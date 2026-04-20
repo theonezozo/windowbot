@@ -1,0 +1,220 @@
+"""Main orchestration logic for WindowBot.
+
+Coordinates the fetch → decide → notify pipeline each time the
+timer trigger fires.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+
+from src.config import get_config
+from src.state import StateManager
+from src.notifier import send_notification
+from src.ecobee_client import EcobeeClient, EcobeeAuthError, EcobeeApiError
+from src.nws_client import NWSClient, NWSError
+from src.purpleair_client import PurpleAirClient
+from src.airnow_client import AirNowClient
+from src.decision_engine import DecisionEngine, FloorDecision, InsufficientDataError
+
+logger = logging.getLogger("windowbot")
+
+# Notification cooldown (seconds) — 1 hour between non-urgent notifications.
+_NOTIFICATION_COOLDOWN = 3600
+
+
+def run_check() -> None:
+    """Top-level orchestration called by the timer trigger.
+
+    Steps:
+        1. Load configuration
+        2. Fetch data from all sources (Ecobee, NWS, AQI)
+        3. For each floor, run the decision engine
+        4. If state changed, persist new state and send notification
+    """
+    try:
+        logger.info("WindowBot check starting at %s", datetime.now(timezone.utc).isoformat())
+
+        config = get_config()
+        state_mgr = StateManager()
+
+        # ------------------------------------------------------------------
+        # Step 1: Fetch data from external APIs
+        # ------------------------------------------------------------------
+        try:
+            ecobee = EcobeeClient(
+                client_id=config["ecobee_client_id"],
+                refresh_token=config["ecobee_refresh_token"],
+                state_manager=state_mgr,
+            )
+            sensors = ecobee.get_sensors()
+            hvac_mode = ecobee.get_hvac_mode()
+        except EcobeeAuthError as exc:
+            # Token irrecoverably expired/revoked — notify the user!
+            logger.error("Ecobee auth failed: %s", exc)
+            send_notification(
+                title="⚠️ WindowBot — Ecobee Auth Failed",
+                message=(
+                    "Your Ecobee token has been revoked or expired. "
+                    "WindowBot cannot read sensor data until you re-authorize. "
+                    "Please run the PIN authorization flow again."
+                ),
+                priority="urgent",
+                urgent=True,
+            )
+            return
+        except EcobeeApiError as exc:
+            logger.error("Ecobee API error: %s", exc)
+            return
+
+        # Fetch outdoor conditions (NWS personal stations → official fallback)
+        try:
+            nws = NWSClient(config["user_latitude"], config["user_longitude"])
+            outdoor = nws.get_outdoor_conditions()
+        except NWSError as exc:
+            logger.error("NWS error: %s", exc)
+            return
+
+        # Fetch AQI (PurpleAir median → AirNow fallback)
+        aqi_data = _fetch_aqi(config)
+
+        # ------------------------------------------------------------------
+        # Step 2: Evaluate each floor independently
+        # ------------------------------------------------------------------
+        engine = DecisionEngine(config)
+
+        for floor_name, sensor_names in [
+            ("upstairs", config["upstairs_sensors"]),
+            ("downstairs", config["downstairs_sensors"]),
+        ]:
+            if not sensor_names:
+                continue
+            _evaluate_floor(
+                floor_name, sensor_names, sensors, outdoor, aqi_data,
+                hvac_mode, engine, state_mgr,
+            )
+
+        logger.info("WindowBot check complete.")
+
+    except Exception:
+        logger.exception("WindowBot check failed — will retry next cycle.")
+
+
+def _fetch_aqi(config: dict) -> dict:
+    """Fetch AQI: PurpleAir (median of 3) → AirNow fallback.
+
+    Returns a dict compatible with DecisionEngine.decide(aqi=...) parameter.
+    Always returns a dict with at least {"aqi": <value>}.
+    """
+    # Try PurpleAir first
+    if config.get("purpleair_api_key"):
+        try:
+            pa = PurpleAirClient(
+                config["user_latitude"], config["user_longitude"],
+                api_key=config["purpleair_api_key"],
+            )
+            result = pa.get_aqi()
+            if result and result.get("aqi") is not None:
+                logger.info("AQI from PurpleAir: %d (sensors: %d)", result["aqi"], result.get("sensor_count", 0))
+                return result
+        except Exception:
+            logger.warning("PurpleAir failed, falling back to AirNow.", exc_info=True)
+
+    # Fallback to AirNow
+    if config.get("airnow_api_key"):
+        try:
+            airnow = AirNowClient(
+                config["airnow_api_key"], config["user_latitude"], config["user_longitude"],
+            )
+            result = airnow.get_aqi()
+            if result and result.get("aqi") is not None:
+                logger.info("AQI from AirNow: %d", result["aqi"])
+                return result
+        except Exception:
+            logger.warning("AirNow also failed.", exc_info=True)
+
+    logger.warning("No AQI data available — proceeding without AQI gate.")
+    return {"aqi": 0, "source": "none"}
+
+
+def _evaluate_floor(
+    floor_name: str,
+    sensor_names: list[str],
+    all_sensors: list[dict],
+    outdoor: dict,
+    aqi_data: dict,
+    hvac_mode: str,
+    engine: DecisionEngine,
+    state_mgr: StateManager,
+) -> None:
+    """Run the decision pipeline for a single floor.
+
+    Args:
+        floor_name: "upstairs" or "downstairs"
+        sensor_names: Names of sensors assigned to this floor
+        all_sensors: All parsed Ecobee sensor readings
+        outdoor: Aggregated outdoor conditions dict
+        aqi_data: AQI result dict (from PurpleAir or AirNow)
+        hvac_mode: Current Ecobee HVAC mode string
+        engine: DecisionEngine instance
+        state_mgr: StateManager for reading/writing state
+    """
+    try:
+        previous = state_mgr.get_floor_state(floor_name)
+        last_state = previous.get("CurrentState", "CLOSED")
+        last_notify_time = previous.get("LastNotificationTime")
+
+        decision: FloorDecision = engine.decide(
+            floor=floor_name,
+            floor_sensors=all_sensors,
+            outdoor=outdoor,
+            aqi=aqi_data,
+            hvac_mode=hvac_mode,
+            last_state=last_state,
+            floor_group=sensor_names,
+        )
+
+        # Persist new state regardless of notification
+        now = datetime.now(timezone.utc)
+        new_state_record = {
+            "CurrentState": decision.new_state,
+            "LastDecisionTime": now.isoformat(),
+            "LastOutdoorTemp": outdoor.get("temperature_f"),
+            "LastAQI": aqi_data.get("aqi"),
+            "DecisionReason": decision.reason,
+        }
+
+        if decision.changed:
+            # Check notification cooldown (unless urgent)
+            should_notify = decision.urgent  # always notify if urgent
+            if not should_notify and last_notify_time:
+                elapsed = (now - datetime.fromisoformat(last_notify_time)).total_seconds()
+                should_notify = elapsed >= _NOTIFICATION_COOLDOWN
+            elif not should_notify:
+                should_notify = True  # first notification ever
+
+            if should_notify:
+                action = "🪟 Open" if decision.new_state == "OPEN" else "🚪 Close"
+                title = f"WindowBot — {action} windows ({floor_name.title()})"
+                send_notification(
+                    title=title,
+                    message=decision.reason,
+                    priority="urgent" if decision.urgent else "default",
+                    urgent=decision.urgent,
+                )
+                new_state_record["LastNotificationTime"] = now.isoformat()
+                logger.info("Notified: %s → %s (%s)", last_state, decision.new_state, floor_name)
+            else:
+                logger.info(
+                    "State changed %s → %s (%s) but cooldown active.",
+                    last_state, decision.new_state, floor_name,
+                )
+
+        state_mgr.update_floor_state(floor_name, new_state_record)
+        logger.info("Floor %s: %s (reason: %s)", floor_name, decision.new_state, decision.reason)
+
+    except InsufficientDataError as exc:
+        logger.warning("Floor '%s': insufficient sensor data — %s", floor_name, exc)
+    except Exception:
+        logger.exception("Error evaluating floor '%s'.", floor_name)
