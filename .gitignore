@@ -1,0 +1,27 @@
+# Squad (local planning infrastructure — not part of the app)
+.squad/
+.gitattributes
+
+# Copilot
+.copilot/
+
+# GitHub workflows (Squad-generated, not part of app)
+.github/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Azure Functions
+local.settings.json
+.python_packages/
+.funcignore
+
+# IDE
+.vscode/
+*.swp
+*.swo

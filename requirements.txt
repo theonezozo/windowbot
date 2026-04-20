@@ -1,0 +1,4 @@
+azure-functions>=1.17.0
+azure-data-tables>=12.4.0
+requests>=2.31.0
+python-dotenv>=1.0.0
