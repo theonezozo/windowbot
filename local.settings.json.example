@@ -1,0 +1,38 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+
+    "ECOBEE_CLIENT_ID": "",
+    "ECOBEE_REFRESH_TOKEN": "",
+    "AIRNOW_API_KEY": "",
+    "PURPLEAIR_API_KEY": "",
+
+    "USER_LATITUDE": "0.0",
+    "USER_LONGITUDE": "0.0",
+
+    "NTFY_TOPIC": "",
+
+    "UPSTAIRS_SENSORS": "Bedroom,Office",
+    "DOWNSTAIRS_SENSORS": "Living Room,Kitchen",
+
+    "HYSTERESIS_OPEN_DIFF": "1.0",
+    "HYSTERESIS_CLOSE_DIFF": "1.0",
+    "MAX_OUTDOOR_HUMIDITY": "80",
+    "MAX_AQI_THRESHOLD": "100",
+    "MIN_AQI_FOR_OPENING": "50",
+
+    "POLLING_INTERVAL_MINUTES": "10",
+    "MAX_OBSERVATION_AGE_MINUTES": "30",
+    "NOTIFICATION_COOLDOWN_HOURS": "1",
+
+    "ALLOWED_HVAC_MODES": "cool,heatCool,auto",
+
+    "AQ_PROVIDER": "purpleair",
+
+    "ENABLE_HUMIDITY_GATE": "true",
+    "ENABLE_AQI_GATE": "true",
+    "ENABLE_WIND_CHECK": "false"
+  }
+}

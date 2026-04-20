@@ -60,7 +60,10 @@ tests/
    ```
 
 3. **Configure settings:**
-   Copy `local.settings.json.example` and fill in your API keys and sensor names.
+   Copy `local.settings.json.example` to `local.settings.json` and fill in your API keys and sensor names:
+   ```bash
+   cp local.settings.json.example local.settings.json
+   ```
 
 4. **Run locally with Azure Functions Core Tools:**
    ```bash
