@@ -50,6 +50,10 @@ def get_config() -> dict:
         # --- API credentials ---
         "ecobee_client_id": _env("ECOBEE_CLIENT_ID", ""),
         "ecobee_refresh_token": _env("ECOBEE_REFRESH_TOKEN", ""),
+        "beestat_api_key": _env("BEESTAT_API_KEY", ""),
+
+        # --- Indoor sensor provider ---
+        "indoor_provider": _env("INDOOR_PROVIDER", "beestat"),
         "airnow_api_key": _env("AIRNOW_API_KEY", ""),
         "purpleair_api_key": _env("PURPLEAIR_API_KEY", ""),
 

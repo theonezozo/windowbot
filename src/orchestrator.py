@@ -13,6 +13,7 @@ from src.config import get_config
 from src.state import StateManager
 from src.notifier import send_notification
 from src.ecobee_client import EcobeeClient, EcobeeAuthError, EcobeeApiError
+from src.beestat_client import BeestatClient, BeestatAuthError, BeestatApiError
 from src.nws_client import NWSClient, NWSError
 from src.purpleair_client import PurpleAirClient
 from src.airnow_client import AirNowClient
@@ -43,29 +44,22 @@ def run_check() -> None:
         # Step 1: Fetch data from external APIs
         # ------------------------------------------------------------------
         try:
-            ecobee = EcobeeClient(
-                client_id=config["ecobee_client_id"],
-                refresh_token=config["ecobee_refresh_token"],
-                state_manager=state_mgr,
-            )
-            sensors = ecobee.get_sensors()
-            hvac_mode = ecobee.get_hvac_mode()
-        except EcobeeAuthError as exc:
-            # Token irrecoverably expired/revoked — notify the user!
-            logger.error("Ecobee auth failed: %s", exc)
+            sensors, hvac_mode = _fetch_indoor_data(config, state_mgr)
+        except (EcobeeAuthError, BeestatAuthError) as exc:
+            provider = "Beestat" if isinstance(exc, BeestatAuthError) else "Ecobee"
+            logger.error("%s auth failed: %s", provider, exc)
             send_notification(
-                title="⚠️ WindowBot — Ecobee Auth Failed",
+                title=f"⚠️ WindowBot — {provider} Auth Failed",
                 message=(
-                    "Your Ecobee token has been revoked or expired. "
-                    "WindowBot cannot read sensor data until you re-authorize. "
-                    "Please run the PIN authorization flow again."
+                    f"Your {provider} credentials are invalid or expired. "
+                    "WindowBot cannot read sensor data until this is fixed."
                 ),
                 priority="urgent",
                 urgent=True,
             )
             return
-        except EcobeeApiError as exc:
-            logger.error("Ecobee API error: %s", exc)
+        except (EcobeeApiError, BeestatApiError) as exc:
+            logger.error("Indoor sensor API error: %s", exc)
             return
 
         # Fetch outdoor conditions (NWS personal stations → official fallback)
@@ -99,6 +93,40 @@ def run_check() -> None:
 
     except Exception:
         logger.exception("WindowBot check failed — will retry next cycle.")
+
+
+def _fetch_indoor_data(config: dict, state_mgr: StateManager) -> tuple[list[dict], str]:
+    """Fetch indoor sensors and HVAC mode from the configured provider.
+
+    Uses ``config["indoor_provider"]`` to select between Beestat (default)
+    and Ecobee.
+
+    Returns:
+        Tuple of (sensors list, hvac_mode string).
+
+    Raises:
+        BeestatAuthError / EcobeeAuthError: On authentication failure.
+        BeestatApiError / EcobeeApiError: On other API errors.
+    """
+    provider = config.get("indoor_provider", "beestat")
+
+    if provider == "beestat" and config.get("beestat_api_key"):
+        logger.info("Using Beestat for indoor sensor data.")
+        client = BeestatClient(api_key=config["beestat_api_key"])
+    else:
+        if provider == "beestat" and not config.get("beestat_api_key"):
+            logger.info("Beestat selected but no API key set — falling back to Ecobee.")
+        else:
+            logger.info("Using Ecobee for indoor sensor data.")
+        client = EcobeeClient(
+            client_id=config["ecobee_client_id"],
+            refresh_token=config["ecobee_refresh_token"],
+            state_manager=state_mgr,
+        )
+
+    sensors = client.get_sensors()
+    hvac_mode = client.get_hvac_mode()
+    return sensors, hvac_mode
 
 
 def _fetch_aqi(config: dict) -> dict:
