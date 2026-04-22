@@ -1,6 +1,6 @@
 """Comprehensive tests for the WindowBot decision engine.
 
-Covers all gate layers (HVAC → AQI → Humidity → Temperature) with
+Covers all gate layers (HVAC → AQI → Humidity → Comfort → Temperature) with
 hysteresis, boundary conditions, and combined-condition scenarios.
 """
 
@@ -183,10 +183,10 @@ class TestTemperatureLogic:
         assert result.changed is True
 
     def test_negative_temperatures(self, engine):
-        """Winter edge: indoor 30°F, outdoor -5°F → diff 35 → OPEN."""
+        """Winter edge: indoor 30°F, outdoor -5°F → comfort gate keeps CLOSED (30 ≤ 72)."""
         result = _decide(engine, indoor_temps=[30.0], outdoor_temp=-5.0, aqi=30)
-        assert result.new_state == "OPEN"
-        assert result.changed is True
+        assert result.new_state == "CLOSED"
+        assert result.changed is False
 
     def test_indoor_outdoor_equal_stays_closed(self, engine):
         """Indoor and outdoor both 74°F → diff=0 → stay CLOSED."""
@@ -964,6 +964,57 @@ class TestConfigCustomisation:
 # ==================================================================
 # 10. FloorDecision Dataclass
 # ==================================================================
+
+
+# ==================================================================
+# Comfort Threshold Gate
+# ==================================================================
+
+class TestComfortThreshold:
+    """Gate 4 — don't open windows when indoor temps are already comfortable."""
+
+    def test_no_open_when_indoor_at_72(self, engine):
+        """At exactly the comfort boundary, windows stay closed."""
+        result = _decide(engine, indoor_temps=[72.0], outdoor_temp=60.0, aqi=30)
+        assert result.new_state == "CLOSED"
+        assert not result.changed
+        assert "comfortable" in result.reason.lower()
+
+    def test_no_open_when_indoor_below_72(self, engine):
+        """Below the comfort max, windows stay closed."""
+        result = _decide(engine, indoor_temps=[70.0], outdoor_temp=60.0, aqi=30)
+        assert result.new_state == "CLOSED"
+        assert not result.changed
+        assert "comfortable" in result.reason.lower()
+
+    def test_open_allowed_when_indoor_above_72(self, engine):
+        """Above the comfort max, normal temperature logic can open windows."""
+        result = _decide(engine, indoor_temps=[74.0], outdoor_temp=60.0, aqi=30)
+        assert result.new_state == "OPEN"
+        assert result.changed
+
+    def test_comfort_gate_does_not_force_close_open_windows(self, engine):
+        """When windows are already open, the comfort gate is skipped."""
+        result = _decide(
+            engine, indoor_temps=[71.0], outdoor_temp=70.0, aqi=30, last_state="OPEN",
+        )
+        assert result.new_state == "OPEN"
+        assert not result.changed
+
+    def test_comfort_threshold_custom_config(self, default_config):
+        """A custom comfort_temp_max of 70 allows opening at 71°F."""
+        custom = {**default_config, "comfort_temp_max": 70.0}
+        eng = DecisionEngine(custom)
+        result = _decide(eng, indoor_temps=[71.0], outdoor_temp=60.0, aqi=30)
+        assert result.new_state == "OPEN"
+        assert result.changed
+
+    def test_comfort_at_boundary_with_multiple_sensors(self, engine):
+        """Warmest sensor determines the comfort check."""
+        result = _decide(engine, indoor_temps=[72.0, 71.0, 70.0], outdoor_temp=60.0, aqi=30)
+        assert result.new_state == "CLOSED"
+        assert not result.changed
+        assert "72.0" in result.reason
 
 
 class TestFloorDecision:

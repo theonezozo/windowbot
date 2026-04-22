@@ -74,6 +74,7 @@ def get_config() -> dict:
         "max_outdoor_humidity": _env_int("MAX_OUTDOOR_HUMIDITY", 80),
         "max_aqi_threshold": _env_int("MAX_AQI_THRESHOLD", 100),
         "min_aqi_for_opening": _env_int("MIN_AQI_FOR_OPENING", 50),
+        "comfort_temp_max": _env_float("COMFORT_TEMP_MAX", 72.0),
 
         # --- Polling & runtime ---
         "polling_interval_minutes": _env_int("POLLING_INTERVAL_MINUTES", 10),

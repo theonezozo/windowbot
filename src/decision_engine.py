@@ -9,6 +9,7 @@ spec (Section 4) with all user-specified refinements:
     • AQI 50–99 → neutral (no AQI-driven state change)
     • AQI < 50 → allow opening (if temperature conditions favour it)
 - Humidity gate: block opening if outdoor humidity > 80 %
+- Comfort gate: skip opening when indoor temps are already comfortable
 - HVAC mode gate: only act when in cooling/auto modes
 """
 
@@ -68,6 +69,7 @@ class DecisionEngine:
         self.allowed_hvac_modes: list[str] = list(
             config.get("allowed_hvac_modes", ["cool", "heatCool", "auto"])
         )
+        self.comfort_temp_max: float = float(config.get("comfort_temp_max", 72.0))
         self.enable_humidity_gate: bool = config.get("enable_humidity_gate", True)
         self.enable_aqi_gate: bool = config.get("enable_aqi_gate", True)
 
@@ -128,6 +130,19 @@ class DecisionEngine:
             )
             if humidity_decision is not None:
                 return humidity_decision
+
+        # ---- Gate 4: Comfort threshold ----
+        if last_state == "CLOSED":
+            try:
+                warmest_pre, _ = self.get_floor_temps(floor_sensors, floor_group)
+                if warmest_pre <= self.comfort_temp_max:
+                    return self._keep(
+                        floor,
+                        "CLOSED",
+                        f"Indoor already comfortable ({warmest_pre:.1f}°F ≤ {self.comfort_temp_max:.1f}°F)",
+                    )
+            except InsufficientDataError:
+                pass  # let temperature logic handle the error
 
         # ---- Temperature logic with hysteresis ----
         try:
