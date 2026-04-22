@@ -62,7 +62,7 @@ class TestAuthFailure:
     """EcobeeAuthError triggers urgent notification to user."""
 
     @patch("src.orchestrator.send_notification")
-    @patch("src.orchestrator.StateManager")
+    @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_config")
     def test_auth_error_sends_urgent_notification(
@@ -83,7 +83,7 @@ class TestAuthFailure:
         assert "Auth" in kwargs["title"] or "auth" in kwargs["title"].lower()
 
     @patch("src.orchestrator.send_notification")
-    @patch("src.orchestrator.StateManager")
+    @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_config")
     def test_api_error_does_not_notify(
@@ -303,7 +303,7 @@ class TestPerFloorIteration:
     @patch("src.orchestrator._fetch_aqi")
     @patch("src.orchestrator.NWSClient")
     @patch("src.orchestrator.EcobeeClient")
-    @patch("src.orchestrator.StateManager")
+    @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
     def test_both_floors_evaluated(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
@@ -337,7 +337,7 @@ class TestPerFloorIteration:
     @patch("src.orchestrator._fetch_aqi")
     @patch("src.orchestrator.NWSClient")
     @patch("src.orchestrator.EcobeeClient")
-    @patch("src.orchestrator.StateManager")
+    @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
     def test_empty_floor_skipped(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
@@ -432,7 +432,7 @@ class TestNWSFailure:
     @patch("src.orchestrator._fetch_aqi")
     @patch("src.orchestrator.NWSClient")
     @patch("src.orchestrator.EcobeeClient")
-    @patch("src.orchestrator.StateManager")
+    @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
     def test_nws_failure_aborts(
         self, mock_config, mock_state_cls, mock_ecobee_cls,

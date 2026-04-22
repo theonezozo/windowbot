@@ -16,6 +16,9 @@ __pycache__/
 venv/
 *.egg-info/
 
+# Local dev state
+.local_state.json
+
 # Azure Functions
 local.settings.json
 .python_packages/

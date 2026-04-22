@@ -1,19 +1,27 @@
-"""Tests for the Azure Table Storage state manager.
+"""Tests for the state managers (Azure Table Storage + local file fallback).
 
 Validates design decisions:
 - Floor state reads/writes with partition key = floor name.
 - Default state returned when no entity exists.
 - OAuth token persistence and retrieval.
 - Missing connection string raises ValueError.
+- Local fallback activates when Azurite is unavailable.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.state import StateManager, STATE_TABLE, OAUTH_TABLE
+from src.state import (
+    StateManager,
+    LocalStateManager,
+    get_state_manager,
+    STATE_TABLE,
+    OAUTH_TABLE,
+)
 
 
 # ------------------------------------------------------------------
@@ -175,3 +183,84 @@ class TestTableInit:
         table_names = [c[0][0] for c in create_calls]
         assert STATE_TABLE in table_names
         assert OAUTH_TABLE in table_names
+
+
+# ------------------------------------------------------------------
+# LocalStateManager
+# ------------------------------------------------------------------
+
+
+class TestLocalStateManager:
+    """File-backed state manager for dev use."""
+
+    @pytest.fixture(autouse=True)
+    def local_mgr(self, tmp_path):
+        self.state_file = tmp_path / ".local_state.json"
+        self.mgr = LocalStateManager(path=self.state_file)
+
+    def test_get_floor_state_default(self):
+        """Missing floor → returns UNKNOWN defaults."""
+        result = self.mgr.get_floor_state("upstairs")
+        assert result["CurrentState"] == "UNKNOWN"
+        assert result["LastNotificationTime"] is None
+
+    def test_update_then_get_floor_state(self):
+        """Written state is readable."""
+        self.mgr.update_floor_state("upstairs", {"CurrentState": "OPEN"})
+        result = self.mgr.get_floor_state("upstairs")
+        assert result["CurrentState"] == "OPEN"
+        assert result["PartitionKey"] == "upstairs"
+
+    def test_floor_states_independent(self):
+        """Two floors don't clobber each other."""
+        self.mgr.update_floor_state("upstairs", {"CurrentState": "OPEN"})
+        self.mgr.update_floor_state("downstairs", {"CurrentState": "CLOSED"})
+        assert self.mgr.get_floor_state("upstairs")["CurrentState"] == "OPEN"
+        assert self.mgr.get_floor_state("downstairs")["CurrentState"] == "CLOSED"
+
+    def test_get_oauth_tokens_default(self):
+        """No stored tokens → empty defaults."""
+        result = self.mgr.get_oauth_tokens()
+        assert result["AccessToken"] == ""
+        assert result["RefreshToken"] == ""
+
+    def test_update_then_get_oauth_tokens(self):
+        """Written tokens are readable."""
+        self.mgr.update_oauth_tokens({"AccessToken": "abc", "RefreshToken": "xyz"})
+        result = self.mgr.get_oauth_tokens()
+        assert result["AccessToken"] == "abc"
+        assert result["RefreshToken"] == "xyz"
+
+
+# ------------------------------------------------------------------
+# Factory: get_state_manager()
+# ------------------------------------------------------------------
+
+
+class TestGetStateManager:
+    """Factory function picks the right backend."""
+
+    @patch("src.state.os.environ", {})
+    def test_no_connection_string_returns_local(self):
+        """No env var → LocalStateManager."""
+        mgr = get_state_manager()
+        assert isinstance(mgr, LocalStateManager)
+
+    def test_valid_connection_returns_azure(self, mock_table_service):
+        """Valid connection string → StateManager."""
+        mgr = get_state_manager(connection_string="DefaultEndpointsProtocol=https;AccountName=x")
+        assert isinstance(mgr, StateManager)
+
+    @patch("src.state.TableServiceClient")
+    def test_azurite_failure_falls_back_to_local(self, mock_tsc):
+        """UseDevelopmentStorage=true but Azurite down → LocalStateManager."""
+        mock_tsc.from_connection_string.side_effect = ConnectionError("Connection refused")
+        mgr = get_state_manager(connection_string="UseDevelopmentStorage=true")
+        assert isinstance(mgr, LocalStateManager)
+
+    @patch("src.state.TableServiceClient")
+    def test_production_failure_still_raises(self, mock_tsc):
+        """Non-dev connection failure → exception propagates."""
+        mock_tsc.from_connection_string.side_effect = ConnectionError("Server unavailable")
+        with pytest.raises(ConnectionError):
+            get_state_manager(connection_string="DefaultEndpointsProtocol=https;AccountName=prod")

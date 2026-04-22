@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timezone
 
 from src.config import get_config
-from src.state import StateManager
+from src.state import get_state_manager
 from src.notifier import send_notification
 from src.ecobee_client import EcobeeClient, EcobeeAuthError, EcobeeApiError
 from src.beestat_client import BeestatClient, BeestatAuthError, BeestatApiError
@@ -38,7 +38,7 @@ def run_check() -> None:
         logger.info("WindowBot check starting at %s", datetime.now(timezone.utc).isoformat())
 
         config = get_config()
-        state_mgr = StateManager()
+        state_mgr = get_state_manager()
 
         # ------------------------------------------------------------------
         # Step 1: Fetch data from external APIs
