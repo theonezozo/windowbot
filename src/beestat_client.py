@@ -148,16 +148,32 @@ class BeestatClient:
         data = self._fetch_all()
         raw_sensors = data.get("sensors", {})
 
-        sensors: list[dict] = []
+        # --- Pass 1: collect all non-inactive sensors -----------------
+        active_items: list[tuple[str, dict]] = []
         for sensor_id, raw in raw_sensors.items():
-            # Skip inactive or not-in-use sensors
             if raw.get("inactive", False):
                 logger.debug("Skipping inactive sensor %s", sensor_id)
                 continue
-            if not raw.get("in_use", True):
-                logger.debug("Skipping not-in-use sensor %s", sensor_id)
-                continue
+            active_items.append((sensor_id, raw))
 
+        # --- Pass 2: prefer only in_use sensors, but fall back --------
+        in_use_items = [
+            (sid, r) for sid, r in active_items if r.get("in_use", True)
+        ]
+        if in_use_items:
+            selected = in_use_items
+        else:
+            # Ecobee rotated all remotes off — use every non-inactive sensor
+            logger.warning(
+                "All %d non-inactive sensors have in_use=False; "
+                "ignoring in_use filter so downstream gets data.",
+                len(active_items),
+            )
+            selected = active_items
+
+        # --- Build sensor dicts from selected items -------------------
+        sensors: list[dict] = []
+        for sensor_id, raw in selected:
             name = raw.get("name", "Unknown")
 
             # Temperature: Beestat stores actual °F (already /10 from Ecobee)

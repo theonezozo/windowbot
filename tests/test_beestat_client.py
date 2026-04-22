@@ -15,6 +15,7 @@ Validates design decisions:
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -279,6 +280,127 @@ class TestGetSensorsFiltering:
         sensors = client.get_sensors()
 
         assert len(sensors) == 2
+
+
+# ------------------------------------------------------------------
+# get_sensors() — in_use fallback behaviour
+# ------------------------------------------------------------------
+
+
+class TestGetSensorsInUseFallback:
+    """When ALL non-inactive sensors have in_use=False the client must
+    fall back to returning every non-inactive sensor instead of an
+    empty list.
+    """
+
+    @patch("src.beestat_client.requests.post")
+    def test_all_sensors_not_in_use_triggers_fallback(self, mock_post):
+        """All non-inactive sensors have in_use=False → all returned."""
+        sid1, s1 = _raw_sensor(1, "Room A", in_use=False)
+        sid2, s2 = _raw_sensor(2, "Room B", in_use=False)
+        body = _beestat_response(
+            sensors={sid1: s1, sid2: s2},
+            thermostat=_raw_thermostat(),
+        )
+        mock_post.return_value = _ok_post(body)
+        client = BeestatClient("key")
+
+        sensors = client.get_sensors()
+
+        assert len(sensors) == 2
+        names = {s["name"] for s in sensors}
+        assert names == {"Room A", "Room B"}
+
+    @patch("src.beestat_client.requests.post")
+    def test_mix_in_use_true_and_false_returns_only_in_use(self, mock_post):
+        """Some in_use=True, some False → only in_use=True returned."""
+        sid1, s1 = _raw_sensor(1, "Active", in_use=True)
+        sid2, s2 = _raw_sensor(2, "Rotated Off", in_use=False)
+        sid3, s3 = _raw_sensor(3, "Also Active", in_use=True)
+        body = _beestat_response(
+            sensors={sid1: s1, sid2: s2, sid3: s3},
+            thermostat=_raw_thermostat(),
+        )
+        mock_post.return_value = _ok_post(body)
+        client = BeestatClient("key")
+
+        sensors = client.get_sensors()
+
+        assert len(sensors) == 2
+        names = {s["name"] for s in sensors}
+        assert names == {"Active", "Also Active"}
+
+    @patch("src.beestat_client.requests.post")
+    def test_all_sensors_in_use_returns_all(self, mock_post):
+        """Normal case — every sensor in_use=True → all returned."""
+        sid1, s1 = _raw_sensor(1, "S1", in_use=True)
+        sid2, s2 = _raw_sensor(2, "S2", in_use=True)
+        sid3, s3 = _raw_sensor(3, "S3", in_use=True)
+        body = _beestat_response(
+            sensors={sid1: s1, sid2: s2, sid3: s3},
+            thermostat=_raw_thermostat(),
+        )
+        mock_post.return_value = _ok_post(body)
+        client = BeestatClient("key")
+
+        sensors = client.get_sensors()
+
+        assert len(sensors) == 3
+
+    @patch("src.beestat_client.requests.post")
+    def test_inactive_excluded_but_not_in_use_returned_via_fallback(self, mock_post):
+        """Inactive sensors always excluded; remaining not-in-use sensors
+        returned through the fallback when none are in_use=True."""
+        sid1, s1 = _raw_sensor(1, "Inactive", inactive=True, in_use=False)
+        sid2, s2 = _raw_sensor(2, "Not In Use A", inactive=False, in_use=False)
+        sid3, s3 = _raw_sensor(3, "Not In Use B", inactive=False, in_use=False)
+        body = _beestat_response(
+            sensors={sid1: s1, sid2: s2, sid3: s3},
+            thermostat=_raw_thermostat(),
+        )
+        mock_post.return_value = _ok_post(body)
+        client = BeestatClient("key")
+
+        sensors = client.get_sensors()
+
+        assert len(sensors) == 2
+        names = {s["name"] for s in sensors}
+        assert "Inactive" not in names
+        assert names == {"Not In Use A", "Not In Use B"}
+
+    @patch("src.beestat_client.requests.post")
+    def test_fallback_logs_warning(self, mock_post, caplog):
+        """Warning is logged when the in_use fallback triggers."""
+        sid1, s1 = _raw_sensor(1, "Room A", in_use=False)
+        sid2, s2 = _raw_sensor(2, "Room B", in_use=False)
+        body = _beestat_response(
+            sensors={sid1: s1, sid2: s2},
+            thermostat=_raw_thermostat(),
+        )
+        mock_post.return_value = _ok_post(body)
+        client = BeestatClient("key")
+
+        with caplog.at_level(logging.WARNING, logger="windowbot.beestat"):
+            client.get_sensors()
+
+        assert any("in_use=False" in msg for msg in caplog.messages)
+
+    @patch("src.beestat_client.requests.post")
+    def test_normal_path_no_fallback_warning(self, mock_post, caplog):
+        """No warning when at least one sensor is in_use=True."""
+        sid1, s1 = _raw_sensor(1, "Active", in_use=True)
+        sid2, s2 = _raw_sensor(2, "Off", in_use=False)
+        body = _beestat_response(
+            sensors={sid1: s1, sid2: s2},
+            thermostat=_raw_thermostat(),
+        )
+        mock_post.return_value = _ok_post(body)
+        client = BeestatClient("key")
+
+        with caplog.at_level(logging.WARNING, logger="windowbot.beestat"):
+            client.get_sensors()
+
+        assert not any("in_use=False" in msg for msg in caplog.messages)
 
 
 # ------------------------------------------------------------------
