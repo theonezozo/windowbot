@@ -16,7 +16,7 @@ import os
 
 import pytest
 
-from src.notifier import send_notification, NTFY_BASE_URL
+from src.notifier import send_notification, NTFY_BASE_URL, _priority_to_int
 
 
 # ------------------------------------------------------------------
@@ -30,14 +30,14 @@ class TestPriorityMapping:
     @patch("src.notifier.requests.post")
     @patch.dict(os.environ, {"NTFY_TOPIC": "test_topic"})
     def test_urgent_true_sets_priority_urgent(self, mock_post):
-        """urgent=True → priority header = 'urgent'."""
+        """urgent=True → priority = 5 (urgent)."""
         mock_post.return_value = MagicMock(status_code=200)
         mock_post.return_value.raise_for_status = MagicMock()
 
         send_notification("Title", "Body", priority="default", urgent=True)
 
-        headers = mock_post.call_args.kwargs.get("headers") or mock_post.call_args[1].get("headers", {})
-        assert headers["Priority"] == "urgent"
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json", {})
+        assert payload["priority"] == 5
 
     @patch("src.notifier.requests.post")
     @patch.dict(os.environ, {"NTFY_TOPIC": "test_topic"})
@@ -48,20 +48,20 @@ class TestPriorityMapping:
 
         send_notification("Title", "Body", priority="high", urgent=False)
 
-        headers = mock_post.call_args.kwargs.get("headers") or mock_post.call_args[1].get("headers", {})
-        assert headers["Priority"] == "high"
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json", {})
+        assert payload["priority"] == 4
 
     @patch("src.notifier.requests.post")
     @patch.dict(os.environ, {"NTFY_TOPIC": "test_topic"})
     def test_default_priority(self, mock_post):
-        """No priority or urgent → default priority."""
+        """No priority or urgent → default priority (3)."""
         mock_post.return_value = MagicMock(status_code=200)
         mock_post.return_value.raise_for_status = MagicMock()
 
         send_notification("Title", "Body")
 
-        headers = mock_post.call_args.kwargs.get("headers") or mock_post.call_args[1].get("headers", {})
-        assert headers["Priority"] == "default"
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json", {})
+        assert payload["priority"] == 3
 
 
 # ------------------------------------------------------------------
@@ -70,7 +70,7 @@ class TestPriorityMapping:
 
 
 class TestTags:
-    """Urgent notifications get 'warning,window'; normal get 'window'."""
+    """Urgent notifications get ['warning', 'window']; normal get ['window']."""
 
     @patch("src.notifier.requests.post")
     @patch.dict(os.environ, {"NTFY_TOPIC": "test_topic"})
@@ -80,8 +80,8 @@ class TestTags:
 
         send_notification("Title", "Body", urgent=True)
 
-        headers = mock_post.call_args.kwargs.get("headers") or mock_post.call_args[1].get("headers", {})
-        assert headers["Tags"] == "warning,window"
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json", {})
+        assert payload["tags"] == ["warning", "window"]
 
     @patch("src.notifier.requests.post")
     @patch.dict(os.environ, {"NTFY_TOPIC": "test_topic"})
@@ -91,8 +91,8 @@ class TestTags:
 
         send_notification("Title", "Body", urgent=False)
 
-        headers = mock_post.call_args.kwargs.get("headers") or mock_post.call_args[1].get("headers", {})
-        assert headers["Tags"] == "window"
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json", {})
+        assert payload["tags"] == ["window"]
 
 
 # ------------------------------------------------------------------
@@ -101,43 +101,55 @@ class TestTags:
 
 
 class TestHTTPCall:
-    """URL, body, and header construction."""
+    """URL, body, and payload construction."""
 
     @patch("src.notifier.requests.post")
     @patch.dict(os.environ, {"NTFY_TOPIC": "my_window_topic"})
-    def test_url_uses_topic(self, mock_post):
-        """POST URL = NTFY_BASE_URL / topic."""
+    def test_url_is_base(self, mock_post):
+        """POST URL = NTFY_BASE_URL (topic in JSON body)."""
         mock_post.return_value = MagicMock(status_code=200)
         mock_post.return_value.raise_for_status = MagicMock()
 
         send_notification("Title", "Body")
 
         url = mock_post.call_args[0][0]
-        assert url == f"{NTFY_BASE_URL}/my_window_topic"
+        assert url == NTFY_BASE_URL
+
+    @patch("src.notifier.requests.post")
+    @patch.dict(os.environ, {"NTFY_TOPIC": "my_window_topic"})
+    def test_topic_in_payload(self, mock_post):
+        """Topic is sent in the JSON payload."""
+        mock_post.return_value = MagicMock(status_code=200)
+        mock_post.return_value.raise_for_status = MagicMock()
+
+        send_notification("Title", "Body")
+
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json", {})
+        assert payload["topic"] == "my_window_topic"
 
     @patch("src.notifier.requests.post")
     @patch.dict(os.environ, {"NTFY_TOPIC": "test_topic"})
-    def test_title_in_header(self, mock_post):
-        """Title is sent as a header."""
+    def test_title_in_payload(self, mock_post):
+        """Title is sent in the JSON payload."""
         mock_post.return_value = MagicMock(status_code=200)
         mock_post.return_value.raise_for_status = MagicMock()
 
         send_notification("My Title", "My Body")
 
-        headers = mock_post.call_args.kwargs.get("headers") or mock_post.call_args[1].get("headers", {})
-        assert headers["Title"] == "My Title"
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json", {})
+        assert payload["title"] == "My Title"
 
     @patch("src.notifier.requests.post")
     @patch.dict(os.environ, {"NTFY_TOPIC": "test_topic"})
-    def test_body_utf8_encoded(self, mock_post):
-        """Message body is UTF-8 encoded bytes."""
+    def test_message_in_payload(self, mock_post):
+        """Message body with unicode is sent in JSON payload."""
         mock_post.return_value = MagicMock(status_code=200)
         mock_post.return_value.raise_for_status = MagicMock()
 
         send_notification("T", "Hello 🪟")
 
-        data = mock_post.call_args.kwargs.get("data") or mock_post.call_args[1].get("data")
-        assert data == "Hello 🪟".encode("utf-8")
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json", {})
+        assert payload["message"] == "Hello 🪟"
 
     @patch("src.notifier.requests.post")
     @patch.dict(os.environ, {"NTFY_TOPIC": "test_topic"})
@@ -147,6 +159,37 @@ class TestHTTPCall:
         mock_post.return_value.raise_for_status = MagicMock()
 
         assert send_notification("T", "B") is True
+
+    @patch("src.notifier.requests.post")
+    @patch.dict(os.environ, {"NTFY_TOPIC": "test_topic"})
+    def test_unicode_title_works(self, mock_post):
+        """Emoji in title works via JSON API (no latin-1 header encoding)."""
+        mock_post.return_value = MagicMock(status_code=200)
+        mock_post.return_value.raise_for_status = MagicMock()
+
+        result = send_notification("🪟 WindowBot", "Open windows!")
+
+        assert result is True
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json", {})
+        assert payload["title"] == "🪟 WindowBot"
+
+
+# ------------------------------------------------------------------
+# Priority Integer Conversion
+# ------------------------------------------------------------------
+
+
+class TestPriorityConversion:
+    """_priority_to_int maps string priorities to ntfy integers."""
+
+    @pytest.mark.parametrize("name,expected", [
+        ("min", 1), ("low", 2), ("default", 3), ("high", 4), ("urgent", 5),
+    ])
+    def test_known_priorities(self, name, expected):
+        assert _priority_to_int(name) == expected
+
+    def test_unknown_defaults_to_3(self):
+        assert _priority_to_int("bogus") == 3
 
 
 # ------------------------------------------------------------------
