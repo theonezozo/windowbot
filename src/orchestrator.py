@@ -70,13 +70,11 @@ def run_check() -> None:
             logger.error("NWS error: %s", exc)
             return
 
-        # Fetch AQI (PurpleAir median → AirNow fallback)
-        aqi_data = _fetch_aqi(config)
-
         # ------------------------------------------------------------------
-        # Step 2: Evaluate each floor independently
+        # Step 2: Evaluate each floor independently (lazy AQI fetching)
         # ------------------------------------------------------------------
         engine = DecisionEngine(config)
+        aqi_cache: dict = {}  # shared across floors within this cycle
 
         for floor_name, sensor_names in [
             ("upstairs", config["upstairs_sensors"]),
@@ -84,6 +82,29 @@ def run_check() -> None:
         ]:
             if not sensor_names:
                 continue
+
+            # Pre-check: does this floor actually need AQI data?
+            previous = state_mgr.get_floor_state(floor_name)
+            last_state = previous.get("CurrentState", "CLOSED")
+
+            needs, skip_reason = engine.needs_aqi(
+                floor_sensors=sensors,
+                outdoor=outdoor,
+                hvac_mode=hvac_mode,
+                last_state=last_state,
+                floor_group=sensor_names,
+            )
+
+            if needs:
+                if "result" not in aqi_cache:
+                    aqi_cache["result"] = _fetch_aqi(config)
+                aqi_data = aqi_cache["result"]
+            else:
+                logger.info(
+                    "Skipping AQI fetch for %s — %s", floor_name, skip_reason,
+                )
+                aqi_data = {"aqi": 0, "source": "skipped"}
+
             _evaluate_floor(
                 floor_name, sensor_names, sensors, outdoor, aqi_data,
                 hvac_mode, engine, state_mgr,
