@@ -1,9 +1,9 @@
 """National Weather Service API client for WindowBot.
 
 Fetches outdoor temperature, humidity, and wind speed from nearby NWS
-weather stations.  Uses the **median** of up to 3 personal/cooperative
-stations for robustness, falling back to the nearest official ASOS/AWOS
-station when fewer than 3 personal stations are available.
+weather stations.  Blends personal/cooperative and official stations into
+a single list sorted by distance, then takes the **median** of the 3
+closest stations for robustness.
 
 Reference: https://www.weather.gov/documentation/services-web-api
 """
@@ -254,15 +254,20 @@ class NWSClient:
     # Aggregated outdoor conditions
     # ------------------------------------------------------------------
 
+    def _station_distance_key(self, station: dict) -> float:
+        """Haversine distance from target for sorting; inf if no coords."""
+        lat, lon = station.get("lat"), station.get("lon")
+        if lat is None or lon is None:
+            return float("inf")
+        return self._haversine_miles(self._lat, self._lon, lat, lon)
+
     def get_outdoor_conditions(self) -> dict:
-        """Compute aggregated outdoor conditions using the MEDIAN of nearby
-        personal weather stations, with an automatic fallback to official
-        stations.
+        """Compute aggregated outdoor conditions using the MEDIAN of the
+        closest weather stations, blending personal and official together.
 
         Strategy:
-            1. Query the 3 closest personal/cooperative stations.
-            2. If fewer than 2 valid readings, fall back to the nearest
-               official ASOS/AWOS station(s).
+            1. Sort all discovered stations by distance from target coordinates.
+            2. Query the 3 closest stations (regardless of type).
             3. Return the **median** temperature, humidity, and wind speed.
 
         Returns:
@@ -271,49 +276,54 @@ class NWSClient:
             - ``humidity`` (float | None): Median outdoor humidity %.
             - ``wind_speed_mph`` (float | None): Median wind speed.
             - ``station_count`` (int): Number of stations contributing.
-            - ``is_fallback`` (bool): True if official stations were used.
+            - ``is_fallback`` (bool): True if any official station contributed.
         """
         self.discover_stations()
 
-        # Separate personal and official stations.
-        personal_ids = [s["id"] for s in self._stations if s["is_personal"]]
-        official_ids = [s["id"] for s in self._stations if not s["is_personal"]]
+        # Blend all stations and sort by distance from target.
+        sorted_stations = sorted(self._stations, key=self._station_distance_key)
+        candidates = sorted_stations[:3]
 
         now = datetime.now(timezone.utc)
-        is_fallback = False
+        observations = self._fetch_batch(
+            [s["id"] for s in candidates], now, target=3,
+        )
 
-        # Try personal stations first (up to 3).
-        candidates = personal_ids[:5]
-        self._log_station_distances(candidates)
-        observations = self._fetch_batch(candidates, now, target=3)
-
-        if len(observations) < 2:
-            # Fallback: use official stations.
-            logger.info("Only %d personal station readings — falling back to official.", len(observations))
-            fallback_candidates = official_ids[:3]
-            self._log_station_distances(fallback_candidates)
-            fallback_obs = self._fetch_batch(fallback_candidates, now, target=3)
-            observations = observations + fallback_obs
-            is_fallback = True
+        # Log each station's temperature reading.
+        stations_by_id = {s["id"]: s for s in self._stations}
+        for obs in observations:
+            sid = obs["station_id"]
+            stn = stations_by_id.get(sid, {})
+            stype = "personal" if stn.get("is_personal", True) else "official"
+            stn_lat, stn_lon = stn.get("lat"), stn.get("lon")
+            if stn_lat is not None and stn_lon is not None:
+                dist = self._haversine_miles(self._lat, self._lon, stn_lat, stn_lon)
+                logger.info(
+                    "Station %s (%s): %.1f°F at %.1f mi",
+                    sid, stype, obs["temperature_f"], dist,
+                )
+            else:
+                logger.info(
+                    "Station %s (%s): %.1f°F at unknown distance",
+                    sid, stype, obs["temperature_f"],
+                )
 
         if not observations:
             raise NWSError("No valid weather observations available from any station.")
 
-        return self._aggregate(observations, is_fallback)
+        # is_fallback: True if any official station contributed.
+        is_fallback = any(
+            not stations_by_id.get(o["station_id"], {}).get("is_personal", True)
+            for o in observations
+        )
 
-    def _log_station_distances(self, station_ids: list[str]) -> None:
-        """Log the haversine distance from target coords to each station."""
-        stations_by_id = {s["id"]: s for s in self._stations}
-        for sid in station_ids:
-            stn = stations_by_id.get(sid)
-            if not stn:
-                continue
-            stn_lat, stn_lon = stn.get("lat"), stn.get("lon")
-            if stn_lat is None or stn_lon is None:
-                logger.info("NWS station %s (%s): distance unknown (no coordinates)", sid, stn.get("name", "?"))
-                continue
-            dist = self._haversine_miles(self._lat, self._lon, stn_lat, stn_lon)
-            logger.info("NWS station %s (%s): %.1f mi from target", sid, stn.get("name", "?"), dist)
+        result = self._aggregate(observations, is_fallback)
+        logger.info(
+            "Outdoor temperature: %.1f°F (median of %d readings)",
+            result["temperature_f"],
+            len(observations),
+        )
+        return result
 
     def _fetch_batch(
         self, station_ids: list[str], now: datetime, target: int
