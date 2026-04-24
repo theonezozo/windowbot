@@ -11,6 +11,7 @@ Reference: https://www.weather.gov/documentation/services-web-api
 from __future__ import annotations
 
 import logging
+import math
 import statistics
 from datetime import datetime, timezone, timedelta
 
@@ -78,6 +79,20 @@ class NWSClient:
         return kmh * 0.621371
 
     @staticmethod
+    def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Great-circle distance between two points in miles."""
+        R = 3958.8  # Earth radius in miles
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (
+            math.sin(dlat / 2) ** 2
+            + math.cos(math.radians(lat1))
+            * math.cos(math.radians(lat2))
+            * math.sin(dlon / 2) ** 2
+        )
+        return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    @staticmethod
     def _is_personal_station(station: dict) -> bool:
         """Heuristic: a station is "personal/cooperative" if its identifier
         does NOT start with K (ASOS/AWOS airport) and is not a 4-char ICAO code."""
@@ -126,11 +141,17 @@ class NWSClient:
             sprops = feat.get("properties", {})
             sid = sprops.get("stationIdentifier", "")
             name = sprops.get("name", "")
+            # GeoJSON coordinates: [longitude, latitude]
+            coords = feat.get("geometry", {}).get("coordinates", [])
+            stn_lon = coords[0] if len(coords) >= 2 else None
+            stn_lat = coords[1] if len(coords) >= 2 else None
             self._stations.append(
                 {
                     "id": sid,
                     "name": name,
                     "is_personal": self._is_personal_station({"id": sid}),
+                    "lat": stn_lat,
+                    "lon": stn_lon,
                 }
             )
 
@@ -262,12 +283,16 @@ class NWSClient:
         is_fallback = False
 
         # Try personal stations first (up to 3).
-        observations = self._fetch_batch(personal_ids[:5], now, target=3)
+        candidates = personal_ids[:5]
+        self._log_station_distances(candidates)
+        observations = self._fetch_batch(candidates, now, target=3)
 
         if len(observations) < 2:
             # Fallback: use official stations.
             logger.info("Only %d personal station readings — falling back to official.", len(observations))
-            fallback_obs = self._fetch_batch(official_ids[:3], now, target=3)
+            fallback_candidates = official_ids[:3]
+            self._log_station_distances(fallback_candidates)
+            fallback_obs = self._fetch_batch(fallback_candidates, now, target=3)
             observations = observations + fallback_obs
             is_fallback = True
 
@@ -275,6 +300,20 @@ class NWSClient:
             raise NWSError("No valid weather observations available from any station.")
 
         return self._aggregate(observations, is_fallback)
+
+    def _log_station_distances(self, station_ids: list[str]) -> None:
+        """Log the haversine distance from target coords to each station."""
+        stations_by_id = {s["id"]: s for s in self._stations}
+        for sid in station_ids:
+            stn = stations_by_id.get(sid)
+            if not stn:
+                continue
+            stn_lat, stn_lon = stn.get("lat"), stn.get("lon")
+            if stn_lat is None or stn_lon is None:
+                logger.info("NWS station %s (%s): distance unknown (no coordinates)", sid, stn.get("name", "?"))
+                continue
+            dist = self._haversine_miles(self._lat, self._lon, stn_lat, stn_lon)
+            logger.info("NWS station %s (%s): %.1f mi from target", sid, stn.get("name", "?"), dist)
 
     def _fetch_batch(
         self, station_ids: list[str], now: datetime, target: int
