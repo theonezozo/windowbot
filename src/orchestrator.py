@@ -24,6 +24,12 @@ logger = logging.getLogger("windowbot")
 # Notification cooldown (seconds) — 1 hour between non-urgent notifications.
 _NOTIFICATION_COOLDOWN = 3600
 
+# Module-level NWSClient — kept alive across run_check() cycles so its LKG
+# station cache survives between calls.  _nws_client_key tracks (lat, lon, cls)
+# so we re-create if coords change or if the class is swapped (e.g. test mocks).
+_nws_client: "NWSClient | None" = None
+_nws_client_key: tuple = ()
+
 
 def run_check() -> None:
     """Top-level orchestration called by the timer trigger.
@@ -62,10 +68,16 @@ def run_check() -> None:
             logger.error("Indoor sensor API error: %s", exc)
             return
 
-        # Fetch outdoor conditions (NWS personal stations → official fallback)
+        # Fetch outdoor conditions — reuse the same NWSClient so its LKG cache
+        # persists across cycles.  Re-create only if coords or class changed.
+        global _nws_client, _nws_client_key
+        lat, lon = config["user_latitude"], config["user_longitude"]
+        client_key = (lat, lon, NWSClient)
+        if _nws_client is None or _nws_client_key != client_key:
+            _nws_client = NWSClient(lat, lon)
+            _nws_client_key = client_key
         try:
-            nws = NWSClient(config["user_latitude"], config["user_longitude"])
-            outdoor = nws.get_outdoor_conditions()
+            outdoor = _nws_client.get_outdoor_conditions()
         except NWSError as exc:
             logger.error("NWS error: %s", exc)
             return

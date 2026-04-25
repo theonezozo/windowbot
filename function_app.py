@@ -11,7 +11,7 @@ app = func.FunctionApp()
 @app.timer_trigger(
     schedule="0 */10 * * * *",
     arg_name="timer",
-    run_on_startup=False,
+    run_on_startup=True,
 )
 def windowbot_check(timer: func.TimerRequest) -> None:
     """Runs every 10 minutes to evaluate window open/close conditions."""

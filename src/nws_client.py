@@ -28,6 +28,11 @@ REQUIRED_HEADERS = {
 # Observations older than this are rejected as stale.
 _MAX_OBS_AGE = timedelta(minutes=30)
 _REQUEST_TIMEOUT = 15
+# Cached readings older than this are not used (hard eviction threshold).
+_CACHE_MAX_AGE = timedelta(hours=2)
+# Only consider stations within this radius; prevents distant outliers from
+# bloating the search and keeps results hyperlocal.
+_MAX_STATION_DISTANCE_MILES = 10.0
 
 # Station identifier prefixes that indicate personal/cooperative networks.
 # CRS = Cooperative Remote Sensing; COOP = Cooperative Observer Program.
@@ -50,6 +55,11 @@ class NWSClient:
         self._lat = latitude
         self._lon = longitude
         self._stations: list[dict] = []  # cached station metadata
+        self._last_skip_reason: str | None = None  # set by _fetch_single_observation
+        self._station_cache: dict[str, dict] = {}  # last-known-good readings, keyed by station ID
+        self._grid_id: str | None = None
+        self._grid_x: int | None = None
+        self._grid_y: int | None = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -77,6 +87,16 @@ class NWSClient:
     def _kmh_to_mph(kmh: float) -> float:
         """Convert km/h to mph."""
         return kmh * 0.621371
+
+    @staticmethod
+    def _format_age(delta: timedelta) -> str:
+        """Format a timedelta as 'Xh Ym ago' or 'Ym ago'."""
+        total_secs = int(delta.total_seconds())
+        hours, remainder = divmod(total_secs, 3600)
+        minutes = remainder // 60
+        if hours > 0:
+            return f"{hours}h {minutes:02d}m ago"
+        return f"{minutes}m ago"
 
     @staticmethod
     def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -118,19 +138,28 @@ class NWSClient:
         if self._stations:
             return [s["id"] for s in self._stations]
 
-        # Step 1: Resolve grid coordinates from lat/lon.
-        points_url = f"{NWS_API_BASE}/points/{self._lat},{self._lon}"
-        points_data = self._get(points_url)
-        props = points_data.get("properties", {})
+        if self._grid_id is not None:
+            # Gridpoint already cached — skip the points API entirely.
+            stations_url = f"{NWS_API_BASE}/gridpoints/{self._grid_id}/{self._grid_x},{self._grid_y}/stations"
+        else:
+            # Step 1: Resolve grid coordinates from lat/lon.
+            points_url = f"{NWS_API_BASE}/points/{self._lat},{self._lon}"
+            points_data = self._get(points_url)
+            props = points_data.get("properties", {})
 
-        stations_url = props.get("observationStations")
-        if not stations_url:
+            stations_url = props.get("observationStations")
             grid_id = props.get("gridId")
             grid_x = props.get("gridX")
             grid_y = props.get("gridY")
-            if not all([grid_id, grid_x is not None, grid_y is not None]):
-                raise NWSError("Could not determine grid coordinates from NWS points API.")
-            stations_url = f"{NWS_API_BASE}/gridpoints/{grid_id}/{grid_x},{grid_y}/stations"
+            if all([grid_id, grid_x is not None, grid_y is not None]):
+                self._grid_id = grid_id
+                self._grid_x = grid_x
+                self._grid_y = grid_y
+                logger.debug("Resolved NWS gridpoint: %s/%s,%s", self._grid_id, self._grid_x, self._grid_y)
+            if not stations_url:
+                if self._grid_id is None:
+                    raise NWSError("Could not determine grid coordinates from NWS points API.")
+                stations_url = f"{NWS_API_BASE}/gridpoints/{self._grid_id}/{self._grid_x},{self._grid_y}/stations"
 
         # Step 2: Fetch stations (already sorted by distance from the grid point).
         stations_data = self._get(stations_url)
@@ -145,6 +174,11 @@ class NWSClient:
             coords = feat.get("geometry", {}).get("coordinates", [])
             stn_lon = coords[0] if len(coords) >= 2 else None
             stn_lat = coords[1] if len(coords) >= 2 else None
+            dist = (
+                self._haversine_miles(self._lat, self._lon, stn_lat, stn_lon)
+                if (stn_lat is not None and stn_lon is not None)
+                else float("inf")
+            )
             self._stations.append(
                 {
                     "id": sid,
@@ -152,6 +186,7 @@ class NWSClient:
                     "is_personal": self._is_personal_station({"id": sid}),
                     "lat": stn_lat,
                     "lon": stn_lon,
+                    "distance_miles": dist,
                 }
             )
 
@@ -201,7 +236,12 @@ class NWSClient:
         return observations
 
     def _fetch_single_observation(self, station_id: str, now: datetime) -> dict | None:
-        """Fetch and validate a single station's latest observation."""
+        """Fetch and validate a single station's latest observation.
+
+        Sets ``self._last_skip_reason`` to a human-readable string whenever
+        returning ``None`` so callers can log the specific rejection cause.
+        """
+        self._last_skip_reason = None
         url = f"{NWS_API_BASE}/stations/{station_id}/observations/latest"
         data = self._get(url)
         props = data.get("properties", {})
@@ -210,22 +250,27 @@ class NWSClient:
         ts_str = props.get("timestamp")
         if not ts_str:
             logger.debug("Station %s: no timestamp — skipping.", station_id)
+            self._last_skip_reason = "no timestamp"
             return None
 
         try:
             ts = datetime.fromisoformat(ts_str)
         except (ValueError, TypeError):
             logger.debug("Station %s: unparseable timestamp '%s'.", station_id, ts_str)
+            self._last_skip_reason = "invalid timestamp"
             return None
 
-        if now - ts > _MAX_OBS_AGE:
+        age = now - ts
+        if age > _MAX_OBS_AGE:
             logger.debug("Station %s: observation too old (%s).", station_id, ts_str)
+            self._last_skip_reason = f"stale ({self._format_age(age)})"
             return None
 
         # Parse temperature (Celsius → Fahrenheit).
         temp_raw = props.get("temperature", {})
         temp_c = temp_raw.get("value")
         if temp_c is None:
+            self._last_skip_reason = "no temperature"
             return None
         temperature_f = self._c_to_f(float(temp_c))
 
@@ -255,11 +300,8 @@ class NWSClient:
     # ------------------------------------------------------------------
 
     def _station_distance_key(self, station: dict) -> float:
-        """Haversine distance from target for sorting; inf if no coords."""
-        lat, lon = station.get("lat"), station.get("lon")
-        if lat is None or lon is None:
-            return float("inf")
-        return self._haversine_miles(self._lat, self._lon, lat, lon)
+        """Return the pre-computed distance (miles) for sorting; inf if unknown."""
+        return station.get("distance_miles", float("inf"))
 
     def get_outdoor_conditions(self) -> dict:
         """Compute aggregated outdoor conditions using the MEDIAN of the
@@ -280,33 +322,28 @@ class NWSClient:
         """
         self.discover_stations()
 
-        # Blend all stations and sort by distance from target.
+        # Blend all stations, sort by distance, then cap to those within the
+        # configured radius so distant outliers don't bloat the search.
         sorted_stations = sorted(self._stations, key=self._station_distance_key)
-        candidates = sorted_stations[:3]
+        nearby = [
+            s for s in sorted_stations
+            if self._station_distance_key(s) <= _MAX_STATION_DISTANCE_MILES
+        ]
+        if not nearby:
+            logger.warning(
+                "No stations within %.0f mi — falling back to all %d stations.",
+                _MAX_STATION_DISTANCE_MILES, len(sorted_stations),
+            )
+            nearby = sorted_stations
+        else:
+            logger.info(
+                "Station pool: %d within %.0f mi (of %d total).",
+                len(nearby), _MAX_STATION_DISTANCE_MILES, len(sorted_stations),
+            )
+        stations_by_id = {s["id"]: s for s in self._stations}
 
         now = datetime.now(timezone.utc)
-        observations = self._fetch_batch(
-            [s["id"] for s in candidates], now, target=3,
-        )
-
-        # Log each station's temperature reading.
-        stations_by_id = {s["id"]: s for s in self._stations}
-        for obs in observations:
-            sid = obs["station_id"]
-            stn = stations_by_id.get(sid, {})
-            stype = "personal" if stn.get("is_personal", True) else "official"
-            stn_lat, stn_lon = stn.get("lat"), stn.get("lon")
-            if stn_lat is not None and stn_lon is not None:
-                dist = self._haversine_miles(self._lat, self._lon, stn_lat, stn_lon)
-                logger.info(
-                    "Station %s (%s): %.1f°F at %.1f mi",
-                    sid, stype, obs["temperature_f"], dist,
-                )
-            else:
-                logger.info(
-                    "Station %s (%s): %.1f°F at unknown distance",
-                    sid, stype, obs["temperature_f"],
-                )
+        observations = self._fetch_batch(nearby, now, target=3)
 
         if not observations:
             raise NWSError("No valid weather observations available from any station.")
@@ -316,30 +353,105 @@ class NWSClient:
             not stations_by_id.get(o["station_id"], {}).get("is_personal", True)
             for o in observations
         )
+        used_cache = any(o.get("is_cached", False) for o in observations)
 
         result = self._aggregate(observations, is_fallback)
+        result["used_cache"] = used_cache
         logger.info(
-            "Outdoor temperature: %.1f°F (median of %d readings)",
+            "Outdoor temperature: %.1f°F (median of %d readings%s)",
             result["temperature_f"],
             len(observations),
+            ", some from cache" if used_cache else "",
         )
         return result
 
     def _fetch_batch(
-        self, station_ids: list[str], now: datetime, target: int
+        self, stations: list[dict], now: datetime, target: int
     ) -> list[dict]:
-        """Fetch observations from *station_ids* until *target* valid
-        readings are collected or the list is exhausted."""
+        """Walk *stations* in order, fetching until *target* valid readings
+        are collected or the list is exhausted.
+
+        Logs one INFO line per station examined:
+            ``#N  SID  (type, dist) → ✓ XX.X°F``  or  ``→ ✗ reason``
+            ``#N  SID  (type, dist) → ⚠ cached (last good: Xh Ym ago)``
+        followed by a summary line.
+
+        Valid observations are stored in ``self._station_cache`` for use as
+        last-known-good (LKG) fallbacks on future calls within the same run.
+        """
         results: list[dict] = []
-        for sid in station_ids:
+        checked = 0
+        fresh_count = 0
+        cached_count = 0
+
+        for stn in stations:
             if len(results) >= target:
                 break
+
+            checked += 1
+            sid = stn["id"]
+            stype = "personal" if stn.get("is_personal", True) else "official"
+            dist = stn.get("distance_miles", float("inf"))
+            dist_str = f"{dist:4.1f} mi" if dist != float("inf") else " ??? mi"
+
+            self._last_skip_reason = None
+            api_error: NWSError | None = None
+            obs: dict | None = None
             try:
                 obs = self._fetch_single_observation(sid, now)
-                if obs is not None:
-                    results.append(obs)
-            except NWSError:
-                logger.warning("Skipping station %s due to error.", sid, exc_info=True)
+            except NWSError as exc:
+                api_error = exc
+
+            if obs is not None:
+                logger.info(
+                    "  #%-2d  %-8s  (%-8s %s) → ✓ %.1f°F",
+                    checked, sid, stype + ",", dist_str, obs["temperature_f"],
+                )
+                self._station_cache[sid] = obs
+                fresh_count += 1
+                results.append(obs)
+                continue
+
+            # Station was skipped — try the LKG cache.
+            cached = self._station_cache.get(sid)
+            if cached is not None:
+                cache_age = now - cached["timestamp"]
+                if cache_age <= _CACHE_MAX_AGE:
+                    cached_obs = {**cached, "is_cached": True}
+                    age_str = self._format_age(cache_age)
+                    logger.info(
+                        "  #%-2d  %-8s  (%-8s %s) → ⚠ cached (last good: %s)",
+                        checked, sid, stype + ",", dist_str, age_str,
+                    )
+                    cached_count += 1
+                    results.append(cached_obs)
+                    continue
+                else:
+                    logger.info(
+                        "  #%-2d  %-8s  (%-8s %s) → ✗ no recent data (cache expired)",
+                        checked, sid, stype + ",", dist_str,
+                    )
+                    continue
+
+            # No cache entry — log original rejection reason.
+            if api_error is not None:
+                logger.info(
+                    "  #%-2d  %-8s  (%-8s %s) → ✗ API error: %s",
+                    checked, sid, stype + ",", dist_str, api_error,
+                )
+            else:
+                reason = self._last_skip_reason or "unknown"
+                logger.info(
+                    "  #%-2d  %-8s  (%-8s %s) → ✗ %s",
+                    checked, sid, stype + ",", dist_str, reason,
+                )
+
+        logger.info(
+            "Station search complete: %d valid reading%s (%d fresh, %d cached) from %d station%s checked.",
+            len(results), "s" if len(results) != 1 else "",
+            fresh_count, cached_count,
+            checked, "s" if checked != 1 else "",
+        )
         return results
 
     @staticmethod

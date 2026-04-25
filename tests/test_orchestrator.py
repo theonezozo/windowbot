@@ -486,3 +486,317 @@ class TestInsufficientData:
 
         # State still gets updated (engine returns _keep)
         state_mgr.update_floor_state.assert_called_once()
+
+
+# ------------------------------------------------------------------
+# Conditional / Lazy AQI Polling
+# ------------------------------------------------------------------
+
+
+class TestConditionalAqiPolling:
+    """Lazy AQI fetching — orchestrator skips PurpleAir/AirNow when unnecessary.
+
+    Validates:
+    - AQI skipped when windows CLOSED + indoor comfortable
+    - AQI skipped when HVAC mode blocks action
+    - AQI fetched when windows OPEN (safety net)
+    - AQI fetched when temperature favors opening
+    - AQI cached across floors in same run_check cycle
+    - Fallback PurpleAir→AirNow still works in lazy path
+    - Skip reason logged correctly
+    """
+
+    # -- Helpers --
+
+    @staticmethod
+    def _setup_run_check_mocks(
+        mock_config,
+        mock_state_cls,
+        mock_ecobee_cls,
+        mock_nws_cls,
+        *,
+        sensor_temps=None,
+        hvac_mode="cool",
+        outdoor_temp=65.0,
+        outdoor_humidity=50.0,
+        current_state="CLOSED",
+    ):
+        """Wire up the standard mocks for a run_check integration test."""
+        if sensor_temps is None:
+            sensor_temps = {"sensor_up": 70.0, "sensor_down": 70.0}
+
+        mock_config.return_value = _base_config()
+
+        mock_state = MagicMock()
+        mock_state.get_floor_state.return_value = {
+            "CurrentState": current_state,
+        }
+        mock_state_cls.return_value = mock_state
+
+        sensors = [
+            {"name": name, "temperature_f": temp, "is_online": True}
+            for name, temp in sensor_temps.items()
+        ]
+        mock_ecobee = MagicMock()
+        mock_ecobee.get_sensors.return_value = sensors
+        mock_ecobee.get_hvac_mode.return_value = hvac_mode
+        mock_ecobee_cls.return_value = mock_ecobee
+
+        mock_nws = MagicMock()
+        mock_nws.get_outdoor_conditions.return_value = {
+            "temperature_f": outdoor_temp,
+            "humidity": outdoor_humidity,
+        }
+        mock_nws_cls.return_value = mock_nws
+
+    # ------------------------------------------------------------------
+    # 1. AQI skipped when windows CLOSED + indoor comfortable (≤72°F)
+    # ------------------------------------------------------------------
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_aqi_skipped_when_closed_and_comfortable(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+    ):
+        """Windows CLOSED + indoor 70°F (≤ 72°F comfort max) → AQI not fetched."""
+        self._setup_run_check_mocks(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            sensor_temps={"sensor_up": 70.0, "sensor_down": 70.0},
+            hvac_mode="cool",
+            outdoor_temp=65.0,
+            current_state="CLOSED",
+        )
+
+        run_check()
+
+        mock_fetch_aqi.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # 2. AQI skipped when HVAC mode not in allowed list
+    # ------------------------------------------------------------------
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_aqi_skipped_when_hvac_mode_not_allowed(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+    ):
+        """HVAC mode 'heat' not in allowed modes → AQI not fetched."""
+        self._setup_run_check_mocks(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            sensor_temps={"sensor_up": 78.0, "sensor_down": 78.0},
+            hvac_mode="heat",
+            outdoor_temp=65.0,
+            current_state="CLOSED",
+        )
+
+        run_check()
+
+        mock_fetch_aqi.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # 3. AQI fetched when windows are OPEN
+    # ------------------------------------------------------------------
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_aqi_fetched_when_windows_open(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+    ):
+        """Windows OPEN → AQI always fetched (urgent close safety net)."""
+        self._setup_run_check_mocks(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            sensor_temps={"sensor_up": 74.0, "sensor_down": 74.0},
+            hvac_mode="cool",
+            outdoor_temp=68.0,
+            current_state="OPEN",
+        )
+        mock_fetch_aqi.return_value = {"aqi": 30, "source": "purpleair"}
+
+        run_check()
+
+        mock_fetch_aqi.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # 4. AQI fetched when windows closed but temperature favors opening
+    # ------------------------------------------------------------------
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_aqi_fetched_when_temp_favors_opening(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+    ):
+        """Indoor 78°F, outdoor 65°F, CLOSED → AQI fetched to confirm safe."""
+        self._setup_run_check_mocks(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            sensor_temps={"sensor_up": 78.0, "sensor_down": 78.0},
+            hvac_mode="cool",
+            outdoor_temp=65.0,
+            current_state="CLOSED",
+        )
+        mock_fetch_aqi.return_value = {"aqi": 25, "source": "purpleair"}
+
+        run_check()
+
+        mock_fetch_aqi.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # 5. AQI cached across floors in same run_check cycle
+    # ------------------------------------------------------------------
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_aqi_cached_across_floors(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+    ):
+        """Both floors need AQI (OPEN) → _fetch_aqi called exactly once."""
+        self._setup_run_check_mocks(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            sensor_temps={"sensor_up": 74.0, "sensor_down": 74.0},
+            hvac_mode="cool",
+            outdoor_temp=68.0,
+            current_state="OPEN",
+        )
+        aqi_result = {"aqi": 42, "source": "purpleair"}
+        mock_fetch_aqi.return_value = aqi_result
+
+        run_check()
+
+        # Single fetch despite two floors needing AQI
+        mock_fetch_aqi.assert_called_once()
+        # Both floors evaluated with the cached result
+        assert mock_eval_floor.call_count == 2
+        for eval_call in mock_eval_floor.call_args_list:
+            assert eval_call.args[4] == aqi_result  # aqi_data positional arg
+
+    # ------------------------------------------------------------------
+    # 6. Fallback PurpleAir→AirNow still works in the lazy path
+    # ------------------------------------------------------------------
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_fallback_works_when_aqi_needed(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_pa_cls, mock_an_cls, mock_eval_floor,
+    ):
+        """PurpleAir fails when AQI IS needed → AirNow fallback used."""
+        self._setup_run_check_mocks(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            sensor_temps={"sensor_up": 74.0, "sensor_down": 74.0},
+            hvac_mode="cool",
+            outdoor_temp=68.0,
+            current_state="OPEN",
+        )
+
+        # PurpleAir fails
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.side_effect = Exception("PurpleAir down")
+        mock_pa_cls.return_value = mock_pa
+
+        # AirNow succeeds
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 55, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        run_check()
+
+        # AirNow was used as fallback
+        mock_an.get_aqi.assert_called_once()
+        # _evaluate_floor received the AirNow result
+        assert mock_eval_floor.call_count == 2
+        for eval_call in mock_eval_floor.call_args_list:
+            assert eval_call.args[4]["source"] == "airnow"
+
+    # ------------------------------------------------------------------
+    # 7. AQI skip reason logged
+    # ------------------------------------------------------------------
+
+    @patch("src.orchestrator.logger")
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_aqi_skipped_log_message(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_fetch_aqi, mock_eval_floor, mock_logger,
+    ):
+        """When AQI is skipped, logger records the floor name and skip reason."""
+        self._setup_run_check_mocks(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            sensor_temps={"sensor_up": 70.0, "sensor_down": 70.0},
+            hvac_mode="cool",
+            outdoor_temp=65.0,
+            current_state="CLOSED",
+        )
+
+        run_check()
+
+        # At least one "Skipping AQI fetch" log per skipped floor
+        skip_calls = [
+            c for c in mock_logger.info.call_args_list
+            if len(c.args) >= 2 and "Skipping AQI fetch" in str(c.args[0])
+        ]
+        assert len(skip_calls) >= 1
+        # The log message includes the floor name
+        assert any("upstairs" in str(c) for c in skip_calls)
+
+    # ------------------------------------------------------------------
+    # 8. Skipped AQI passes sentinel to _evaluate_floor
+    # ------------------------------------------------------------------
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_skipped_aqi_passes_sentinel_to_evaluate(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+    ):
+        """When AQI is skipped, _evaluate_floor receives {"aqi": 0, "source": "skipped"}."""
+        self._setup_run_check_mocks(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            sensor_temps={"sensor_up": 70.0, "sensor_down": 70.0},
+            hvac_mode="cool",
+            outdoor_temp=65.0,
+            current_state="CLOSED",
+        )
+
+        run_check()
+
+        mock_fetch_aqi.assert_not_called()
+        for eval_call in mock_eval_floor.call_args_list:
+            aqi_arg = eval_call.args[4]
+            assert aqi_arg == {"aqi": 0, "source": "skipped"}
