@@ -302,13 +302,14 @@ class TestPerFloorIteration:
 
     @patch("src.orchestrator._evaluate_floor")
     @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
     @patch("src.orchestrator.NWSClient")
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
     def test_both_floors_evaluated(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
-        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
     ):
         """run_check calls _evaluate_floor for both upstairs and downstairs."""
         mock_config.return_value = _base_config()
@@ -323,6 +324,7 @@ class TestPerFloorIteration:
             "temperature_f": 70.0, "humidity": 50.0
         }
         mock_nws_cls.return_value = mock_nws
+        mock_om_cls.return_value.get_observation.side_effect = OpenMeteoError("test")
 
         mock_fetch_aqi.return_value = {"aqi": 30}
 
@@ -336,13 +338,14 @@ class TestPerFloorIteration:
 
     @patch("src.orchestrator._evaluate_floor")
     @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
     @patch("src.orchestrator.NWSClient")
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
     def test_empty_floor_skipped(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
-        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
     ):
         """Floor with empty sensor list → skipped."""
         mock_config.return_value = _base_config(downstairs_sensors=[])
@@ -357,6 +360,7 @@ class TestPerFloorIteration:
             "temperature_f": 70.0, "humidity": 50.0
         }
         mock_nws_cls.return_value = mock_nws
+        mock_om_cls.return_value.get_observation.side_effect = OpenMeteoError("test")
 
         mock_fetch_aqi.return_value = {"aqi": 30}
 
@@ -440,8 +444,8 @@ class TestNWSFailure:
         self, mock_config, mock_state_cls, mock_ecobee_cls,
         mock_get_nws, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
     ):
-        """NWSError + OpenMeteoError (no WU/Synoptic keys) → floors not evaluated."""
-        mock_config.return_value = _base_config()  # no synoptic_api_key, no wu_api_key
+        """NWSError + OpenMeteoError (peer and fallback both fail) → floors not evaluated."""
+        mock_config.return_value = _base_config()
 
         mock_ecobee = MagicMock()
         mock_ecobee.get_sensors.return_value = []
@@ -453,6 +457,7 @@ class TestNWSFailure:
         mock_get_nws.return_value = mock_nws
 
         mock_om = MagicMock()
+        mock_om.get_observation.side_effect = OpenMeteoError("OM down")
         mock_om.get_outdoor_conditions.side_effect = OpenMeteoError("OM down")
         mock_om_cls.return_value = mock_om
 
@@ -520,6 +525,7 @@ class TestConditionalAqiPolling:
         mock_state_cls,
         mock_ecobee_cls,
         mock_nws_cls,
+        mock_om_cls=None,
         *,
         sensor_temps=None,
         hvac_mode="cool",
@@ -555,23 +561,27 @@ class TestConditionalAqiPolling:
         }
         mock_nws_cls.return_value = mock_nws
 
+        if mock_om_cls is not None:
+            mock_om_cls.return_value.get_observation.side_effect = OpenMeteoError("no peer")
+
     # ------------------------------------------------------------------
     # 1. AQI skipped when windows CLOSED + indoor comfortable (≤72°F)
     # ------------------------------------------------------------------
 
     @patch("src.orchestrator._evaluate_floor")
     @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
     @patch("src.orchestrator.NWSClient")
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
     def test_aqi_skipped_when_closed_and_comfortable(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
-        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
     ):
         """Windows CLOSED + indoor 70°F (≤ 72°F comfort max) → AQI not fetched."""
         self._setup_run_check_mocks(
-            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
             sensor_temps={"sensor_up": 70.0, "sensor_down": 70.0},
             hvac_mode="cool",
             outdoor_temp=65.0,
@@ -588,17 +598,18 @@ class TestConditionalAqiPolling:
 
     @patch("src.orchestrator._evaluate_floor")
     @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
     @patch("src.orchestrator.NWSClient")
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
     def test_aqi_skipped_when_hvac_mode_not_allowed(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
-        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
     ):
         """HVAC mode 'heat' not in allowed modes → AQI not fetched."""
         self._setup_run_check_mocks(
-            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
             sensor_temps={"sensor_up": 78.0, "sensor_down": 78.0},
             hvac_mode="heat",
             outdoor_temp=65.0,
@@ -615,17 +626,18 @@ class TestConditionalAqiPolling:
 
     @patch("src.orchestrator._evaluate_floor")
     @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
     @patch("src.orchestrator.NWSClient")
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
     def test_aqi_fetched_when_windows_open(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
-        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
     ):
         """Windows OPEN → AQI always fetched (urgent close safety net)."""
         self._setup_run_check_mocks(
-            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
             sensor_temps={"sensor_up": 74.0, "sensor_down": 74.0},
             hvac_mode="cool",
             outdoor_temp=68.0,
@@ -643,17 +655,18 @@ class TestConditionalAqiPolling:
 
     @patch("src.orchestrator._evaluate_floor")
     @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
     @patch("src.orchestrator.NWSClient")
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
     def test_aqi_fetched_when_temp_favors_opening(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
-        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
     ):
         """Indoor 78°F, outdoor 65°F, CLOSED → AQI fetched to confirm safe."""
         self._setup_run_check_mocks(
-            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
             sensor_temps={"sensor_up": 78.0, "sensor_down": 78.0},
             hvac_mode="cool",
             outdoor_temp=65.0,
@@ -671,17 +684,18 @@ class TestConditionalAqiPolling:
 
     @patch("src.orchestrator._evaluate_floor")
     @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
     @patch("src.orchestrator.NWSClient")
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
     def test_aqi_cached_across_floors(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
-        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
     ):
         """Both floors need AQI (OPEN) → _fetch_aqi called exactly once."""
         self._setup_run_check_mocks(
-            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
             sensor_temps={"sensor_up": 74.0, "sensor_down": 74.0},
             hvac_mode="cool",
             outdoor_temp=68.0,
@@ -706,17 +720,18 @@ class TestConditionalAqiPolling:
     @patch("src.orchestrator._evaluate_floor")
     @patch("src.orchestrator.AirNowClient")
     @patch("src.orchestrator.PurpleAirClient")
+    @patch("src.orchestrator.OpenMeteoClient")
     @patch("src.orchestrator.NWSClient")
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
     def test_fallback_works_when_aqi_needed(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
-        mock_nws_cls, mock_pa_cls, mock_an_cls, mock_eval_floor,
+        mock_nws_cls, mock_om_cls, mock_pa_cls, mock_an_cls, mock_eval_floor,
     ):
         """PurpleAir fails when AQI IS needed → AirNow fallback used."""
         self._setup_run_check_mocks(
-            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
             sensor_temps={"sensor_up": 74.0, "sensor_down": 74.0},
             hvac_mode="cool",
             outdoor_temp=68.0,
@@ -749,17 +764,18 @@ class TestConditionalAqiPolling:
     @patch("src.orchestrator.logger")
     @patch("src.orchestrator._evaluate_floor")
     @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
     @patch("src.orchestrator.NWSClient")
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
     def test_aqi_skipped_log_message(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
-        mock_nws_cls, mock_fetch_aqi, mock_eval_floor, mock_logger,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor, mock_logger,
     ):
         """When AQI is skipped, logger records the floor name and skip reason."""
         self._setup_run_check_mocks(
-            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
             sensor_temps={"sensor_up": 70.0, "sensor_down": 70.0},
             hvac_mode="cool",
             outdoor_temp=65.0,
@@ -783,17 +799,18 @@ class TestConditionalAqiPolling:
 
     @patch("src.orchestrator._evaluate_floor")
     @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
     @patch("src.orchestrator.NWSClient")
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
     def test_skipped_aqi_passes_sentinel_to_evaluate(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
-        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
     ):
         """When AQI is skipped, _evaluate_floor receives {"aqi": 0, "source": "skipped"}."""
         self._setup_run_check_mocks(
-            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls,
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
             sensor_temps={"sensor_up": 70.0, "sensor_down": 70.0},
             hvac_mode="cool",
             outdoor_temp=65.0,
@@ -809,15 +826,19 @@ class TestConditionalAqiPolling:
 
 
 # ------------------------------------------------------------------
-# Weather Fallback Chain: WU → NWS → Open-Meteo
+# Weather Fallback Chain: NWS (+ OM peer) → Open-Meteo sole fallback
 # ------------------------------------------------------------------
 
 
 class TestWeatherFallbackChain:
-    """2-level outdoor weather fallback: NWS → Open-Meteo.
+    """Outdoor weather: Open-Meteo always attempted as a peer alongside NWS.
 
-    WU and Synoptic clients exist in src/ but are not wired into the
-    orchestrator — they activate only when API keys are added in the future.
+    Flow:
+      1. om.get_observation() called first (peer blending attempt).
+      2. nws.get_outdoor_conditions(peer_observations=...) called.
+      3. If NWS fails + OM peer fresh → OM used as sole source.
+      4. If NWS fails + OM peer stale → om.get_outdoor_conditions() (no age check).
+      5. If everything fails → return early.
     """
 
     @patch("src.orchestrator._evaluate_floor")
@@ -827,12 +848,12 @@ class TestWeatherFallbackChain:
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
-    def test_nws_succeeds_openmeteo_not_called(
+    def test_nws_succeeds_floors_evaluated(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
         mock_get_nws, mock_om_cls,
         mock_fetch_aqi, mock_eval_floor,
     ):
-        """NWS succeeds → Open-Meteo is never called."""
+        """NWS succeeds (OM peer optional) → floors evaluated."""
         mock_config.return_value = _base_config()
 
         mock_ecobee = MagicMock()
@@ -846,10 +867,15 @@ class TestWeatherFallbackChain:
         }
         mock_get_nws.return_value = mock_nws
 
+        # OM peer fails — NWS should still work alone
+        mock_om = MagicMock()
+        mock_om.get_observation.side_effect = OpenMeteoError("stale")
+        mock_om_cls.return_value = mock_om
+
         run_check()
 
         mock_nws.get_outdoor_conditions.assert_called_once()
-        mock_om_cls.assert_not_called()
+        assert mock_eval_floor.call_count >= 1
 
     @patch("src.orchestrator._evaluate_floor")
     @patch("src.orchestrator._fetch_aqi")
@@ -858,12 +884,54 @@ class TestWeatherFallbackChain:
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
-    def test_nws_fails_openmeteo_succeeds(
+    def test_nws_fails_om_peer_used_as_sole_source(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
         mock_get_nws, mock_om_cls,
         mock_fetch_aqi, mock_eval_floor,
     ):
-        """NWS fails → Open-Meteo used as fallback."""
+        """NWS fails → fresh OM peer used as sole outdoor source; get_outdoor_conditions not called."""
+        mock_config.return_value = _base_config()
+
+        mock_ecobee = MagicMock()
+        mock_ecobee.get_sensors.return_value = []
+        mock_ecobee.get_hvac_mode.return_value = "cool"
+        mock_ecobee_cls.return_value = mock_ecobee
+
+        mock_nws = MagicMock()
+        mock_nws.get_outdoor_conditions.side_effect = NWSError("NWS down")
+        mock_get_nws.return_value = mock_nws
+
+        from datetime import datetime, timezone
+        mock_om = MagicMock()
+        mock_om.get_observation.return_value = {
+            "station_id": "OPENMETEO",
+            "temperature_f": 66.0,
+            "humidity": 60.0,
+            "wind_speed_mph": 5.0,
+            "timestamp": datetime.now(timezone.utc),
+        }
+        mock_om_cls.return_value = mock_om
+
+        run_check()
+
+        mock_nws.get_outdoor_conditions.assert_called_once()
+        mock_om.get_observation.assert_called_once()
+        mock_om.get_outdoor_conditions.assert_not_called()
+        assert mock_eval_floor.call_count >= 1
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator._get_nws_client")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_nws_fails_peer_stale_falls_back_to_om_conditions(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_get_nws, mock_om_cls,
+        mock_fetch_aqi, mock_eval_floor,
+    ):
+        """NWS fails, OM peer stale → get_outdoor_conditions() last-resort fallback."""
         mock_config.return_value = _base_config()
 
         mock_ecobee = MagicMock()
@@ -876,16 +944,16 @@ class TestWeatherFallbackChain:
         mock_get_nws.return_value = mock_nws
 
         mock_om = MagicMock()
+        mock_om.get_observation.side_effect = OpenMeteoError("stale")
         mock_om.get_outdoor_conditions.return_value = {
-            "temperature_f": 66.0, "humidity": 60.0,
+            "temperature_f": 66.0, "humidity": 60.0, "wind_speed_mph": 5.0,
             "source": "openmeteo", "is_fallback": True,
+            "station_count": 1, "used_cache": False,
         }
         mock_om_cls.return_value = mock_om
 
         run_check()
 
-        mock_nws.get_outdoor_conditions.assert_called_once()
-        mock_om_cls.assert_called_once()
         mock_om.get_outdoor_conditions.assert_called_once()
         assert mock_eval_floor.call_count >= 1
 
@@ -901,7 +969,7 @@ class TestWeatherFallbackChain:
         mock_get_nws, mock_om_cls,
         mock_fetch_aqi, mock_eval_floor,
     ):
-        """NWS and Open-Meteo both fail → returns early, no floor evaluation."""
+        """NWS fails, OM peer stale, OM fallback fails → returns early, no floor evaluation."""
         mock_config.return_value = _base_config()
 
         mock_ecobee = MagicMock()
@@ -914,9 +982,11 @@ class TestWeatherFallbackChain:
         mock_get_nws.return_value = mock_nws
 
         mock_om = MagicMock()
+        mock_om.get_observation.side_effect = OpenMeteoError("stale")
         mock_om.get_outdoor_conditions.side_effect = OpenMeteoError("OM down")
         mock_om_cls.return_value = mock_om
 
         run_check()
 
         mock_eval_floor.assert_not_called()
+

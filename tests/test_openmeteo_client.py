@@ -1,9 +1,12 @@
-"""Tests for the Open-Meteo free weather fallback client.
+"""Tests for the Open-Meteo free weather peer/fallback client.
 
 Validates design decisions:
 - No API key required — zero-auth grid-based weather data.
 - Single API call (no station discovery step).
-- Returns dict matching NWS/WU format: temperature_f, humidity, wind_speed_mph.
+- get_outdoor_conditions() returns NWS-compatible aggregated dict.
+- get_observation() returns NWS-compatible single-station dict with timestamp.
+- Freshness check: get_observation() raises OpenMeteoError when obs > 30 min old.
+- Timestamp parsed from current["time"] + utc_offset_seconds → UTC datetime.
 - Always: source="openmeteo", is_fallback=True, station_count=1, used_cache=False.
 - Null humidity / wind → None in result (not error).
 - HTTP errors → OpenMeteoError.
@@ -14,6 +17,7 @@ Validates design decisions:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -33,10 +37,28 @@ def _api_response(
     temp_f: float = 65.3,
     humidity: float | None = 58,
     wind_mph: float | None = 7.2,
+    utc_offset_seconds: int = 0,
+    time_offset_minutes: int = -5,  # default: timestamp 5 minutes ago (fresh)
 ):
-    """Build a mock Open-Meteo current-weather JSON response."""
+    """Build a mock Open-Meteo current-weather JSON response.
+
+    Args:
+        utc_offset_seconds: UTC offset in seconds (0 = UTC).
+        time_offset_minutes: Offset from now in minutes (negative = in the past).
+    """
+    # Build a timestamp that, after UTC conversion, is `time_offset_minutes` old.
+    # local_time = UTC + utc_offset_seconds
+    # so: local_naive = (now + offset_delta) + time_offset
+    now_utc = datetime.now(timezone.utc)
+    local_naive = (
+        now_utc
+        + timedelta(seconds=utc_offset_seconds)
+        + timedelta(minutes=time_offset_minutes)
+    ).replace(tzinfo=None)
+    ts_str = local_naive.strftime("%Y-%m-%dT%H:%M")
+
     current = {
-        "time": "2026-04-25T08:30",
+        "time": ts_str,
         "interval": 900,
         "temperature_2m": temp_f,
     }
@@ -44,7 +66,7 @@ def _api_response(
         current["relative_humidity_2m"] = humidity
     if wind_mph is not None:
         current["wind_speed_10m"] = wind_mph
-    return {"current": current}
+    return {"current": current, "utc_offset_seconds": utc_offset_seconds}
 
 
 # ------------------------------------------------------------------
@@ -360,3 +382,124 @@ class TestMalformedResponse:
         client = OpenMeteoClient(_LAT, _LON)
         with pytest.raises(OpenMeteoError, match="temperature"):
             client.get_outdoor_conditions()
+
+
+# ------------------------------------------------------------------
+# get_observation() — NWS-compatible single-station dict
+# ------------------------------------------------------------------
+
+
+class TestGetObservation:
+    """get_observation() returns an NWS-compatible dict and enforces freshness."""
+
+    @patch("src.openmeteo_client.requests.get")
+    def test_returns_nws_compatible_dict(self, mock_get):
+        """Fresh observation → dict with station_id, temperature_f, humidity,
+        wind_speed_mph, and timestamp."""
+        mock_get.return_value = MagicMock(
+            ok=True,
+            json=lambda: _api_response(temp_f=65.3, humidity=58, wind_mph=7.2),
+        )
+        client = OpenMeteoClient(_LAT, _LON)
+        result = client.get_observation()
+
+        assert result["station_id"] == "OPENMETEO"
+        assert result["temperature_f"] == pytest.approx(65.3, abs=0.1)
+        assert result["humidity"] == pytest.approx(58.0, abs=0.1)
+        assert result["wind_speed_mph"] == pytest.approx(7.2, abs=0.1)
+        assert isinstance(result["timestamp"], datetime)
+        assert result["timestamp"].tzinfo == timezone.utc
+
+    @patch("src.openmeteo_client.requests.get")
+    def test_fresh_observation_does_not_raise(self, mock_get):
+        """Timestamp 5 minutes old → no error."""
+        mock_get.return_value = MagicMock(
+            ok=True,
+            json=lambda: _api_response(time_offset_minutes=-5),
+        )
+        client = OpenMeteoClient(_LAT, _LON)
+        result = client.get_observation()  # should not raise
+        assert result["station_id"] == "OPENMETEO"
+
+    @patch("src.openmeteo_client.requests.get")
+    def test_stale_observation_raises(self, mock_get):
+        """Timestamp 45 minutes old → OpenMeteoError (stale)."""
+        mock_get.return_value = MagicMock(
+            ok=True,
+            json=lambda: _api_response(time_offset_minutes=-45),
+        )
+        client = OpenMeteoClient(_LAT, _LON)
+        with pytest.raises(OpenMeteoError, match="stale"):
+            client.get_observation()
+
+    @patch("src.openmeteo_client.requests.get")
+    def test_exactly_30_minute_boundary(self, mock_get):
+        """Timestamp exactly 30 minutes old → raises (age > 30m required to be fresh)."""
+        mock_get.return_value = MagicMock(
+            ok=True,
+            json=lambda: _api_response(time_offset_minutes=-30),
+        )
+        client = OpenMeteoClient(_LAT, _LON)
+        with pytest.raises(OpenMeteoError, match="stale"):
+            client.get_observation()
+
+    @patch("src.openmeteo_client.requests.get")
+    def test_timestamp_utc_conversion_positive_offset(self, mock_get):
+        """UTC+5 offset: local time converted to correct UTC datetime."""
+        utc_offset = 5 * 3600  # UTC+5
+        mock_get.return_value = MagicMock(
+            ok=True,
+            json=lambda: _api_response(
+                utc_offset_seconds=utc_offset, time_offset_minutes=-10
+            ),
+        )
+        client = OpenMeteoClient(_LAT, _LON)
+        result = client.get_observation()
+        ts = result["timestamp"]
+        # Timestamp should be within 2 minutes of 10 minutes ago (UTC)
+        expected = datetime.now(timezone.utc) - timedelta(minutes=10)
+        assert abs((ts - expected).total_seconds()) < 120
+
+    @patch("src.openmeteo_client.requests.get")
+    def test_timestamp_utc_conversion_negative_offset(self, mock_get):
+        """UTC-8 offset: local time converted to correct UTC datetime."""
+        utc_offset = -8 * 3600  # UTC-8
+        mock_get.return_value = MagicMock(
+            ok=True,
+            json=lambda: _api_response(
+                utc_offset_seconds=utc_offset, time_offset_minutes=-10
+            ),
+        )
+        client = OpenMeteoClient(_LAT, _LON)
+        result = client.get_observation()
+        ts = result["timestamp"]
+        expected = datetime.now(timezone.utc) - timedelta(minutes=10)
+        assert abs((ts - expected).total_seconds()) < 120
+
+    @patch("src.openmeteo_client.requests.get")
+    def test_null_humidity_allowed(self, mock_get):
+        """Missing humidity → humidity is None, no error."""
+        resp = _api_response(humidity=None)
+        resp["current"].pop("relative_humidity_2m", None)
+        mock_get.return_value = MagicMock(ok=True, json=lambda: resp)
+        client = OpenMeteoClient(_LAT, _LON)
+        result = client.get_observation()
+        assert result["humidity"] is None
+
+    @patch("src.openmeteo_client.requests.get")
+    def test_network_error_raises(self, mock_get):
+        """Network error → OpenMeteoError."""
+        import requests as req
+        mock_get.side_effect = req.ConnectionError("DNS failed")
+        client = OpenMeteoClient(_LAT, _LON)
+        with pytest.raises(OpenMeteoError, match="Network error"):
+            client.get_observation()
+
+    @patch("src.openmeteo_client.requests.get")
+    def test_http_error_raises(self, mock_get):
+        """HTTP 500 → OpenMeteoError."""
+        mock_get.return_value = MagicMock(ok=False, status_code=500, text="error")
+        client = OpenMeteoClient(_LAT, _LON)
+        with pytest.raises(OpenMeteoError, match="API error"):
+            client.get_observation()
+

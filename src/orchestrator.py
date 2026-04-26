@@ -79,21 +79,43 @@ def run_check() -> None:
             logger.error("Indoor sensor API error: %s", exc)
             return
 
-        # Fetch outdoor conditions — NWS primary, Open-Meteo free fallback.
-        # WU and Synoptic clients exist in src/ but are not active without
-        # their respective API keys (WU_API_KEY, SYNOPTIC_API_KEY).
+        # Fetch outdoor conditions.
+        # Open-Meteo is always attempted as a fresh peer alongside NWS —
+        # if its reading is ≤30 min old it is blended into the NWS median.
+        # If NWS station discovery fails entirely, Open-Meteo is the sole source.
+        lat, lon = config["user_latitude"], config["user_longitude"]
+        om = OpenMeteoClient(lat, lon)
+        om_obs: "dict | None" = None
+        try:
+            om_obs = om.get_observation()
+            logger.debug("Open-Meteo peer: %.1f°F", om_obs["temperature_f"])
+        except OpenMeteoError as exc:
+            logger.debug("Open-Meteo peer unavailable: %s", exc)
+
         outdoor = None
         try:
-            outdoor = _get_nws_client(config).get_outdoor_conditions()
-            logger.info("Outdoor data from NWS.")
+            outdoor = _get_nws_client(config).get_outdoor_conditions(
+                peer_observations=[om_obs] if om_obs else None
+            )
         except NWSError as exc:
-            logger.warning("NWS failed (%s), trying Open-Meteo.", exc)
+            logger.warning("NWS failed (%s).", exc)
+            if om_obs:
+                logger.info("Using Open-Meteo peer as sole outdoor source.")
+                outdoor = {
+                    "temperature_f": om_obs["temperature_f"],
+                    "humidity": om_obs["humidity"],
+                    "wind_speed_mph": om_obs["wind_speed_mph"],
+                    "station_count": 1,
+                    "is_fallback": True,
+                    "used_cache": False,
+                    "source": "openmeteo",
+                }
 
         if outdoor is None:
+            # NWS failed and no fresh OM peer — try OM without freshness check.
             try:
-                om = OpenMeteoClient(config["user_latitude"], config["user_longitude"])
                 outdoor = om.get_outdoor_conditions()
-                logger.info("Outdoor data from Open-Meteo (free fallback).")
+                logger.info("Outdoor data from Open-Meteo (last-resort fallback).")
             except OpenMeteoError as exc:
                 logger.error("All outdoor sources failed. Open-Meteo: %s", exc)
                 return

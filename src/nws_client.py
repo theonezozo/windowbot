@@ -303,14 +303,24 @@ class NWSClient:
         """Return the pre-computed distance (miles) for sorting; inf if unknown."""
         return station.get("distance_miles", float("inf"))
 
-    def get_outdoor_conditions(self) -> dict:
+    def get_outdoor_conditions(
+        self, peer_observations: list[dict] | None = None
+    ) -> dict:
         """Compute aggregated outdoor conditions using the MEDIAN of the
-        closest weather stations, blending personal and official together.
+        closest weather stations, blending personal, official, and optional
+        peer sources (e.g., Open-Meteo) together.
 
         Strategy:
             1. Sort all discovered stations by distance from target coordinates.
             2. Query the 3 closest stations (regardless of type).
-            3. Return the **median** temperature, humidity, and wind speed.
+            3. Append any fresh ``peer_observations`` to the pool.
+            4. Return the **median** temperature, humidity, and wind speed.
+
+        Args:
+            peer_observations: Optional list of pre-validated NWS-compatible
+                observation dicts (e.g., from Open-Meteo) to blend into the
+                median.  Each must have ``station_id``, ``temperature_f``,
+                ``humidity``, ``wind_speed_mph``, and ``timestamp``.
 
         Returns:
             Dict with keys:
@@ -318,7 +328,8 @@ class NWSClient:
             - ``humidity`` (float | None): Median outdoor humidity %.
             - ``wind_speed_mph`` (float | None): Median wind speed.
             - ``station_count`` (int): Number of stations contributing.
-            - ``is_fallback`` (bool): True if any official station contributed.
+            - ``is_fallback`` (bool): True if any official station contributed,
+              or if no NWS stations contributed (peer-only).
         """
         self.discover_stations()
 
@@ -343,25 +354,40 @@ class NWSClient:
         stations_by_id = {s["id"]: s for s in self._stations}
 
         now = datetime.now(timezone.utc)
-        observations = self._fetch_batch(nearby, now, target=3)
+        nws_observations = self._fetch_batch(nearby, now, target=3)
 
-        if not observations:
+        # Blend in any fresh peer observations (e.g., Open-Meteo grid point).
+        all_observations = list(nws_observations)
+        if peer_observations:
+            for peer_obs in peer_observations:
+                all_observations.append(peer_obs)
+                logger.info(
+                    "  peer  %-8s                             → ✓ %.1f°F",
+                    peer_obs.get("station_id", "PEER"), peer_obs["temperature_f"],
+                )
+
+        if not all_observations:
             raise NWSError("No valid weather observations available from any station.")
 
-        # is_fallback: True if any official station contributed.
-        is_fallback = any(
-            not stations_by_id.get(o["station_id"], {}).get("is_personal", True)
-            for o in observations
-        )
-        used_cache = any(o.get("is_cached", False) for o in observations)
+        # is_fallback: True if any official (non-personal) NWS station contributed,
+        # or if no NWS stations contributed at all (peer-only scenario).
+        peer_ids = {o.get("station_id") for o in (peer_observations or [])}
+        if not nws_observations:
+            is_fallback = True
+        else:
+            is_fallback = any(
+                not stations_by_id.get(o["station_id"], {}).get("is_personal", True)
+                for o in nws_observations
+            )
+        used_cache = any(o.get("is_cached", False) for o in nws_observations)
 
-        result = self._aggregate(observations, is_fallback)
+        result = self._aggregate(all_observations, is_fallback)
         result["used_cache"] = used_cache
         result["source"] = "nws"
         logger.info(
             "Outdoor temperature: %.1f°F (median of %d readings%s)",
             result["temperature_f"],
-            len(observations),
+            len(all_observations),
             ", some from cache" if used_cache else "",
         )
         return result

@@ -1,9 +1,12 @@
-"""Open-Meteo free weather fallback for WindowBot.
+"""Open-Meteo free weather peer/fallback for WindowBot.
 
 Fetches current outdoor temperature, humidity, and wind speed from the
 Open-Meteo API.  Completely free, requires NO API key, and returns
-model-interpolated data for exact coordinates.  This is the last-resort
-fallback behind both Weather Underground and NWS.
+model-interpolated data for exact coordinates.
+
+In normal operation Open-Meteo acts as a **peer station** alongside NWS:
+when its reading is fresh (≤30 min) it is blended into the NWS median pool.
+If all NWS stations fail, Open-Meteo serves as the sole fallback source.
 
 Reference: https://open-meteo.com/en/docs
 """
@@ -11,10 +14,14 @@ Reference: https://open-meteo.com/en/docs
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone, timedelta
 
 import requests
 
 logger = logging.getLogger("windowbot.openmeteo")
+
+# Observations older than this are not blended into the NWS peer pool.
+_MAX_OBS_AGE = timedelta(minutes=30)
 
 
 class OpenMeteoError(Exception):
@@ -22,7 +29,7 @@ class OpenMeteoError(Exception):
 
 
 class OpenMeteoClient:
-    """Free, zero-auth weather fallback using Open-Meteo.
+    """Free, zero-auth weather client using Open-Meteo.
 
     Returns model-interpolated weather data for exact coordinates.
     No station discovery needed — this is grid-based, not station-based.
@@ -35,22 +42,18 @@ class OpenMeteoClient:
         self._lat = latitude
         self._lon = longitude
 
-    def get_outdoor_conditions(self) -> dict:
-        """Fetch current weather from Open-Meteo.
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-        Returns dict matching the same format as NWSClient/WUClient:
-        {
-            "temperature_f": float,
-            "humidity": float | None,
-            "wind_speed_mph": float | None,
-            "station_count": 1,     # always 1 (grid point)
-            "is_fallback": True,    # always True (this IS the fallback)
-            "used_cache": False,    # no cache needed
-            "source": "openmeteo",
-        }
+    def _fetch(self) -> dict:
+        """Fetch current weather from the API and return parsed fields.
+
+        Returns:
+            Dict with keys: temperature_f, humidity, wind_speed_mph, timestamp.
 
         Raises:
-            OpenMeteoError: On any network or API failure.
+            OpenMeteoError: On network errors, HTTP errors, or missing fields.
         """
         params = {
             "latitude": self._lat,
@@ -87,26 +90,99 @@ class OpenMeteoClient:
             raise OpenMeteoError("Response missing temperature_2m.")
 
         humidity = current.get("relative_humidity_2m")
-        if humidity is not None:
-            humidity = float(humidity)
-
         wind_mph = current.get("wind_speed_10m")
-        if wind_mph is not None:
-            wind_mph = float(wind_mph)
 
-        temp_f = float(temp_f)
+        # Parse observation timestamp.
+        # current["time"] is in the local timezone; utc_offset_seconds converts to UTC.
+        # local = UTC + offset  →  UTC = local − offset
+        ts_str = current.get("time")
+        utc_offset_seconds = data.get("utc_offset_seconds", 0)
+        if ts_str:
+            try:
+                local_naive = datetime.fromisoformat(ts_str)
+                ts = (
+                    local_naive - timedelta(seconds=utc_offset_seconds)
+                ).replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                ts = datetime.now(timezone.utc)
+        else:
+            ts = datetime.now(timezone.utc)
 
-        logger.info(
-            "Open-Meteo: %.1f°F, %d%% humidity, %.1f mph wind",
-            temp_f,
-            int(humidity) if humidity is not None else 0,
-            wind_mph if wind_mph is not None else 0.0,
+        return {
+            "temperature_f": round(float(temp_f), 1),
+            "humidity": round(float(humidity), 1) if humidity is not None else None,
+            "wind_speed_mph": round(float(wind_mph), 1) if wind_mph is not None else None,
+            "timestamp": ts,
+        }
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get_observation(self) -> dict:
+        """Fetch current weather and return an NWS-compatible observation dict.
+
+        The observation is considered fresh only if its timestamp is within
+        30 minutes of now.  Stale readings raise an error so the caller can
+        skip this peer without using outdated data.
+
+        Returns:
+            Dict matching the NWS single-observation shape:
+            ``station_id``, ``temperature_f``, ``humidity``,
+            ``wind_speed_mph``, ``timestamp``.
+
+        Raises:
+            OpenMeteoError: On network/API errors or stale data (> 30 min).
+        """
+        data = self._fetch()
+        age = datetime.now(timezone.utc) - data["timestamp"]
+        if age > _MAX_OBS_AGE:
+            raise OpenMeteoError(
+                f"Open-Meteo observation stale ({int(age.total_seconds() // 60)}m old)"
+            )
+
+        logger.debug(
+            "Open-Meteo peer: %.1f°F, %dm old",
+            data["temperature_f"],
+            int(age.total_seconds() // 60),
         )
 
         return {
-            "temperature_f": round(temp_f, 1),
-            "humidity": round(humidity, 1) if humidity is not None else None,
-            "wind_speed_mph": round(wind_mph, 1) if wind_mph is not None else None,
+            "station_id": "OPENMETEO",
+            "temperature_f": data["temperature_f"],
+            "humidity": data["humidity"],
+            "wind_speed_mph": data["wind_speed_mph"],
+            "timestamp": data["timestamp"],
+        }
+
+    def get_outdoor_conditions(self) -> dict:
+        """Fetch current weather as a last-resort fallback (no freshness check).
+
+        Unlike ``get_observation()``, this method does NOT enforce the 30-minute
+        freshness limit.  Use it only when all NWS stations have failed and no
+        fresh OM peer reading is available.
+
+        Returns:
+            Dict matching the NWS aggregated-conditions format:
+            ``temperature_f``, ``humidity``, ``wind_speed_mph``,
+            ``station_count``, ``is_fallback``, ``used_cache``, ``source``.
+
+        Raises:
+            OpenMeteoError: On any network or API failure.
+        """
+        data = self._fetch()
+
+        logger.info(
+            "Open-Meteo fallback: %.1f°F, %s%% humidity, %.1f mph wind",
+            data["temperature_f"],
+            f"{int(data['humidity'])}" if data["humidity"] is not None else "?",
+            data["wind_speed_mph"] if data["wind_speed_mph"] is not None else 0.0,
+        )
+
+        return {
+            "temperature_f": data["temperature_f"],
+            "humidity": data["humidity"],
+            "wind_speed_mph": data["wind_speed_mph"],
             "station_count": 1,
             "is_fallback": True,
             "used_cache": False,
