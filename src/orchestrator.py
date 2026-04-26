@@ -15,6 +15,7 @@ from src.notifier import send_notification
 from src.ecobee_client import EcobeeClient, EcobeeAuthError, EcobeeApiError
 from src.beestat_client import BeestatClient, BeestatAuthError, BeestatApiError
 from src.nws_client import NWSClient, NWSError
+from src.openmeteo_client import OpenMeteoClient, OpenMeteoError
 from src.purpleair_client import PurpleAirClient
 from src.airnow_client import AirNowClient
 from src.decision_engine import DecisionEngine, FloorDecision, InsufficientDataError
@@ -25,10 +26,20 @@ logger = logging.getLogger("windowbot")
 _NOTIFICATION_COOLDOWN = 3600
 
 # Module-level NWSClient — kept alive across run_check() cycles so its LKG
-# station cache survives between calls.  _nws_client_key tracks (lat, lon, cls)
-# so we re-create if coords change or if the class is swapped (e.g. test mocks).
+# station cache survives between calls.
 _nws_client: "NWSClient | None" = None
 _nws_client_key: tuple = ()
+
+
+def _get_nws_client(config: dict) -> NWSClient:
+    """Return or create the NWSClient singleton."""
+    global _nws_client, _nws_client_key
+    lat, lon = config["user_latitude"], config["user_longitude"]
+    key = (lat, lon, NWSClient)
+    if _nws_client is None or _nws_client_key != key:
+        _nws_client = NWSClient(lat, lon)
+        _nws_client_key = key
+    return _nws_client
 
 
 def run_check() -> None:
@@ -68,19 +79,24 @@ def run_check() -> None:
             logger.error("Indoor sensor API error: %s", exc)
             return
 
-        # Fetch outdoor conditions — reuse the same NWSClient so its LKG cache
-        # persists across cycles.  Re-create only if coords or class changed.
-        global _nws_client, _nws_client_key
-        lat, lon = config["user_latitude"], config["user_longitude"]
-        client_key = (lat, lon, NWSClient)
-        if _nws_client is None or _nws_client_key != client_key:
-            _nws_client = NWSClient(lat, lon)
-            _nws_client_key = client_key
+        # Fetch outdoor conditions — NWS primary, Open-Meteo free fallback.
+        # WU and Synoptic clients exist in src/ but are not active without
+        # their respective API keys (WU_API_KEY, SYNOPTIC_API_KEY).
+        outdoor = None
         try:
-            outdoor = _nws_client.get_outdoor_conditions()
+            outdoor = _get_nws_client(config).get_outdoor_conditions()
+            logger.info("Outdoor data from NWS.")
         except NWSError as exc:
-            logger.error("NWS error: %s", exc)
-            return
+            logger.warning("NWS failed (%s), trying Open-Meteo.", exc)
+
+        if outdoor is None:
+            try:
+                om = OpenMeteoClient(config["user_latitude"], config["user_longitude"])
+                outdoor = om.get_outdoor_conditions()
+                logger.info("Outdoor data from Open-Meteo (free fallback).")
+            except OpenMeteoError as exc:
+                logger.error("All outdoor sources failed. Open-Meteo: %s", exc)
+                return
 
         # ------------------------------------------------------------------
         # Step 2: Evaluate each floor independently (lazy AQI fetching)

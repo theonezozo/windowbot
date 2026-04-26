@@ -20,6 +20,7 @@ import pytest
 from src.orchestrator import run_check, _fetch_aqi, _evaluate_floor, _NOTIFICATION_COOLDOWN
 from src.ecobee_client import EcobeeAuthError, EcobeeApiError
 from src.nws_client import NWSError
+from src.openmeteo_client import OpenMeteoError
 from src.decision_engine import DecisionEngine, FloorDecision, InsufficientDataError
 
 
@@ -426,20 +427,21 @@ class TestStatePersistence:
 
 
 class TestNWSFailure:
-    """NWS failure gracefully aborts the check."""
+    """NWS failure when it's the only remaining source gracefully aborts the check."""
 
     @patch("src.orchestrator._evaluate_floor")
     @patch("src.orchestrator._fetch_aqi")
-    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator._get_nws_client")
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
-    def test_nws_failure_aborts(
+    def test_nws_failure_with_openmeteo_failure_aborts(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
-        mock_nws_cls, mock_fetch_aqi, mock_eval_floor,
+        mock_get_nws, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
     ):
-        """NWSError → floors not evaluated."""
-        mock_config.return_value = _base_config()
+        """NWSError + OpenMeteoError (no WU/Synoptic keys) → floors not evaluated."""
+        mock_config.return_value = _base_config()  # no synoptic_api_key, no wu_api_key
 
         mock_ecobee = MagicMock()
         mock_ecobee.get_sensors.return_value = []
@@ -448,7 +450,11 @@ class TestNWSFailure:
 
         mock_nws = MagicMock()
         mock_nws.get_outdoor_conditions.side_effect = NWSError("API down")
-        mock_nws_cls.return_value = mock_nws
+        mock_get_nws.return_value = mock_nws
+
+        mock_om = MagicMock()
+        mock_om.get_outdoor_conditions.side_effect = OpenMeteoError("OM down")
+        mock_om_cls.return_value = mock_om
 
         run_check()
 
@@ -800,3 +806,117 @@ class TestConditionalAqiPolling:
         for eval_call in mock_eval_floor.call_args_list:
             aqi_arg = eval_call.args[4]
             assert aqi_arg == {"aqi": 0, "source": "skipped"}
+
+
+# ------------------------------------------------------------------
+# Weather Fallback Chain: WU → NWS → Open-Meteo
+# ------------------------------------------------------------------
+
+
+class TestWeatherFallbackChain:
+    """2-level outdoor weather fallback: NWS → Open-Meteo.
+
+    WU and Synoptic clients exist in src/ but are not wired into the
+    orchestrator — they activate only when API keys are added in the future.
+    """
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator._get_nws_client")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_nws_succeeds_openmeteo_not_called(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_get_nws, mock_om_cls,
+        mock_fetch_aqi, mock_eval_floor,
+    ):
+        """NWS succeeds → Open-Meteo is never called."""
+        mock_config.return_value = _base_config()
+
+        mock_ecobee = MagicMock()
+        mock_ecobee.get_sensors.return_value = []
+        mock_ecobee.get_hvac_mode.return_value = "cool"
+        mock_ecobee_cls.return_value = mock_ecobee
+
+        mock_nws = MagicMock()
+        mock_nws.get_outdoor_conditions.return_value = {
+            "temperature_f": 68.0, "humidity": 55.0, "source": "nws",
+        }
+        mock_get_nws.return_value = mock_nws
+
+        run_check()
+
+        mock_nws.get_outdoor_conditions.assert_called_once()
+        mock_om_cls.assert_not_called()
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator._get_nws_client")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_nws_fails_openmeteo_succeeds(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_get_nws, mock_om_cls,
+        mock_fetch_aqi, mock_eval_floor,
+    ):
+        """NWS fails → Open-Meteo used as fallback."""
+        mock_config.return_value = _base_config()
+
+        mock_ecobee = MagicMock()
+        mock_ecobee.get_sensors.return_value = []
+        mock_ecobee.get_hvac_mode.return_value = "cool"
+        mock_ecobee_cls.return_value = mock_ecobee
+
+        mock_nws = MagicMock()
+        mock_nws.get_outdoor_conditions.side_effect = NWSError("NWS down")
+        mock_get_nws.return_value = mock_nws
+
+        mock_om = MagicMock()
+        mock_om.get_outdoor_conditions.return_value = {
+            "temperature_f": 66.0, "humidity": 60.0,
+            "source": "openmeteo", "is_fallback": True,
+        }
+        mock_om_cls.return_value = mock_om
+
+        run_check()
+
+        mock_nws.get_outdoor_conditions.assert_called_once()
+        mock_om_cls.assert_called_once()
+        mock_om.get_outdoor_conditions.assert_called_once()
+        assert mock_eval_floor.call_count >= 1
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator._get_nws_client")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_both_fail_returns_early(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_get_nws, mock_om_cls,
+        mock_fetch_aqi, mock_eval_floor,
+    ):
+        """NWS and Open-Meteo both fail → returns early, no floor evaluation."""
+        mock_config.return_value = _base_config()
+
+        mock_ecobee = MagicMock()
+        mock_ecobee.get_sensors.return_value = []
+        mock_ecobee.get_hvac_mode.return_value = "cool"
+        mock_ecobee_cls.return_value = mock_ecobee
+
+        mock_nws = MagicMock()
+        mock_nws.get_outdoor_conditions.side_effect = NWSError("NWS down")
+        mock_get_nws.return_value = mock_nws
+
+        mock_om = MagicMock()
+        mock_om.get_outdoor_conditions.side_effect = OpenMeteoError("OM down")
+        mock_om_cls.return_value = mock_om
+
+        run_check()
+
+        mock_eval_floor.assert_not_called()

@@ -357,6 +357,7 @@ class NWSClient:
 
         result = self._aggregate(observations, is_fallback)
         result["used_cache"] = used_cache
+        result["source"] = "nws"
         logger.info(
             "Outdoor temperature: %.1f°F (median of %d readings%s)",
             result["temperature_f"],

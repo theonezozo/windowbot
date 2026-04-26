@@ -57,6 +57,11 @@ def get_config() -> dict:
         "airnow_api_key": _env("AIRNOW_API_KEY", ""),
         "purpleair_api_key": _env("PURPLEAIR_API_KEY", ""),
 
+        # --- Outdoor weather provider ---
+        "synoptic_api_key": _env("SYNOPTIC_API_KEY", ""),
+        "wu_api_key": _env("WU_API_KEY", ""),
+        "outdoor_provider": _env("OUTDOOR_PROVIDER", "synoptic"),
+
         # --- Location ---
         "user_latitude": _env_float("USER_LATITUDE", 0.0),
         "user_longitude": _env_float("USER_LONGITUDE", 0.0),
