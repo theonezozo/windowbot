@@ -96,7 +96,13 @@ pip install pytest
 
 ### 2. Configure
 
-Create `local.settings.json` (this file is git-ignored):
+Copy the example file and fill in your API keys and sensor names (the real `local.settings.json` is git-ignored):
+
+```bash
+cp local.settings.json.example local.settings.json
+```
+
+The template mirrors the shape below:
 
 ```json
 {
