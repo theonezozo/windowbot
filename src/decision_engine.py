@@ -9,6 +9,7 @@ spec (Section 4) with all user-specified refinements:
     • AQI 50–99 → neutral (no AQI-driven state change)
     • AQI < 50 → allow opening (if temperature conditions favour it)
 - Humidity gate: block opening if outdoor humidity > 80 %
+- Comfort gate: skip opening when indoor temps are already comfortable
 - HVAC mode gate: only act when in cooling/auto modes
 """
 
@@ -68,6 +69,7 @@ class DecisionEngine:
         self.allowed_hvac_modes: list[str] = list(
             config.get("allowed_hvac_modes", ["cool", "heatCool", "auto"])
         )
+        self.comfort_temp_max: float = float(config.get("comfort_temp_max", 72.0))
         self.enable_humidity_gate: bool = config.get("enable_humidity_gate", True)
         self.enable_aqi_gate: bool = config.get("enable_aqi_gate", True)
 
@@ -129,6 +131,19 @@ class DecisionEngine:
             if humidity_decision is not None:
                 return humidity_decision
 
+        # ---- Gate 4: Comfort threshold ----
+        if last_state == "CLOSED":
+            try:
+                warmest_pre, _ = self.get_floor_temps(floor_sensors, floor_group)
+                if warmest_pre <= self.comfort_temp_max:
+                    return self._keep(
+                        floor,
+                        "CLOSED",
+                        f"Indoor already comfortable ({warmest_pre:.1f}°F ≤ {self.comfort_temp_max:.1f}°F)",
+                    )
+            except InsufficientDataError:
+                pass  # let temperature logic handle the error
+
         # ---- Temperature logic with hysteresis ----
         try:
             warmest, coolest = self.get_floor_temps(floor_sensors, floor_group)
@@ -139,6 +154,69 @@ class DecisionEngine:
         return self._temperature_decision(
             floor, outdoor_temp, warmest, coolest, aqi_value, last_state
         )
+
+    # ------------------------------------------------------------------
+    # Pre-check: is AQI data needed?
+    # ------------------------------------------------------------------
+
+    def needs_aqi(
+        self,
+        floor_sensors: list[dict],
+        outdoor: dict,
+        hvac_mode: str,
+        last_state: str,
+        floor_group: list[str],
+    ) -> tuple[bool, str]:
+        """Determine whether AQI data is needed before calling :meth:`decide`.
+
+        Runs the non-AQI gates (HVAC mode, humidity, comfort, temperature)
+        to see if AQI could influence the final outcome.  This lets the
+        orchestrator skip PurpleAir/AirNow calls when they're irrelevant.
+
+        Returns:
+            ``(True, reason)`` if AQI should be fetched.
+            ``(False, reason)`` if AQI can safely be skipped.
+        """
+        if not self.enable_aqi_gate:
+            return False, "AQI gate disabled"
+
+        if last_state not in ("OPEN", "CLOSED"):
+            last_state = "CLOSED"
+
+        # Windows OPEN → always need AQI (urgent close safety net)
+        if last_state == "OPEN":
+            return True, "windows open — need AQI for safety check"
+
+        # ---- Windows CLOSED: would non-AQI gates even allow opening? ----
+
+        if hvac_mode not in self.allowed_hvac_modes:
+            return False, f"HVAC mode '{hvac_mode}' not in allowed modes"
+
+        outdoor_humidity: float | None = outdoor.get("humidity")
+        if self.enable_humidity_gate and outdoor_humidity is not None:
+            if outdoor_humidity > self.max_humidity:
+                return False, f"outdoor humidity too high ({outdoor_humidity:.0f}%)"
+
+        try:
+            warmest, _ = self.get_floor_temps(floor_sensors, floor_group)
+        except InsufficientDataError:
+            return False, "insufficient sensor data — decision won't depend on AQI"
+
+        if warmest <= self.comfort_temp_max:
+            return False, (
+                f"indoor already comfortable ({warmest:.1f}°F "
+                f"≤ {self.comfort_temp_max:.1f}°F)"
+            )
+
+        outdoor_temp: float = outdoor["temperature_f"]
+        open_threshold = warmest - self.hysteresis_open
+        if outdoor_temp >= open_threshold:
+            return False, (
+                f"outdoor not cool enough to open ({outdoor_temp:.1f}°F "
+                f"≥ {open_threshold:.1f}°F)"
+            )
+
+        return True, "conditions favor opening — need AQI to confirm safe"
 
     # ------------------------------------------------------------------
     # Gate helpers

@@ -21,6 +21,7 @@ def default_config() -> dict:
         "max_aqi_threshold": 100,
         "min_aqi_for_opening": 50,
         "allowed_hvac_modes": ["cool", "heatCool", "auto"],
+        "comfort_temp_max": 72.0,
         "enable_humidity_gate": True,
         "enable_aqi_gate": True,
     }

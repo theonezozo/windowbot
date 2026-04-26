@@ -50,8 +50,17 @@ def get_config() -> dict:
         # --- API credentials ---
         "ecobee_client_id": _env("ECOBEE_CLIENT_ID", ""),
         "ecobee_refresh_token": _env("ECOBEE_REFRESH_TOKEN", ""),
+        "beestat_api_key": _env("BEESTAT_API_KEY", ""),
+
+        # --- Indoor sensor provider ---
+        "indoor_provider": _env("INDOOR_PROVIDER", "beestat"),
         "airnow_api_key": _env("AIRNOW_API_KEY", ""),
         "purpleair_api_key": _env("PURPLEAIR_API_KEY", ""),
+
+        # --- Outdoor weather provider ---
+        "synoptic_api_key": _env("SYNOPTIC_API_KEY", ""),
+        "wu_api_key": _env("WU_API_KEY", ""),
+        "outdoor_provider": _env("OUTDOOR_PROVIDER", "synoptic"),
 
         # --- Location ---
         "user_latitude": _env_float("USER_LATITUDE", 0.0),
@@ -70,6 +79,7 @@ def get_config() -> dict:
         "max_outdoor_humidity": _env_int("MAX_OUTDOOR_HUMIDITY", 80),
         "max_aqi_threshold": _env_int("MAX_AQI_THRESHOLD", 100),
         "min_aqi_for_opening": _env_int("MIN_AQI_FOR_OPENING", 50),
+        "comfort_temp_max": _env_float("COMFORT_TEMP_MAX", 72.0),
 
         # --- Polling & runtime ---
         "polling_interval_minutes": _env_int("POLLING_INTERVAL_MINUTES", 10),

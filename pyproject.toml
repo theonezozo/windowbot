@@ -1,4 +1,7 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -m 'not e2e'"
+markers = [
+    "e2e: end-to-end tests using live API calls (deselected by default)",
+]

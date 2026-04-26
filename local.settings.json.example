@@ -6,8 +6,14 @@
 
     "ECOBEE_CLIENT_ID": "",
     "ECOBEE_REFRESH_TOKEN": "",
+    "BEESTAT_API_KEY": "",
+    "INDOOR_PROVIDER": "beestat",
+
     "AIRNOW_API_KEY": "",
     "PURPLEAIR_API_KEY": "",
+    "SYNOPTIC_API_KEY": "",
+    "WU_API_KEY": "",
+    "OUTDOOR_PROVIDER": "synoptic",
 
     "USER_LATITUDE": "0.0",
     "USER_LONGITUDE": "0.0",
@@ -22,6 +28,7 @@
     "MAX_OUTDOOR_HUMIDITY": "80",
     "MAX_AQI_THRESHOLD": "100",
     "MIN_AQI_FOR_OPENING": "50",
+    "COMFORT_TEMP_MAX": "72.0",
 
     "POLLING_INTERVAL_MINUTES": "10",
     "MAX_OBSERVATION_AGE_MINUTES": "30",

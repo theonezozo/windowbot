@@ -37,18 +37,31 @@ def send_notification(
     if urgent:
         priority = "urgent"
 
-    url = f"{NTFY_BASE_URL}/{topic}"
-    headers = {
-        "Title": title,
-        "Priority": priority,
-        "Tags": "window" if not urgent else "warning,window",
+    url = f"{NTFY_BASE_URL}"
+    payload = {
+        "topic": topic,
+        "title": title,
+        "message": message,
+        "priority": _priority_to_int(priority),
+        "tags": ["warning", "window"] if urgent else ["window"],
     }
 
     try:
-        response = requests.post(url, data=message.encode("utf-8"), headers=headers, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
         response.raise_for_status()
         logger.info("Notification sent: %s", title)
         return True
     except requests.RequestException:
         logger.exception("Failed to send notification to ntfy.sh.")
         return False
+
+
+def _priority_to_int(priority: str) -> int:
+    """Convert string priority to ntfy integer value."""
+    return {
+        "min": 1,
+        "low": 2,
+        "default": 3,
+        "high": 4,
+        "urgent": 5,
+    }.get(priority, 3)
