@@ -236,42 +236,74 @@ class NWSClient:
         return observations
 
     def _fetch_single_observation(self, station_id: str, now: datetime) -> dict | None:
-        """Fetch and validate a single station's latest observation.
+        """Fetch and validate a single station's most recent fresh observation.
+
+        Queries ``/observations?limit=5`` rather than ``/observations/latest``
+        because the ``latest`` endpoint is aggressively cached and frequently
+        lags the underlying observation list by 30+ minutes.  We walk the
+        returned features newest-first and accept the first one that is both
+        fresh (within ``_MAX_OBS_AGE``) and has a temperature value.
 
         Sets ``self._last_skip_reason`` to a human-readable string whenever
         returning ``None`` so callers can log the specific rejection cause.
         """
         self._last_skip_reason = None
-        url = f"{NWS_API_BASE}/stations/{station_id}/observations/latest"
+        url = f"{NWS_API_BASE}/stations/{station_id}/observations?limit=5"
         data = self._get(url)
-        props = data.get("properties", {})
 
-        # Validate timestamp.
-        ts_str = props.get("timestamp")
-        if not ts_str:
-            logger.debug("Station %s: no timestamp — skipping.", station_id)
+        # The list endpoint returns a FeatureCollection.  Tolerate the legacy
+        # single-properties shape too so test fixtures and any future fallback
+        # to /observations/latest keep working.
+        features = data.get("features")
+        if features is None and "properties" in data:
+            features = [{"properties": data["properties"]}]
+        if not features:
+            self._last_skip_reason = "no observations returned"
+            return None
+
+        # Parse + sort newest-first; the API usually returns this order already
+        # but we don't want to rely on it.
+        candidates: list[tuple[datetime, dict]] = []
+        for feat in features:
+            props = feat.get("properties", {})
+            ts_str = props.get("timestamp")
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str)
+            except (ValueError, TypeError):
+                continue
+            candidates.append((ts, props))
+
+        if not candidates:
             self._last_skip_reason = "no timestamp"
             return None
 
-        try:
-            ts = datetime.fromisoformat(ts_str)
-        except (ValueError, TypeError):
-            logger.debug("Station %s: unparseable timestamp '%s'.", station_id, ts_str)
-            self._last_skip_reason = "invalid timestamp"
-            return None
+        candidates.sort(key=lambda pair: pair[0], reverse=True)
+        newest_ts = candidates[0][0]
 
-        age = now - ts
-        if age > _MAX_OBS_AGE:
-            logger.debug("Station %s: observation too old (%s).", station_id, ts_str)
-            self._last_skip_reason = f"stale ({self._format_age(age)})"
+        # Walk newest-first; prefer a fresh reading that actually has a temp.
+        props: dict | None = None
+        ts: datetime | None = None
+        for cand_ts, cand_props in candidates:
+            age = now - cand_ts
+            if age > _MAX_OBS_AGE:
+                break  # remaining candidates are older still
+            if cand_props.get("temperature", {}).get("value") is None:
+                continue
+            ts, props = cand_ts, cand_props
+            break
+
+        if props is None:
+            newest_age = now - newest_ts
+            if newest_age > _MAX_OBS_AGE:
+                self._last_skip_reason = f"stale ({self._format_age(newest_age)})"
+            else:
+                self._last_skip_reason = "no temperature"
             return None
 
         # Parse temperature (Celsius → Fahrenheit).
-        temp_raw = props.get("temperature", {})
-        temp_c = temp_raw.get("value")
-        if temp_c is None:
-            self._last_skip_reason = "no temperature"
-            return None
+        temp_c = props.get("temperature", {}).get("value")
         temperature_f = self._c_to_f(float(temp_c))
 
         # Parse humidity.
