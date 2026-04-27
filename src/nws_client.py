@@ -430,9 +430,11 @@ class NWSClient:
                 api_error = exc
 
             if obs is not None:
+                age = now - obs["timestamp"]
+                age_str = self._format_age(age)
                 logger.info(
-                    "  #%-2d  %-8s  (%-8s %s) → ✓ %.1f°F",
-                    checked, sid, stype + ",", dist_str, obs["temperature_f"],
+                    "  #%-2d  %-8s  (%-8s %s) → ✓ %.1f°F  (%s)",
+                    checked, sid, stype + ",", dist_str, obs["temperature_f"], age_str,
                 )
                 self._station_cache[sid] = obs
                 fresh_count += 1
@@ -447,8 +449,8 @@ class NWSClient:
                     cached_obs = {**cached, "is_cached": True}
                     age_str = self._format_age(cache_age)
                     logger.info(
-                        "  #%-2d  %-8s  (%-8s %s) → ⚠ cached (last good: %s)",
-                        checked, sid, stype + ",", dist_str, age_str,
+                        "  #%-2d  %-8s  (%-8s %s) → ⚠ %.1f°F  cached (last good: %s)",
+                        checked, sid, stype + ",", dist_str, cached["temperature_f"], age_str,
                     )
                     cached_count += 1
                     results.append(cached_obs)

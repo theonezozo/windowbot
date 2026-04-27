@@ -141,10 +141,19 @@ class OpenMeteoClient:
                 f"Open-Meteo observation stale ({int(age.total_seconds() // 60)}m old)"
             )
 
+        # Format age consistently with NWS
+        total_secs = int(age.total_seconds())
+        hours, remainder = divmod(total_secs, 3600)
+        minutes = remainder // 60
+        if hours > 0:
+            age_str = f"{hours}h {minutes:02d}m ago"
+        else:
+            age_str = f"{minutes}m ago"
+        
         logger.debug(
-            "Open-Meteo peer: %.1f°F, %dm old",
+            "Open-Meteo peer: %.1f°F (%s)",
             data["temperature_f"],
-            int(age.total_seconds() // 60),
+            age_str,
         )
 
         return {
@@ -172,9 +181,20 @@ class OpenMeteoClient:
         """
         data = self._fetch()
 
+        # Format age consistently with NWS
+        age = datetime.now(timezone.utc) - data["timestamp"]
+        total_secs = int(age.total_seconds())
+        hours, remainder = divmod(total_secs, 3600)
+        minutes = remainder // 60
+        if hours > 0:
+            age_str = f"{hours}h {minutes:02d}m ago"
+        else:
+            age_str = f"{minutes}m ago"
+
         logger.info(
-            "Open-Meteo fallback: %.1f°F, %s%% humidity, %.1f mph wind",
+            "Open-Meteo fallback: %.1f°F (%s), %s%% humidity, %.1f mph wind",
             data["temperature_f"],
+            age_str,
             f"{int(data['humidity'])}" if data["humidity"] is not None else "?",
             data["wind_speed_mph"] if data["wind_speed_mph"] is not None else 0.0,
         )

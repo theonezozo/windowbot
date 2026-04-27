@@ -88,7 +88,7 @@ def run_check() -> None:
         om_obs: "dict | None" = None
         try:
             om_obs = om.get_observation()
-            logger.debug("Open-Meteo peer: %.1f°F", om_obs["temperature_f"])
+            # OpenMeteoClient already logs peer reading with freshness in get_observation()
         except OpenMeteoError as exc:
             logger.debug("Open-Meteo peer unavailable: %s", exc)
 
