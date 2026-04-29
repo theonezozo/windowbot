@@ -386,7 +386,7 @@ class NWSClient:
         stations_by_id = {s["id"]: s for s in self._stations}
 
         now = datetime.now(timezone.utc)
-        nws_observations = self._fetch_batch(nearby, now, target=3)
+        nws_observations, batch_stats = self._fetch_batch(nearby, now, target=3)
 
         # Blend in any fresh peer observations (e.g., Open-Meteo grid point).
         all_observations = list(nws_observations)
@@ -422,6 +422,7 @@ class NWSClient:
             len(all_observations),
             ", some from cache" if used_cache else "",
         )
+        self._record_freshness_metric(now, batch_stats, result["temperature_f"])
         return result
 
     def _fetch_batch(
@@ -513,8 +514,13 @@ class NWSClient:
             fresh_count, cached_count,
             checked, "s" if checked != 1 else "",
         )
-        self._record_freshness_metric(now, checked, fresh_count, cached_count, len(results))
-        return results
+        batch_stats = {
+            "checked": checked,
+            "fresh": fresh_count,
+            "cached": cached_count,
+            "valid": len(results),
+        }
+        return results, batch_stats
 
     @staticmethod
     def _aggregate(observations: list[dict], is_fallback: bool) -> dict:
@@ -532,7 +538,7 @@ class NWSClient:
         }
 
     def _record_freshness_metric(
-        self, now: datetime, checked: int, fresh_count: int, cached_count: int, valid_count: int
+        self, now: datetime, batch_stats: dict, median_temp_f: float
     ) -> None:
         """Record per-cycle freshness metrics to a JSONL file.
 
@@ -544,13 +550,15 @@ class NWSClient:
             import json
             import os
             metrics_path = os.environ.get("WINDOWBOT_METRICS_PATH", "nws_freshness_metrics.jsonl")
+            checked = batch_stats["checked"]
             record = {
                 "timestamp": now.isoformat(),
                 "checked": checked,
-                "fresh": fresh_count,
-                "cached": cached_count,
-                "valid": valid_count,
-                "fresh_pct": round(100 * fresh_count / checked, 1) if checked else 0,
+                "fresh": batch_stats["fresh"],
+                "cached": batch_stats["cached"],
+                "valid": batch_stats["valid"],
+                "fresh_pct": round(100 * batch_stats["fresh"] / checked, 1) if checked else 0,
+                "median_temp_f": median_temp_f,
             }
             with open(metrics_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
