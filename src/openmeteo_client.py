@@ -136,11 +136,7 @@ class OpenMeteoClient:
         """
         data = self._fetch()
         age = datetime.now(timezone.utc) - data["timestamp"]
-        if age > _MAX_OBS_AGE:
-            raise OpenMeteoError(
-                f"Open-Meteo observation stale ({int(age.total_seconds() // 60)}m old)"
-            )
-
+        
         # Format age consistently with NWS
         total_secs = int(age.total_seconds())
         hours, remainder = divmod(total_secs, 3600)
@@ -149,6 +145,16 @@ class OpenMeteoClient:
             age_str = f"{hours}h {minutes:02d}m ago"
         else:
             age_str = f"{minutes}m ago"
+        
+        if age > _MAX_OBS_AGE:
+            logger.debug(
+                "Open-Meteo peer stale: %.1f°F (%s) — skipped",
+                data["temperature_f"],
+                age_str,
+            )
+            raise OpenMeteoError(
+                f"Open-Meteo observation stale ({int(age.total_seconds() // 60)}m old)"
+            )
         
         logger.debug(
             "Open-Meteo peer: %.1f°F (%s)",
