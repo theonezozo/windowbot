@@ -9,7 +9,7 @@ Runs as an Azure Function on a 10-minute timer and sends push notifications via 
 Every 10 minutes, WindowBot:
 
 1. **Indoor temps** — reads your Ecobee remote sensors via the Beestat API, grouped by floor
-2. **Outdoor weather** — fetches the median of the 3 nearest NWS personal weather stations (falls back to the nearest official station)
+2. **Outdoor weather** — fetches the median of the 3 nearest NWS personal weather stations (falls back to the nearest official station); Open-Meteo is also blended into the outdoor median when its reading is ≤30 min old
 3. **Air quality** — gets the median AQI from the 3 nearest PurpleAir sensors (falls back to AirNow)
 4. **Per-floor decision** — runs the decision engine independently for each floor (upstairs, downstairs)
 5. **Notification** — sends a push notification via ntfy.sh if the recommendation changes
@@ -50,23 +50,30 @@ src/
   decision_engine.py         # Per-floor open/close logic with hysteresis
   beestat_client.py          # Beestat API client (indoor temps via Ecobee)
   nws_client.py              # NWS client (personal + official weather stations)
+  openmeteo_client.py        # Open-Meteo free weather peer (no API key, blended into NWS median)
   purpleair_client.py        # PurpleAir AQI client (median of 3 nearest)
   airnow_client.py           # AirNow fallback AQI client
   notifier.py                # ntfy.sh push notification client (JSON API)
   state.py                   # State manager (Azure Table Storage + local fallback)
+  synoptic_client.py         # Synoptic/MesoWest client (personal weather stations)
   ecobee_client.py           # Direct Ecobee API client (unused — Beestat preferred)
+  wu_client.py               # Weather Underground client (personal weather stations)
 
 tests/
   test_beestat_client.py     # Beestat client tests incl. in_use fallback
   test_decision_engine.py    # Decision logic: all gates, hysteresis, edge cases
   test_orchestrator.py       # Pipeline integration tests
   test_nws_client.py         # NWS station selection and parsing
+  test_nws_freshness_metrics.py # NWS freshness metrics JSONL tests
+  test_openmeteo_client.py   # Open-Meteo client tests
   test_purpleair_client.py   # PurpleAir AQI conversion and median
   test_airnow_client.py      # AirNow client tests
   test_notifier.py           # ntfy JSON API, unicode, priorities
   test_state.py              # State manager (Azure + local fallback)
+  test_synoptic_client.py    # Synoptic client tests
   test_config.py             # Config loader tests
   test_e2e_live.py           # E2E tests with live APIs (run separately)
+  test_wu_client.py          # Weather Underground client tests
   conftest.py                # Shared fixtures
 ```
 
@@ -145,7 +152,7 @@ The template mirrors the shape below:
 ### 3. Run tests
 
 ```bash
-# Unit tests (318 tests, runs in <1s)
+# Unit tests (465 tests, runs in <1s)
 pytest
 
 # E2E tests with live APIs (requires configured API keys)
@@ -240,6 +247,7 @@ az functionapp config appsettings set --name func-windowbot-prod \
 |--------|------|----------|------|
 | [Beestat](https://beestat.io) | Indoor temps, humidity, HVAC mode | `beestat.io/api/` | API key |
 | [NWS](https://www.weather.gov) | Outdoor temp, humidity, wind | `api.weather.gov` | None (free) |
+| [Open-Meteo](https://open-meteo.com) | Outdoor temp, humidity, wind (peer) | `open-meteo.com/v1/forecast` | None (free) |
 | [PurpleAir](https://www.purpleair.com) | AQI (PM2.5) | `api.purpleair.com` | Read key |
 | [AirNow](https://www.airnow.gov) | AQI (fallback) | `airnowapi.org` | API key |
 | [ntfy](https://ntfy.sh) | Push notifications | `ntfy.sh` | None (free) |
