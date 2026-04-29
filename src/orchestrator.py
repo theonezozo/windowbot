@@ -90,7 +90,9 @@ def run_check() -> None:
             om_obs = om.get_observation()
             # OpenMeteoClient already logs peer reading with freshness in get_observation()
         except OpenMeteoError as exc:
-            logger.debug("Open-Meteo peer unavailable: %s", exc)
+            logger.warning("Open-Meteo peer unavailable (OpenMeteoError): %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Open-Meteo peer unavailable (unexpected %s): %s", type(exc).__name__, exc)
 
         outdoor = None
         try:
