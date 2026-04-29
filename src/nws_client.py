@@ -513,6 +513,7 @@ class NWSClient:
             fresh_count, cached_count,
             checked, "s" if checked != 1 else "",
         )
+        self._record_freshness_metric(now, checked, fresh_count, cached_count, len(results))
         return results
 
     @staticmethod
@@ -529,3 +530,30 @@ class NWSClient:
             "station_count": len(observations),
             "is_fallback": is_fallback,
         }
+
+    def _record_freshness_metric(
+        self, now: datetime, checked: int, fresh_count: int, cached_count: int, valid_count: int
+    ) -> None:
+        """Record per-cycle freshness metrics to a JSONL file.
+
+        Metrics are appended to the file specified by WINDOWBOT_METRICS_PATH
+        (default: nws_freshness_metrics.jsonl in cwd). Never raises — metric
+        writes are best-effort and silent on failure.
+        """
+        try:
+            import json
+            import os
+            metrics_path = os.environ.get("WINDOWBOT_METRICS_PATH", "nws_freshness_metrics.jsonl")
+            record = {
+                "timestamp": now.isoformat(),
+                "checked": checked,
+                "fresh": fresh_count,
+                "cached": cached_count,
+                "valid": valid_count,
+                "fresh_pct": round(100 * fresh_count / checked, 1) if checked else 0,
+            }
+            with open(metrics_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception:
+            # Never let metrics break the main flow
+            logger.debug("Could not write freshness metric", exc_info=True)

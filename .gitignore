@@ -18,6 +18,7 @@ venv/
 
 # Local dev state
 .local_state.json
+nws_freshness_metrics.jsonl
 
 # Azure Functions
 local.settings.json
