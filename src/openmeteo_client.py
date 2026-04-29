@@ -147,7 +147,7 @@ class OpenMeteoClient:
             age_str = f"{minutes}m ago"
         
         if age > _MAX_OBS_AGE:
-            logger.debug(
+            logger.info(
                 "Open-Meteo peer stale: %.1f°F (%s) — skipped",
                 data["temperature_f"],
                 age_str,
@@ -155,8 +155,8 @@ class OpenMeteoClient:
             raise OpenMeteoError(
                 f"Open-Meteo observation stale ({int(age.total_seconds() // 60)}m old)"
             )
-        
-        logger.debug(
+
+        logger.info(
             "Open-Meteo peer: %.1f°F (%s)",
             data["temperature_f"],
             age_str,

@@ -515,9 +515,9 @@ class TestGetObservation:
         with pytest.raises(OpenMeteoError, match="stale"):
             client.get_observation()
         
-        # Verify the debug log includes temperature and age
-        mock_logger.debug.assert_called_once()
-        call_args = mock_logger.debug.call_args[0]
+        # Verify the info log includes temperature and age
+        mock_logger.info.assert_called_once()
+        call_args = mock_logger.info.call_args[0]
         assert "stale" in call_args[0]
         assert "%.1f°F" in call_args[0]
         assert "skipped" in call_args[0]
@@ -535,9 +535,9 @@ class TestGetObservation:
         client = OpenMeteoClient(_LAT, _LON)
         result = client.get_observation()
         
-        # Verify the debug log includes temperature and age (without "stale")
-        mock_logger.debug.assert_called_once()
-        call_args = mock_logger.debug.call_args[0]
+        # Verify the info log includes temperature and age (without "stale")
+        mock_logger.info.assert_called_once()
+        call_args = mock_logger.info.call_args[0]
         assert "Open-Meteo peer:" in call_args[0]
         assert "%.1f°F" in call_args[0]
         assert "stale" not in call_args[0]
