@@ -7,6 +7,19 @@ import pytest
 from src.decision_engine import DecisionEngine
 
 
+@pytest.fixture(autouse=True)
+def _isolate_freshness_metrics(tmp_path, monkeypatch):
+    """Redirect NWS freshness metrics to a per-test tmp file.
+
+    Without this, any test that exercises NWSClient.get_outdoor_conditions
+    end-to-end would append to the repo-root nws_freshness_metrics.jsonl
+    and pollute the live runtime metrics file with fixture temperatures.
+    """
+    monkeypatch.setenv(
+        "WINDOWBOT_METRICS_PATH", str(tmp_path / "test_metrics.jsonl")
+    )
+
+
 # ------------------------------------------------------------------
 # Default config
 # ------------------------------------------------------------------
