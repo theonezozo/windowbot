@@ -239,6 +239,34 @@ def _fetch_aqi(config: dict) -> dict:
     return {"aqi": 0, "source": "none"}
 
 
+def _log_floor_sensor_range(
+    floor_name: str, all_sensors: list[dict], sensor_names: list[str]
+) -> None:
+    """Log the warmest and coolest online sensors for a floor."""
+    valid = [
+        s for s in all_sensors
+        if s["name"] in sensor_names
+        and s.get("is_online", False)
+        and s.get("temperature_f") is not None
+    ]
+    if not valid:
+        return
+    warmest = max(valid, key=lambda s: s["temperature_f"])
+    coolest = min(valid, key=lambda s: s["temperature_f"])
+    if warmest["name"] == coolest["name"]:
+        logger.info(
+            "Floor %s indoor: %s → %.1f°F (only sensor)",
+            floor_name, warmest["name"], warmest["temperature_f"],
+        )
+    else:
+        logger.info(
+            "Floor %s indoor — warmest: %s %.1f°F  coolest: %s %.1f°F",
+            floor_name,
+            warmest["name"], warmest["temperature_f"],
+            coolest["name"], coolest["temperature_f"],
+        )
+
+
 def _evaluate_floor(
     floor_name: str,
     sensor_names: list[str],
@@ -275,6 +303,11 @@ def _evaluate_floor(
             last_state=last_state,
             floor_group=sensor_names,
         )
+
+        # Log warmest/coolest indoor sensor for this floor (name + temperature).
+        # Sensor dicts have no per-sensor timestamp — readings are always from
+        # this cycle (< polling interval old).
+        _log_floor_sensor_range(floor_name, all_sensors, sensor_names)
 
         # Persist new state regardless of notification
         now = datetime.now(timezone.utc)
