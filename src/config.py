@@ -96,4 +96,9 @@ def get_config() -> dict:
         "enable_humidity_gate": _env_bool("ENABLE_HUMIDITY_GATE", True),
         "enable_aqi_gate": _env_bool("ENABLE_AQI_GATE", True),
         "enable_wind_check": _env_bool("ENABLE_WIND_CHECK", False),
+
+        # --- Quiet hours (all three required to enable; feature disabled if any is absent) ---
+        "quiet_hours_start":    _env("QUIET_HOURS_START", None),    # "HH:MM" 24-hour local time
+        "quiet_hours_end":      _env("QUIET_HOURS_END", None),      # "HH:MM" 24-hour local time
+        "quiet_hours_timezone": _env("QUIET_HOURS_TIMEZONE", None), # IANA, e.g. "America/Los_Angeles"
     }

@@ -19,6 +19,7 @@ from src.openmeteo_client import OpenMeteoClient, OpenMeteoError
 from src.purpleair_client import PurpleAirClient
 from src.airnow_client import AirNowClient
 from src.decision_engine import DecisionEngine, FloorDecision, InsufficientDataError
+from src.quiet_hours import get_quiet_hours, is_active, just_started, just_ended
 
 logger = logging.getLogger("windowbot")
 
@@ -159,7 +160,7 @@ def run_check() -> None:
 
             _evaluate_floor(
                 floor_name, sensor_names, sensors, outdoor, aqi_data,
-                hvac_mode, engine, state_mgr,
+                hvac_mode, engine, state_mgr, config,
             )
 
         logger.info("WindowBot check complete.")
@@ -291,6 +292,68 @@ def _log_coolest_sensor(
     )
 
 
+def _try_precool_notification(
+    floor_name: str,
+    outdoor: dict,
+    aqi_data: dict,
+    config: dict,
+    now: datetime,
+    new_state_record: dict,
+    engine: DecisionEngine,
+    all_sensors: list[dict],
+    sensor_names: list[str],
+) -> None:
+    """Send a precool opportunity notification if temperature and AQI conditions are met.
+
+    Sets ``new_state_record["LastNotificationTime"]`` on success. Does nothing
+    (silent no-op) when conditions are not met — no "no precool today" notice.
+    """
+    # Guard: we need real AQI data, not a skipped or unavailable reading.
+    if aqi_data.get("source") in ("skipped", "none"):
+        logger.info("Morning precool skipped (%s): AQI unavailable.", floor_name)
+        return
+
+    outdoor_temp = outdoor.get("temperature_f")
+    if outdoor_temp is None:
+        logger.info("Morning precool skipped (%s): no outdoor temperature.", floor_name)
+        return
+
+    try:
+        _, indoor_coolest = engine.get_floor_temps(all_sensors, sensor_names)
+    except InsufficientDataError:
+        logger.info("Morning precool skipped (%s): no valid indoor sensor data.", floor_name)
+        return
+
+    hysteresis: float = float(config.get("hysteresis_open_diff", 1.0))
+    aqi_threshold: int = int(config.get("min_aqi_for_opening", 50))
+    aqi_value: int = aqi_data.get("aqi", 999)
+
+    if outdoor_temp >= indoor_coolest - hysteresis:
+        logger.info(
+            "Morning precool skipped (%s): outdoor %.1f°F not cool enough vs indoor %.1f°F.",
+            floor_name, outdoor_temp, indoor_coolest,
+        )
+        return
+
+    if aqi_value >= aqi_threshold:
+        logger.info(
+            "Morning precool skipped (%s): AQI %d not good enough (threshold %d).",
+            floor_name, aqi_value, aqi_threshold,
+        )
+        return
+
+    delta = indoor_coolest - outdoor_temp
+    title = f"🌅 WindowBot — Precool Opportunity ({floor_name.title()})"
+    body = (
+        f"Quiet hours ended. Outdoor {outdoor_temp:.1f}°F is {delta:.1f}°F cooler than "
+        f"indoor {indoor_coolest:.1f}°F, AQI {aqi_value} (good). "
+        f"Open windows now to precool before it warms up."
+    )
+    send_notification(title=title, message=body, priority="default", urgent=False)
+    new_state_record["LastNotificationTime"] = now.isoformat()
+    logger.info("Precool opportunity notification sent for %s.", floor_name)
+
+
 def _evaluate_floor(
     floor_name: str,
     sensor_names: list[str],
@@ -300,6 +363,7 @@ def _evaluate_floor(
     hvac_mode: str,
     engine: DecisionEngine,
     state_mgr: StateManager,
+    config: dict | None = None,
 ) -> None:
     """Run the decision pipeline for a single floor.
 
@@ -312,11 +376,78 @@ def _evaluate_floor(
         hvac_mode: Current Ecobee HVAC mode string
         engine: DecisionEngine instance
         state_mgr: StateManager for reading/writing state
+        config: Full config dict from get_config() (optional; quiet-hours
+            logic is skipped when None)
     """
     try:
         previous = state_mgr.get_floor_state(floor_name)
         last_state = previous.get("CurrentState", "CLOSED")
         last_notify_time = previous.get("LastNotificationTime")
+        now = datetime.now(timezone.utc)
+        new_state_record: dict = {}
+
+        # -- Quiet hours logic --
+        qh = get_quiet_hours(config) if config is not None else None
+        if qh is not None:
+            last_check_str = previous.get("LastDecisionTime")
+            last_check_utc = (
+                datetime.fromisoformat(last_check_str) if last_check_str else None
+            )
+
+            if last_check_utc and just_started(now, last_check_utc, qh):
+                # Entering quiet hours — presume CLOSED, no notification.
+                if last_state == "OPEN":
+                    new_state_record["OpenedBeforeQuietHours"] = True
+                new_state_record["QuietHoursActive"] = True
+                new_state_record["LastQuietHoursStart"] = now.isoformat()
+                state_mgr.update_floor_state(
+                    floor_name,
+                    {
+                        **previous,
+                        **new_state_record,
+                        "CurrentState": "CLOSED",
+                        "DecisionReason": "Quiet hours started",
+                        "LastDecisionTime": now.isoformat(),
+                    },
+                )
+                logger.info(
+                    "Quiet hours started (%s) — presume CLOSED, no notification.",
+                    floor_name,
+                )
+                return
+
+            if is_active(now, qh):
+                # Mid-quiet hours — skip decision cycle entirely.
+                new_state_record["QuietHoursActive"] = True
+                state_mgr.update_floor_state(
+                    floor_name,
+                    {
+                        **previous,
+                        **new_state_record,
+                        "LastDecisionTime": now.isoformat(),
+                    },
+                )
+                logger.info("Quiet hours active (%s) — skipping decision cycle.", floor_name)
+                return
+
+            if last_check_utc and just_ended(now, last_check_utc, qh):
+                # Exiting quiet hours — try morning precool notification, then
+                # fall through to normal decide() below.
+                new_state_record["QuietHoursActive"] = False
+                new_state_record["LastQuietHoursEnd"] = now.isoformat()
+                opened_before = previous.get("OpenedBeforeQuietHours", False)
+                if opened_before:
+                    _try_precool_notification(
+                        floor_name, outdoor, aqi_data, config, now,
+                        new_state_record, engine, all_sensors, sensor_names,
+                    )
+                new_state_record["OpenedBeforeQuietHours"] = False
+                # Refresh last_notify_time in case precool sent a notification so
+                # the cooldown check below correctly sees it.
+                last_notify_time = new_state_record.get(
+                    "LastNotificationTime", last_notify_time
+                )
+                # Fall through to normal decide() after quiet hours.
 
         # Log the coolest indoor sensor before deciding so we can see inputs.
         _log_coolest_sensor(floor_name, all_sensors, sensor_names)
@@ -336,15 +467,15 @@ def _evaluate_floor(
         # this cycle (< polling interval old).
         _log_floor_sensor_range(floor_name, all_sensors, sensor_names)
 
-        # Persist new state regardless of notification
-        now = datetime.now(timezone.utc)
-        new_state_record = {
+        # Merge decision results into new_state_record (preserves any quiet-hours
+        # fields already written above, e.g. from just_ended path).
+        new_state_record.update({
             "CurrentState": decision.new_state,
             "LastDecisionTime": now.isoformat(),
             "LastOutdoorTemp": outdoor.get("temperature_f"),
             "LastAQI": aqi_data.get("aqi"),
             "DecisionReason": decision.reason,
-        }
+        })
 
         if decision.changed:
             # Check notification cooldown (unless urgent)

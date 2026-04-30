@@ -63,6 +63,10 @@ class LocalStateManager:
             "LastNotificationTime": None,
             "LastDecisionTime": None,
             "DecisionReason": "initial",
+            "OpenedBeforeQuietHours": False,
+            "QuietHoursActive": False,
+            "LastQuietHoursStart": None,
+            "LastQuietHoursEnd": None,
         }
 
     def update_floor_state(self, floor: str, state: dict) -> None:
@@ -204,6 +208,10 @@ class StateManager:
                 "LastNotificationTime": None,
                 "LastDecisionTime": None,
                 "DecisionReason": "initial",
+                "OpenedBeforeQuietHours": False,
+                "QuietHoursActive": False,
+                "LastQuietHoursStart": None,
+                "LastQuietHoursEnd": None,
             }
 
     def update_floor_state(self, floor: str, state: dict) -> None:
