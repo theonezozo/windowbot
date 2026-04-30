@@ -267,6 +267,30 @@ def _log_floor_sensor_range(
         )
 
 
+def _log_coolest_sensor(
+    floor_name: str, all_sensors: list[dict], sensor_names: list[str]
+) -> None:
+    """Log the coolest online indoor sensor for a floor before deciding."""
+    valid = [
+        s for s in all_sensors
+        if s["name"] in sensor_names
+        and s.get("is_online", False)
+        and s.get("temperature_f") is not None
+    ]
+    if not valid:
+        logger.warning(
+            "Coolest indoor (%s): no valid sensor data — all offline or no temperature",
+            floor_name,
+        )
+        return
+    coolest = min(valid, key=lambda s: s["temperature_f"])
+    status = "[online]" if coolest.get("is_online", False) else "[offline]"
+    logger.info(
+        "Coolest indoor (%s): %s → %.1f°F %s",
+        floor_name, coolest["name"], coolest["temperature_f"], status,
+    )
+
+
 def _evaluate_floor(
     floor_name: str,
     sensor_names: list[str],
@@ -293,6 +317,9 @@ def _evaluate_floor(
         previous = state_mgr.get_floor_state(floor_name)
         last_state = previous.get("CurrentState", "CLOSED")
         last_notify_time = previous.get("LastNotificationTime")
+
+        # Log the coolest indoor sensor before deciding so we can see inputs.
+        _log_coolest_sensor(floor_name, all_sensors, sensor_names)
 
         decision: FloorDecision = engine.decide(
             floor=floor_name,
