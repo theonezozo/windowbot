@@ -440,9 +440,10 @@ class NWSClient:
         last-known-good (LKG) fallbacks on future calls within the same run.
         """
         results: list[dict] = []
+        cached_results: list[dict] = []
         checked = 0
         fresh_count = 0
-        cached_count = 0
+        cached_available = 0
 
         for stn in stations:
             if len(results) >= target:
@@ -485,8 +486,8 @@ class NWSClient:
                         "  #%-2d  %-8s  (%-8s %s) → ⚠ %.1f°F  cached (last good: %s)",
                         checked, sid, stype + ",", dist_str, cached["temperature_f"], age_str,
                     )
-                    cached_count += 1
-                    results.append(cached_obs)
+                    cached_available += 1
+                    cached_results.append(cached_obs)
                     continue
                 else:
                     logger.info(
@@ -508,16 +509,39 @@ class NWSClient:
                     checked, sid, stype + ",", dist_str, reason,
                 )
 
-        logger.info(
-            "Station search complete: %d valid reading%s (%d fresh, %d cached) from %d station%s checked.",
-            len(results), "s" if len(results) != 1 else "",
-            fresh_count, cached_count,
-            checked, "s" if checked != 1 else "",
-        )
+        # Stale/cached readings must NEVER dilute the median when fresh readings
+        # exist. Only fall back to LKG cache if zero fresh readings were found.
+        used_cache_fallback = False
+        if not results and cached_results:
+            results = cached_results
+            used_cache_fallback = True
+            logger.info(
+                "No fresh readings found; falling back to %d cached LKG reading%s.",
+                len(cached_results), "s" if len(cached_results) != 1 else "",
+            )
+
+        cached_used = len(cached_results) if used_cache_fallback else 0
+        if cached_available and not used_cache_fallback:
+            logger.info(
+                "Station search complete: %d valid reading%s "
+                "(%d fresh, %d cached available but unused — fresh readings preferred) "
+                "from %d station%s checked.",
+                len(results), "s" if len(results) != 1 else "",
+                fresh_count, cached_available,
+                checked, "s" if checked != 1 else "",
+            )
+        else:
+            logger.info(
+                "Station search complete: %d valid reading%s (%d fresh, %d cached) from %d station%s checked.",
+                len(results), "s" if len(results) != 1 else "",
+                fresh_count, cached_used,
+                checked, "s" if checked != 1 else "",
+            )
         batch_stats = {
             "checked": checked,
             "fresh": fresh_count,
-            "cached": cached_count,
+            "cached": cached_used,
+            "cached_available": cached_available,
             "valid": len(results),
         }
         return results, batch_stats
