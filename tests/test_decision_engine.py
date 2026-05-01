@@ -535,8 +535,8 @@ class TestSensorLogic:
         )
         assert result.new_state == "OPEN"
 
-    def test_offline_sensor_excluded(self, engine):
-        """Offline sensor not used. Two online sensors: 76, 70."""
+    def test_offline_sensor_included(self, engine):
+        """Offline sensor WITH valid temp is now included. Three sensors: 76, 70, 80."""
         sensors = make_sensors(
             [76.0, 70.0, 80.0],
             names=["s0", "s1", "s_offline"],
@@ -549,11 +549,11 @@ class TestSensorLogic:
             outdoor_temp=74.0,
             aqi=30,
         )
-        # warmest = 76, threshold = 75, outdoor 74 < 75 → OPEN
+        # warmest = 80 (offline sensor included), threshold = 79, outdoor 74 < 79 → OPEN
         assert result.new_state == "OPEN"
 
-    def test_all_sensors_offline_raises_error(self, engine):
-        """All sensors offline → InsufficientDataError → keep last state."""
+    def test_all_sensors_offline_with_valid_temps(self, engine):
+        """All sensors offline but with valid temps → normal decision, not kept."""
         sensors = make_sensors(
             [74.0, 72.0],
             names=["s0", "s1"],
@@ -567,13 +567,12 @@ class TestSensorLogic:
             aqi=30,
             last_state="CLOSED",
         )
-        # Engine catches InsufficientDataError and calls _keep
-        assert result.new_state == "CLOSED"
-        assert result.changed is False
-        assert "Insufficient" in result.reason
+        # warmest=74, threshold=73, outdoor 68 < 73 → OPEN (decision made normally)
+        assert result.new_state == "OPEN"
+        assert result.changed is True
 
-    def test_all_sensors_offline_keeps_open(self, engine):
-        """All offline when OPEN → stays OPEN (safe keep)."""
+    def test_all_sensors_offline_with_valid_temps_keeps_open(self, engine):
+        """All offline with valid temps when OPEN → normal decision."""
         sensors = make_sensors(
             [74.0],
             names=["s0"],
@@ -587,11 +586,13 @@ class TestSensorLogic:
             aqi=30,
             last_state="OPEN",
         )
+        # warmest=74, threshold=73, outdoor 68 < 73 → OPEN (still open)
         assert result.new_state == "OPEN"
+        # But it's not a "change" since threshold not crossed
         assert result.changed is False
 
-    def test_mixed_online_offline_uses_only_online(self, engine):
-        """Three sensors, one offline. Uses only the two online ones."""
+    def test_mixed_online_offline_includes_all_valid_temps(self, engine):
+        """Three sensors, one offline with None temp. Uses two with valid temps."""
         sensors = make_sensors(
             [74.0, None, 70.0],
             names=["s0", "s_offline", "s2"],

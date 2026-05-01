@@ -386,8 +386,6 @@ class DecisionEngine:
         for sensor in sensors:
             if sensor["name"] not in floor_group:
                 continue
-            if not sensor.get("is_online", False):
-                continue
             temp = sensor.get("temperature_f")
             if temp is not None:
                 valid_temps.append(temp)

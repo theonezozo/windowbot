@@ -475,8 +475,8 @@ class TestInsufficientData:
     """InsufficientDataError for a floor is caught and logged."""
 
     @patch("src.orchestrator.send_notification")
-    def test_insufficient_data_caught(self, mock_notify):
-        """Floor with all offline sensors → InsufficientDataError caught."""
+    def test_offline_sensor_with_valid_temp_works(self, mock_notify):
+        """Floor with offline sensor but valid temp → decision proceeds normally."""
         engine = DecisionEngine(_base_config())
         state_mgr = MagicMock()
         state_mgr.get_floor_state.return_value = {
@@ -486,17 +486,19 @@ class TestInsufficientData:
 
         outdoor = {"temperature_f": 68.0, "humidity": 50.0}
         aqi_data = {"aqi": 30}
-        # All sensors offline
+        # Sensor is offline but has valid temperature
         sensors = [{"name": "sensor_up", "temperature_f": 74.0, "is_online": False}]
 
-        # Should not raise — InsufficientDataError is caught internally by the engine
+        # Should proceed normally — offline status doesn't block decisions anymore
         _evaluate_floor(
             "upstairs", ["sensor_up"], sensors, outdoor, aqi_data,
             "cool", engine, state_mgr,
         )
 
-        # State still gets updated (engine returns _keep)
+        # State gets updated with normal decision (warmest=74, threshold=73, outdoor 68 < 73 → OPEN)
         state_mgr.update_floor_state.assert_called_once()
+        call_args = state_mgr.update_floor_state.call_args[0]
+        assert call_args[1]["CurrentState"] == "OPEN"
 
 
 # ------------------------------------------------------------------

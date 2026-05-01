@@ -243,52 +243,60 @@ def _fetch_aqi(config: dict) -> dict:
 def _log_floor_sensor_range(
     floor_name: str, all_sensors: list[dict], sensor_names: list[str]
 ) -> None:
-    """Log the warmest and coolest online sensors for a floor."""
+    """Log the warmest and coolest sensors for a floor (regardless of online status)."""
     valid = [
         s for s in all_sensors
         if s["name"] in sensor_names
-        and s.get("is_online", False)
         and s.get("temperature_f") is not None
     ]
     if not valid:
         return
     warmest = max(valid, key=lambda s: s["temperature_f"])
     coolest = min(valid, key=lambda s: s["temperature_f"])
+    warmest_status = "[online]" if warmest.get("is_online", False) else "[offline]"
+    coolest_status = "[online]" if coolest.get("is_online", False) else "[offline]"
     if warmest["name"] == coolest["name"]:
         logger.info(
-            "Floor %s indoor: %s → %.1f°F (only sensor)",
-            floor_name, warmest["name"], warmest["temperature_f"],
+            "Floor %s indoor: %s → %.1f°F %s (only sensor)",
+            floor_name, warmest["name"], warmest["temperature_f"], warmest_status,
         )
     else:
         logger.info(
-            "Floor %s indoor — warmest: %s %.1f°F  coolest: %s %.1f°F",
+            "Floor %s indoor — warmest: %s %.1f°F %s  coolest: %s %.1f°F %s",
             floor_name,
-            warmest["name"], warmest["temperature_f"],
-            coolest["name"], coolest["temperature_f"],
+            warmest["name"], warmest["temperature_f"], warmest_status,
+            coolest["name"], coolest["temperature_f"], coolest_status,
         )
 
 
 def _log_coolest_sensor(
     floor_name: str, all_sensors: list[dict], sensor_names: list[str]
 ) -> None:
-    """Log the coolest online indoor sensor for a floor before deciding."""
+    """Log the coolest indoor sensor for a floor before deciding (regardless of online status)."""
     valid = [
         s for s in all_sensors
         if s["name"] in sensor_names
-        and s.get("is_online", False)
         and s.get("temperature_f") is not None
     ]
     if not valid:
         logger.warning(
-            "Coolest indoor (%s): no valid sensor data — all offline or no temperature",
+            "Coolest indoor (%s): no valid sensor data — no temperature readings",
             floor_name,
         )
         return
     coolest = min(valid, key=lambda s: s["temperature_f"])
     status = "[online]" if coolest.get("is_online", False) else "[offline]"
+    
+    # Build sensor list summary: "sensor1 71.2°F [offline], sensor2 72.5°F [online], ..."
+    sensor_details = ", ".join(
+        f"{s['name']} {s['temperature_f']:.1f}°F [{'online' if s.get('is_online', False) else 'offline'}]"
+        for s in sorted(valid, key=lambda x: x["temperature_f"])
+    )
+    
     logger.info(
-        "Coolest indoor (%s): %s → %.1f°F %s",
+        "Coolest indoor (%s): %s → %.1f°F %s (of %d sensor%s: %s)",
         floor_name, coolest["name"], coolest["temperature_f"], status,
+        len(valid), "s" if len(valid) > 1 else "", sensor_details,
     )
 
 
