@@ -5,6 +5,9 @@ import logging
 
 from src.orchestrator import run_check
 
+# Suppress Azure SDK HTTP transport logs (request/response traces) unless errors occur.
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+
 app = func.FunctionApp()
 
 
