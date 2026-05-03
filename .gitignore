@@ -29,3 +29,4 @@ local.settings.json
 .vscode/
 *.swp
 *.swo
+.squad-workstream
