@@ -9,6 +9,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import math
 import os
 from datetime import datetime, timezone
 
@@ -146,6 +147,20 @@ def _render_html(
 ) -> func.HttpResponse:
     """Render status as HTML."""
     now = datetime.now(timezone.utc)
+
+    # --- Cycle timing -------------------------------------------------------
+    # The timer fires every POLLING_INTERVAL_MINUTES minutes.  Add 90 s of
+    # slop so the page is refreshed only after the new snapshot is likely
+    # written (cold-start + poll latency can be ~60 s on the consumption plan).
+    poll_interval_minutes = int(os.environ.get("POLLING_INTERVAL_MINUTES", "10"))
+    slop_seconds = 90
+
+    # Seconds until the top of the next N-minute window, plus slop
+    seconds_since_epoch = now.timestamp()
+    interval_seconds = poll_interval_minutes * 60
+    seconds_into_interval = seconds_since_epoch % interval_seconds
+    seconds_until_next = interval_seconds - seconds_into_interval
+    refresh_seconds = math.ceil(seconds_until_next) + slop_seconds
     
     # Calculate data freshness
     freshness_html = ""
@@ -211,6 +226,7 @@ def _render_html(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="{refresh_seconds}">
     <title>WindowBot Status</title>
     <style>{_get_css()}</style>
 </head>
@@ -221,14 +237,29 @@ def _render_html(
         {header_html}
         {floors_html}
         <div class="footer">
-            <p>Data source: Last persisted poll cycle</p>
+            <p>Page loaded: {now.strftime('%Y-%m-%d %H:%M:%S UTC')} · auto-refreshes in {refresh_seconds}s</p>
             <p><a href="?format=json">View as JSON</a></p>
         </div>
     </div>
 </body>
 </html>
 """
-    return func.HttpResponse(html_content, status_code=200, mimetype="text/html")
+    # Cache headers: expire at the next cycle boundary (without slop) so
+    # shared caches don't serve a stale page after a new poll has fired.
+    expires_seconds = math.ceil(seconds_until_next)
+    from email.utils import formatdate
+    expires_ts = now.timestamp() + expires_seconds
+    headers = {
+        "Cache-Control": f"public, max-age={expires_seconds}",
+        "Expires": formatdate(timeval=expires_ts, usegmt=True),
+    }
+
+    return func.HttpResponse(
+        html_content,
+        status_code=200,
+        mimetype="text/html",
+        headers=headers,
+    )
 
 
 def _render_floor_card(snapshot: FloorSnapshot) -> str:
