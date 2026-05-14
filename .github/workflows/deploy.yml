@@ -1,0 +1,52 @@
+# Azure Function App Deployment Workflow
+#
+# This workflow automatically deploys the WindowBot Azure Function app to Azure
+# when code is pushed to the main branch by the repository owner (theonezozo).
+#
+# REQUIRED SECRET:
+# You must configure the AZURE_FUNCTIONAPP_PUBLISH_PROFILE secret in GitHub:
+#   1. Go to Azure Portal: https://portal.azure.com
+#   2. Navigate to your Function App: windowbot-func
+#   3. Click "Overview" in the left menu
+#   4. Click "Get publish profile" button in the top menu bar
+#   5. Download the .PublishSettings XML file
+#   6. Go to GitHub repo → Settings → Secrets and variables → Actions → New repository secret
+#   7. Name: AZURE_FUNCTIONAPP_PUBLISH_PROFILE
+#   8. Value: Paste the entire contents of the downloaded XML file
+#   9. Click "Add secret"
+#
+# The workflow will be skipped (not failed) for pushes from other users.
+
+name: Deploy Azure Function App
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Only run this job when the pusher is theonezozo
+    if: github.actor == 'theonezozo'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Deploy to Azure Function App
+        uses: Azure/functions-action@v1
+        with:
+          app-name: 'windowbot-func'
+          package: '.'
+          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}

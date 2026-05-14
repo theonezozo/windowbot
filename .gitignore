@@ -7,6 +7,14 @@
 
 # GitHub workflows (Squad-generated, not part of app)
 .github/
+# ...except the actual deployment pipeline
+!.github/
+!.github/workflows/
+!.github/workflows/deploy.yml
+# Re-ignore Squad-generated workflows
+.github/workflows/sync-squad-labels.yml
+.github/workflows/squad-*.yml
+.github/agents/
 
 # Python
 __pycache__/
@@ -30,3 +38,11 @@ local.settings.json
 *.swp
 *.swo
 .squad-workstream
+.DS_Store
+
+# Azurite (local Azure storage emulator)
+AzuriteConfig
+azurite-debug.log
+__azurite_db_*
+__blobstorage__/
+__queuestorage__/
