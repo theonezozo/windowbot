@@ -227,6 +227,7 @@ def _render_html(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="refresh" content="{refresh_seconds}">
+    <!-- DEPLOY-CHECK-v2 -->
     <title>WindowBot Status</title>
     <style>{_get_css()}</style>
 </head>
