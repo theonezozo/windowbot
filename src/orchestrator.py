@@ -214,15 +214,13 @@ def run_check() -> None:
             # Calculate next transition time
             if quiet_active:
                 # Currently in quiet hours — next transition is end time
-                end_time = datetime.strptime(qh["end_time"], "%H:%M").time()
-                next_transition = datetime.combine(poll_end.date(), end_time)
-                if next_transition <= poll_end:
+                next_transition = datetime.combine(poll_end.date(), qh.end)
+                if next_transition.replace(tzinfo=None) <= poll_end.replace(tzinfo=None):
                     next_transition += timedelta(days=1)
             else:
                 # Not in quiet hours — next transition is start time
-                start_time = datetime.strptime(qh["start_time"], "%H:%M").time()
-                next_transition = datetime.combine(poll_end.date(), start_time)
-                if next_transition <= poll_end:
+                next_transition = datetime.combine(poll_end.date(), qh.start)
+                if next_transition.replace(tzinfo=None) <= poll_end.replace(tzinfo=None):
                     next_transition += timedelta(days=1)
         
         next_poll = poll_end + timedelta(minutes=10)
