@@ -45,6 +45,8 @@
     "_comment_quiet_hours": "Optional: all three keys must be set to enable quiet hours. QUIET_HOURS_START and QUIET_HOURS_END are 24-hour HH:MM local time. QUIET_HOURS_TIMEZONE is an IANA timezone name (e.g. America/Los_Angeles). Leave empty to disable.",
     "QUIET_HOURS_START": "",
     "QUIET_HOURS_END": "",
-    "QUIET_HOURS_TIMEZONE": ""
+    "QUIET_HOURS_TIMEZONE": "",
+    "_comment_status_page": "Optional PIN to protect the /api/status page. Leave empty to allow unauthenticated access. Access via: /api/status?pin=YOUR_PIN",
+    "STATUS_PAGE_PIN": ""
   }
 }

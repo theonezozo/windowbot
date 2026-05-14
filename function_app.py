@@ -32,11 +32,12 @@ def windowbot_check_http(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse("OK", status_code=200)
 
 
-@app.route(route="status", auth_level=func.AuthLevel.FUNCTION, methods=["GET"])
+@app.route(route="status", auth_level=func.AuthLevel.ANONYMOUS, methods=["GET"])
 def windowbot_status(req: func.HttpRequest) -> func.HttpResponse:
     """Status page showing last persisted state.
-    
+
     Returns HTML by default, JSON if Accept: application/json or ?format=json.
-    Requires function key authentication.
+    Protected by a PIN stored in the STATUS_PAGE_PIN app setting.
+    Access via: /api/status?pin=<your-pin>
     """
     return render_status_page(req)

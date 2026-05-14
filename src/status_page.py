@@ -9,6 +9,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import os
 from datetime import datetime, timezone
 
 import azure.functions as func
@@ -19,21 +20,41 @@ from src.diagnostic import SnapshotManager, FloorSnapshot, GlobalSnapshot
 logger = logging.getLogger("windowbot.status")
 
 
+def _pin_denied_response(is_json: bool) -> func.HttpResponse:
+    if is_json:
+        return func.HttpResponse(
+            json.dumps({"error": "Unauthorized"}),
+            status_code=401,
+            mimetype="application/json",
+        )
+    return func.HttpResponse(
+        "<html><body><h1>401 Unauthorized</h1><p>Missing or incorrect PIN.</p></body></html>",
+        status_code=401,
+        mimetype="text/html",
+    )
+
+
 def render_status_page(req: func.HttpRequest) -> func.HttpResponse:
     """Render the status page as HTML or JSON.
-    
+
     Args:
-        req: HTTP request with optional ?format=json query param
-        
+        req: HTTP request with optional ?format=json and ?pin=<pin> query params
+
     Returns:
         HTTP response with HTML (default) or JSON
     """
     # Determine output format
     accept_header = req.headers.get("Accept", "")
     format_param = req.params.get("format", "")
-    
     wants_json = "application/json" in accept_header or format_param == "json"
-    
+
+    # PIN check — required when STATUS_PAGE_PIN is configured
+    required_pin = os.environ.get("STATUS_PAGE_PIN", "").strip()
+    if required_pin:
+        provided_pin = req.params.get("pin", "").strip()
+        if provided_pin != required_pin:
+            return _pin_denied_response(wants_json)
+
     try:
         state_mgr = get_state_manager()
         
