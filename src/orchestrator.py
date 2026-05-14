@@ -7,7 +7,7 @@ timer trigger fires.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from src.config import get_config
 from src.state import get_state_manager
@@ -20,6 +20,15 @@ from src.purpleair_client import PurpleAirClient
 from src.airnow_client import AirNowClient
 from src.decision_engine import DecisionEngine, FloorDecision, InsufficientDataError
 from src.quiet_hours import get_quiet_hours, is_active, just_started, just_ended
+from src.diagnostic import (
+    SnapshotManager,
+    FloorSnapshot,
+    GlobalSnapshot,
+    SensorReading,
+    OutdoorStation,
+    AQIStation,
+    GateEvaluation,
+)
 
 logger = logging.getLogger("windowbot")
 
@@ -51,9 +60,14 @@ def run_check() -> None:
         2. Fetch data from all sources (Ecobee, NWS, AQI)
         3. For each floor, run the decision engine
         4. If state changed, persist new state and send notification
+        5. Persist diagnostic snapshots for status page
     """
+    poll_start = datetime.now(timezone.utc)
+    errors: list[str] = []
+    floor_snapshots: dict[str, FloorSnapshot] = {}
+    
     try:
-        logger.info("WindowBot check starting at %s", datetime.now(timezone.utc).isoformat())
+        logger.info("WindowBot check starting at %s", poll_start.isoformat())
 
         config = get_config()
         state_mgr = get_state_manager()
@@ -66,6 +80,7 @@ def run_check() -> None:
         except (EcobeeAuthError, BeestatAuthError) as exc:
             provider = "Beestat" if isinstance(exc, BeestatAuthError) else "Ecobee"
             logger.error("%s auth failed: %s", provider, exc)
+            errors.append(f"{provider} auth failed: {exc}")
             send_notification(
                 title=f"⚠️ WindowBot — {provider} Auth Failed",
                 message=(
@@ -78,6 +93,7 @@ def run_check() -> None:
             return
         except (EcobeeApiError, BeestatApiError) as exc:
             logger.error("Indoor sensor API error: %s", exc)
+            errors.append(f"Indoor sensor API error: {exc}")
             return
 
         # Fetch outdoor conditions.
@@ -102,6 +118,7 @@ def run_check() -> None:
             )
         except NWSError as exc:
             logger.warning("NWS failed (%s).", exc)
+            errors.append(f"NWS error: {exc}")
             if om_obs:
                 logger.info("Using Open-Meteo peer as sole outdoor source.")
                 outdoor = {
@@ -121,6 +138,7 @@ def run_check() -> None:
                 logger.info("Outdoor data from Open-Meteo (last-resort fallback).")
             except OpenMeteoError as exc:
                 logger.error("All outdoor sources failed. Open-Meteo: %s", exc)
+                errors.append(f"All outdoor sources failed: {exc}")
                 return
 
         # ------------------------------------------------------------------
@@ -162,6 +180,64 @@ def run_check() -> None:
                 floor_name, sensor_names, sensors, outdoor, aqi_data,
                 hvac_mode, engine, state_mgr, config,
             )
+            
+            # Build snapshot for this floor
+            try:
+                decision = engine.decide(
+                    floor=floor_name,
+                    floor_sensors=sensors,
+                    outdoor=outdoor,
+                    aqi=aqi_data,
+                    hvac_mode=hvac_mode,
+                    last_state=last_state,
+                    floor_group=sensor_names,
+                )
+                snapshot = _build_floor_snapshot(
+                    floor_name, sensor_names, sensors, decision, outdoor,
+                    aqi_data, engine, previous, datetime.now(timezone.utc),
+                )
+                floor_snapshots[floor_name] = snapshot
+            except Exception as exc:
+                logger.exception("Failed to build snapshot for %s.", floor_name)
+                errors.append(f"Snapshot build failed for {floor_name}: {exc}")
+
+        # ------------------------------------------------------------------
+        # Step 3: Persist diagnostic snapshots
+        # ------------------------------------------------------------------
+        poll_end = datetime.now(timezone.utc)
+        poll_duration = (poll_end - poll_start).total_seconds()
+        
+        qh = get_quiet_hours(config)
+        quiet_active = is_active(poll_end, qh) if qh else False
+        next_transition = None
+        if qh:
+            # Calculate next transition time
+            if quiet_active:
+                # Currently in quiet hours — next transition is end time
+                end_time = datetime.strptime(qh["end_time"], "%H:%M").time()
+                next_transition = datetime.combine(poll_end.date(), end_time)
+                if next_transition <= poll_end:
+                    next_transition += timedelta(days=1)
+            else:
+                # Not in quiet hours — next transition is start time
+                start_time = datetime.strptime(qh["start_time"], "%H:%M").time()
+                next_transition = datetime.combine(poll_end.date(), start_time)
+                if next_transition <= poll_end:
+                    next_transition += timedelta(days=1)
+        
+        next_poll = poll_end + timedelta(minutes=10)
+        
+        global_snapshot = GlobalSnapshot(
+            poll_start=poll_start.isoformat(),
+            poll_duration_seconds=round(poll_duration, 2),
+            hvac_mode=hvac_mode,
+            quiet_hours_active=quiet_active,
+            quiet_hours_next_transition=next_transition.isoformat() if next_transition else None,
+            next_poll_eta=next_poll.isoformat(),
+            errors=errors,
+        )
+        
+        _persist_snapshots(state_mgr, floor_snapshots, global_snapshot)
 
         logger.info("WindowBot check complete.")
 
@@ -518,3 +594,161 @@ def _evaluate_floor(
         logger.warning("Floor '%s': insufficient sensor data — %s", floor_name, exc)
     except Exception:
         logger.exception("Error evaluating floor '%s'.", floor_name)
+
+
+def _build_floor_snapshot(
+    floor_name: str,
+    sensor_names: list[str],
+    all_sensors: list[dict],
+    decision: FloorDecision,
+    outdoor: dict,
+    aqi_data: dict,
+    engine: DecisionEngine,
+    previous_state: dict,
+    now: datetime,
+) -> FloorSnapshot:
+    """Build a diagnostic snapshot for one floor."""
+    # Indoor sensors
+    floor_sensors = [s for s in all_sensors if s["name"] in sensor_names and s.get("temperature_f") is not None]
+    coolest_temp = min((s["temperature_f"] for s in floor_sensors), default=None)
+    
+    sensor_readings = []
+    for s in all_sensors:
+        if s["name"] in sensor_names:
+            sensor_readings.append(SensorReading(
+                name=s["name"],
+                temperature_f=s.get("temperature_f"),
+                is_online=s.get("is_online", False),
+                is_coolest=(s.get("temperature_f") == coolest_temp if coolest_temp else False),
+            ))
+    
+    # Outdoor stations — we don't have per-station detail from NWS's aggregated result,
+    # but we can infer based on source and count
+    outdoor_stations = []
+    outdoor_source = outdoor.get("source", "unknown")
+    station_count = outdoor.get("station_count", 0)
+    if station_count > 0:
+        # Placeholder — we'd need NWS client to expose raw observations
+        outdoor_stations.append(OutdoorStation(
+            station_id=f"{outdoor_source}_aggregate",
+            distance_mi=None,
+            temperature_f=outdoor["temperature_f"],
+            age_minutes=None,
+        ))
+    
+    # AQI stations — similarly, we only have aggregated data
+    aqi_stations = []
+    aqi_source = aqi_data.get("source", "unknown")
+    aqi_sensor_count = aqi_data.get("sensor_count", 0)
+    if aqi_sensor_count > 0:
+        aqi_stations.append(AQIStation(
+            sensor_id=f"{aqi_source}_aggregate",
+            distance_mi=None,
+            aqi=aqi_data.get("aqi", 0),
+            pm25=aqi_data.get("pm25"),
+        ))
+    
+    # Gates evaluation — reconstruct based on decision reason
+    gates = _evaluate_gates(engine, decision, outdoor, aqi_data, floor_sensors, sensor_names)
+    
+    # Last notification
+    last_notif_time = previous_state.get("LastNotificationTime")
+    last_notif_type = None
+    if last_notif_time:
+        # Infer type from current state — this is approximate
+        current_state = previous_state.get("CurrentState", "UNKNOWN")
+        if current_state == "OPEN":
+            last_notif_type = "open"
+        elif current_state == "CLOSED":
+            last_notif_type = "close"
+    
+    return FloorSnapshot(
+        floor=floor_name,
+        decision=decision.new_state,
+        reason=decision.reason,
+        indoor_sensors=sensor_readings,
+        outdoor_temp_f=outdoor["temperature_f"],
+        outdoor_source=outdoor_source,
+        outdoor_stations=outdoor_stations,
+        outdoor_humidity=outdoor.get("humidity"),
+        aqi_value=aqi_data.get("aqi", 0),
+        aqi_source=aqi_source,
+        aqi_stations=aqi_stations,
+        gates=gates,
+        last_notification_type=last_notif_type,
+        last_notification_time=last_notif_time,
+        timestamp=now.isoformat(),
+    )
+
+
+def _evaluate_gates(
+    engine: DecisionEngine,
+    decision: FloorDecision,
+    outdoor: dict,
+    aqi_data: dict,
+    floor_sensors: list[dict],
+    sensor_names: list[str],
+) -> list[GateEvaluation]:
+    """Build gate evaluation list based on engine config and decision."""
+    gates = []
+    
+    # Humidity gate
+    if engine.enable_humidity_gate and outdoor.get("humidity") is not None:
+        humidity = outdoor["humidity"]
+        passed = humidity <= engine.max_humidity
+        gates.append(GateEvaluation(
+            name="Humidity",
+            passed=passed,
+            threshold=f"≤ {engine.max_humidity}%",
+            actual=f"{humidity:.0f}%",
+        ))
+    
+    # AQI gate
+    if engine.enable_aqi_gate:
+        aqi = aqi_data.get("aqi", 0)
+        # AQI gate is bidirectional: fail if >= 100 (close), neutral 50-99, pass if < 50 (can open)
+        if aqi >= engine.aqi_close_threshold:
+            passed = False  # urgent close
+        elif aqi >= engine.aqi_open_threshold:
+            passed = None  # neutral — don't block, but don't encourage
+        else:
+            passed = True  # good for opening
+        gates.append(GateEvaluation(
+            name="AQI",
+            passed=passed if passed is not None else True,  # for display, treat neutral as pass
+            threshold=f"< {engine.aqi_open_threshold} (good), ≥ {engine.aqi_close_threshold} (close)",
+            actual=f"{aqi}",
+        ))
+    
+    # Wind gate — not currently implemented in engine, but placeholder
+    if outdoor.get("wind_speed_mph") is not None:
+        gates.append(GateEvaluation(
+            name="Wind",
+            passed=True,  # no wind threshold currently enforced
+            threshold="No limit",
+            actual=f"{outdoor['wind_speed_mph']:.1f} mph",
+        ))
+    
+    return gates
+
+
+def _persist_snapshots(
+    state_mgr: StateManager,
+    floor_snapshots: dict[str, FloorSnapshot],
+    global_snapshot: GlobalSnapshot,
+) -> None:
+    """Persist all diagnostic snapshots to Table Storage."""
+    try:
+        if hasattr(state_mgr, 'get_snapshot_table'):
+            snapshot_table = state_mgr.get_snapshot_table()
+            mgr = SnapshotManager(snapshot_table)
+            
+            for snapshot in floor_snapshots.values():
+                mgr.save_floor_snapshot(snapshot)
+            
+            mgr.save_global_snapshot(global_snapshot)
+            logger.info("Diagnostic snapshots persisted successfully.")
+        else:
+            logger.warning("Snapshot table not available (local state mode).")
+    except Exception:
+        logger.exception("Failed to persist diagnostic snapshots.")

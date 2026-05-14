@@ -4,6 +4,7 @@ import azure.functions as func
 import logging
 
 from src.orchestrator import run_check
+from src.status_page import render_status_page
 
 # Suppress Azure SDK HTTP transport logs (request/response traces) unless errors occur.
 logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
@@ -29,3 +30,13 @@ def windowbot_check_http(req: func.HttpRequest) -> func.HttpResponse:
     """HTTP trigger for local development — same logic as the timer."""
     run_check()
     return func.HttpResponse("OK", status_code=200)
+
+
+@app.route(route="status", auth_level=func.AuthLevel.FUNCTION, methods=["GET"])
+def windowbot_status(req: func.HttpRequest) -> func.HttpResponse:
+    """Status page showing last persisted state.
+    
+    Returns HTML by default, JSON if Accept: application/json or ?format=json.
+    Requires function key authentication.
+    """
+    return render_status_page(req)

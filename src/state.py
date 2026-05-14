@@ -18,6 +18,7 @@ logger = logging.getLogger("windowbot.state")
 
 STATE_TABLE = "windowbotstate"
 OAUTH_TABLE = "oauthtokens"
+SNAPSHOT_TABLE = "windowbotsnapshot"
 
 LOCAL_STATE_FILE = Path(".local_state.json")
 
@@ -111,6 +112,10 @@ class LocalStateManager:
             self._write(data)
         logger.info("Local OAuth tokens updated.")
 
+    def get_snapshot_table(self) -> None:
+        """Snapshot table not available in local state mode."""
+        raise NotImplementedError("Snapshot table requires Azure Table Storage.")
+
 
 # ======================================================================
 # Factory
@@ -169,7 +174,7 @@ class StateManager:
         Raises connection-level errors so the factory can detect Azurite
         being unavailable and fall back to local state.
         """
-        for table_name in (STATE_TABLE, OAUTH_TABLE):
+        for table_name in (STATE_TABLE, OAUTH_TABLE, SNAPSHOT_TABLE):
             try:
                 self._service.create_table_if_not_exists(table_name)
             except (ServiceRequestError, ConnectionError, OSError):
@@ -182,6 +187,9 @@ class StateManager:
 
     def _oauth_table(self) -> TableClient:
         return self._service.get_table_client(OAUTH_TABLE)
+
+    def _snapshot_table(self) -> TableClient:
+        return self._service.get_table_client(SNAPSHOT_TABLE)
 
     # ------------------------------------------------------------------
     # Floor state
@@ -273,3 +281,11 @@ class StateManager:
             logger.info("OAuth tokens updated.")
         except Exception:
             logger.exception("Failed to update OAuth tokens.")
+
+    def get_snapshot_table(self) -> TableClient:
+        """Return the snapshot table client for diagnostic data.
+        
+        Returns:
+            TableClient for the windowbotsnapshot table.
+        """
+        return self._snapshot_table()
