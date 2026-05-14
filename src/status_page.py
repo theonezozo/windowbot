@@ -359,6 +359,7 @@ def _get_css() -> str:
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
             background: #f5f5f5;
             color: #333;
+            font-size: 16px;
             line-height: 1.6;
             padding: 20px;
         }
@@ -372,11 +373,13 @@ def _get_css() -> str:
             font-size: 2em;
             margin-bottom: 20px;
             color: #2c3e50;
+            word-wrap: break-word;
         }
         
         h2 {
             font-size: 1.5em;
             color: #34495e;
+            word-wrap: break-word;
         }
         
         .freshness {
@@ -385,6 +388,8 @@ def _get_css() -> str:
             padding: 15px;
             margin-bottom: 20px;
             border-radius: 4px;
+            font-size: 1em;
+            word-wrap: break-word;
         }
         
         .freshness.warning {
@@ -401,6 +406,7 @@ def _get_css() -> str:
             margin-left: 10px;
             color: #d32f2f;
             font-weight: bold;
+            display: inline-block;
         }
         
         .global-info {
@@ -414,8 +420,10 @@ def _get_css() -> str:
         .info-row {
             display: flex;
             justify-content: space-between;
+            gap: 10px;
             padding: 8px 0;
             border-bottom: 1px solid #eee;
+            flex-wrap: wrap;
         }
         
         .info-row:last-child {
@@ -425,18 +433,21 @@ def _get_css() -> str:
         .label {
             font-weight: 600;
             color: #555;
+            word-wrap: break-word;
         }
         
         .value {
             color: #333;
+            word-wrap: break-word;
         }
         
         .badge {
             display: inline-block;
-            padding: 4px 12px;
+            padding: 6px 14px;
             border-radius: 12px;
             font-size: 0.85em;
             font-weight: 600;
+            white-space: nowrap;
         }
         
         .badge-active {
@@ -471,14 +482,20 @@ def _get_css() -> str:
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 10px;
             margin-bottom: 15px;
             padding-bottom: 15px;
             border-bottom: 2px solid #eee;
+            flex-wrap: wrap;
         }
         
         .decision-badge {
             font-size: 1.1em;
-            padding: 8px 16px;
+            padding: 10px 18px;
+            min-height: 44px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
         
         .reason {
@@ -487,6 +504,8 @@ def _get_css() -> str:
             margin-bottom: 15px;
             border-radius: 4px;
             font-size: 0.95em;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
         }
         
         details {
@@ -496,14 +515,21 @@ def _get_css() -> str:
         summary {
             cursor: pointer;
             font-weight: 600;
-            padding: 10px;
+            padding: 14px;
             background: #f5f5f5;
             border-radius: 4px;
             user-select: none;
+            min-height: 44px;
+            display: flex;
+            align-items: center;
         }
         
         summary:hover {
             background: #eeeeee;
+        }
+        
+        summary:active {
+            background: #e0e0e0;
         }
         
         details[open] summary {
@@ -518,24 +544,30 @@ def _get_css() -> str:
         .sensor-list li {
             display: flex;
             justify-content: space-between;
-            padding: 8px 10px;
+            gap: 10px;
+            padding: 10px;
             border-bottom: 1px solid #f0f0f0;
             align-items: center;
+            flex-wrap: wrap;
+            min-height: 44px;
         }
         
         .sensor-name {
             flex: 1;
             font-weight: 500;
+            word-wrap: break-word;
+            min-width: 120px;
         }
         
         .sensor-value {
-            margin: 0 15px;
+            margin: 0 10px;
             font-weight: 600;
+            white-space: nowrap;
         }
         
         .sensor-status {
             font-size: 0.75em;
-            padding: 3px 8px;
+            padding: 4px 10px;
         }
         
         .badge-online {
@@ -551,7 +583,9 @@ def _get_css() -> str:
         .metric {
             display: flex;
             justify-content: space-between;
-            padding: 6px 10px;
+            gap: 10px;
+            padding: 8px 10px;
+            flex-wrap: wrap;
         }
         
         .aqi-good {
@@ -570,16 +604,20 @@ def _get_css() -> str:
         }
         
         .gates-list li {
-            padding: 8px 10px;
+            padding: 10px;
             border-bottom: 1px solid #f0f0f0;
             display: flex;
-            align-items: center;
+            gap: 10px;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            min-height: 44px;
         }
         
         .gate-icon {
-            margin-right: 10px;
+            margin-right: 5px;
             font-weight: bold;
             font-size: 1.2em;
+            flex-shrink: 0;
         }
         
         .gate-pass .gate-icon {
@@ -593,19 +631,23 @@ def _get_css() -> str:
         .gate-name {
             font-weight: 600;
             min-width: 100px;
+            word-wrap: break-word;
         }
         
         .gate-detail {
             color: #666;
             font-size: 0.9em;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
         }
         
         .notification-info {
             margin-top: 15px;
-            padding: 10px;
+            padding: 12px;
             background: #e3f2fd;
             border-radius: 4px;
             font-size: 0.9em;
+            word-wrap: break-word;
         }
         
         .errors {
@@ -621,6 +663,11 @@ def _get_css() -> str:
             padding-left: 20px;
         }
         
+        .errors li {
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+        }
+        
         .footer {
             text-align: center;
             margin-top: 30px;
@@ -632,6 +679,8 @@ def _get_css() -> str:
         .footer a {
             color: #1976d2;
             text-decoration: none;
+            padding: 8px;
+            display: inline-block;
         }
         
         .footer a:hover {
@@ -640,24 +689,249 @@ def _get_css() -> str:
         
         @media (max-width: 600px) {
             body {
-                padding: 10px;
+                padding: 12px;
             }
             
             h1 {
                 font-size: 1.5em;
+                margin-bottom: 15px;
+            }
+            
+            h2 {
+                font-size: 1.3em;
+            }
+            
+            .freshness {
+                padding: 12px;
+                font-size: 0.95em;
+            }
+            
+            .freshness strong {
+                display: block;
+                margin-bottom: 4px;
+            }
+            
+            .freshness-warning {
+                display: block;
+                margin-left: 0;
+                margin-top: 6px;
+            }
+            
+            .global-info, .floor-card {
+                padding: 15px;
+                border-radius: 6px;
             }
             
             .floor-header {
                 flex-direction: column;
                 align-items: flex-start;
+                gap: 12px;
             }
             
             .decision-badge {
-                margin-top: 10px;
+                margin-top: 0;
+                font-size: 1em;
             }
             
-            .sensor-list li {
-                flex-wrap: wrap;
+            .sensor-list li, .gates-list li {
+                padding: 12px 8px;
+            }
+            
+            .sensor-name {
+                min-width: 100%;
+                margin-bottom: 4px;
+            }
+            
+            .sensor-value {
+                margin: 0;
+            }
+            
+            .gate-name {
+                min-width: 100%;
+            }
+            
+            .info-row {
+                flex-direction: column;
+                gap: 4px;
+                padding: 10px 0;
+            }
+            
+            .metric {
+                flex-direction: column;
+                gap: 4px;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            body {
+                padding: 8px;
+                font-size: 15px;
+            }
+            
+            h1 {
+                font-size: 1.4em;
+            }
+            
+            .global-info, .floor-card {
+                padding: 12px;
+            }
+            
+            summary {
+                padding: 12px;
+                font-size: 0.95em;
+            }
+        }
+        
+        @media (prefers-color-scheme: dark) {
+            body {
+                background: #1a1a1a;
+                color: #e0e0e0;
+            }
+            
+            h1, h2 {
+                color: #e0e0e0;
+            }
+            
+            .freshness {
+                background: #1e3a1e;
+                border-left-color: #66bb6a;
+                color: #c8e6c9;
+            }
+            
+            .freshness.warning {
+                background: #3d2f1f;
+                border-left-color: #ffb74d;
+                color: #ffe0b2;
+            }
+            
+            .freshness.stale {
+                background: #3d1f1f;
+                border-left-color: #e57373;
+                color: #ffcdd2;
+            }
+            
+            .freshness-warning {
+                color: #ef5350;
+            }
+            
+            .global-info, .floor-card {
+                background: #2a2a2a;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+            }
+            
+            .info-row {
+                border-bottom-color: #3a3a3a;
+            }
+            
+            .label {
+                color: #aaa;
+            }
+            
+            .value {
+                color: #e0e0e0;
+            }
+            
+            .badge-active {
+                background: #5d4037;
+                color: #ffcc80;
+            }
+            
+            .badge-inactive {
+                background: #3a3a3a;
+                color: #aaa;
+            }
+            
+            .badge-open {
+                background: #2e5d2e;
+                color: #a5d6a7;
+            }
+            
+            .badge-closed {
+                background: #5d2e2e;
+                color: #ef9a9a;
+            }
+            
+            .floor-header {
+                border-bottom-color: #3a3a3a;
+            }
+            
+            .reason {
+                background: #252525;
+                color: #d0d0d0;
+            }
+            
+            summary {
+                background: #252525;
+                color: #e0e0e0;
+            }
+            
+            summary:hover {
+                background: #303030;
+            }
+            
+            summary:active {
+                background: #353535;
+            }
+            
+            .sensor-list li, .gates-list li {
+                border-bottom-color: #333;
+            }
+            
+            .sensor-name {
+                color: #d0d0d0;
+            }
+            
+            .badge-online {
+                background: #2e5d2e;
+                color: #a5d6a7;
+            }
+            
+            .badge-offline {
+                background: #5d2e2e;
+                color: #ef9a9a;
+            }
+            
+            .aqi-good {
+                color: #81c784;
+            }
+            
+            .aqi-moderate {
+                color: #ffb74d;
+            }
+            
+            .aqi-unhealthy {
+                color: #e57373;
+            }
+            
+            .gate-pass .gate-icon {
+                color: #81c784;
+            }
+            
+            .gate-fail .gate-icon {
+                color: #e57373;
+            }
+            
+            .gate-detail {
+                color: #999;
+            }
+            
+            .notification-info {
+                background: #1a2a3a;
+                color: #b3d9ff;
+            }
+            
+            .errors {
+                background: #3d1f1f;
+                border-left-color: #e57373;
+                color: #ffcdd2;
+            }
+            
+            .footer {
+                color: #999;
+            }
+            
+            .footer a {
+                color: #64b5f6;
             }
         }
     """
