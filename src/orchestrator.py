@@ -129,6 +129,7 @@ def run_check() -> None:
                     "is_fallback": True,
                     "used_cache": False,
                     "source": "openmeteo",
+                    "observation_time": om_obs["timestamp"].isoformat() if om_obs.get("timestamp") else None,
                 }
 
         if outdoor is None:
@@ -676,6 +677,8 @@ def _build_floor_snapshot(
         last_notification_type=last_notif_type,
         last_notification_time=last_notif_time,
         timestamp=now.isoformat(),
+        outdoor_observation_time=outdoor.get("observation_time"),
+        aqi_observation_time=aqi_data.get("observation_time"),
     )
 
 

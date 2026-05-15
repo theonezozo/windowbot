@@ -266,9 +266,12 @@ def _render_html(
 def _render_floor_card(snapshot: FloorSnapshot) -> str:
     """Render one floor as an HTML card."""
     decision_class = "open" if snapshot.decision == "OPEN" else "closed"
-    
-    # Indoor sensors
-    indoor_html = "<ul class='sensor-list'>"
+    now = datetime.now(timezone.utc)
+
+    # Indoor sensors — freshness derived from poll timestamp (sensors read at poll time)
+    sensor_poll_time = datetime.fromisoformat(snapshot.timestamp)
+    sensor_age = _format_age(sensor_poll_time)
+    indoor_html = f"<div class='data-freshness'>read {sensor_age} ago</div><ul class='sensor-list'>"
     for sensor in snapshot.indoor_sensors:
         temp_str = f"{sensor.temperature_f:.1f}°F" if sensor.temperature_f else "N/A"
         status = "online" if sensor.is_online else "offline"
@@ -281,9 +284,17 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
         </li>
         """
     indoor_html += "</ul>"
-    
-    # Outdoor
+
+    # Outdoor — show observation age if available, else fall back to poll time
+    outdoor_obs_age = ""
+    if snapshot.outdoor_observation_time:
+        obs_time = datetime.fromisoformat(snapshot.outdoor_observation_time)
+        obs_age_mins = (now - obs_time).total_seconds() / 60
+        age_class = "data-fresh" if obs_age_mins < 30 else ("data-warn" if obs_age_mins < 60 else "data-stale")
+        outdoor_obs_age = f"<div class='data-freshness {age_class}'>observed {_format_age(obs_time)} ago</div>"
+
     outdoor_html = f"""
+    {outdoor_obs_age}
     <div class="metric">
         <span class="label">Temperature:</span>
         <span class="value">{snapshot.outdoor_temp_f:.1f}°F</span>
@@ -300,10 +311,18 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
             <span class="value">{snapshot.outdoor_humidity:.0f}%</span>
         </div>
         """
-    
-    # AQI
+
+    # AQI — show observation age if available
     aqi_class = "good" if snapshot.aqi_value < 50 else ("moderate" if snapshot.aqi_value < 100 else "unhealthy")
+    aqi_obs_age = ""
+    if snapshot.aqi_observation_time:
+        obs_time = datetime.fromisoformat(snapshot.aqi_observation_time)
+        obs_age_mins = (now - obs_time).total_seconds() / 60
+        age_class = "data-fresh" if obs_age_mins < 30 else ("data-warn" if obs_age_mins < 60 else "data-stale")
+        aqi_obs_age = f"<div class='data-freshness {age_class}'>observed {_format_age(obs_time)} ago</div>"
+
     aqi_html = f"""
+    {aqi_obs_age}
     <div class="metric">
         <span class="label">AQI:</span>
         <span class="value aqi-{aqi_class}">{snapshot.aqi_value}</span>
@@ -313,7 +332,7 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
         <span class="value">{html.escape(snapshot.aqi_source)}</span>
     </div>
     """
-    
+
     # Gates
     gates_html = "<ul class='gates-list'>"
     for gate in snapshot.gates:
@@ -330,7 +349,7 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
         </li>
         """
     gates_html += "</ul>"
-    
+
     # Last notification
     notif_html = ""
     if snapshot.last_notification_time:
@@ -342,7 +361,7 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
             <strong>Last notification:</strong> {html.escape(notif_type)} ({notif_age} ago)
         </div>
         """
-    
+
     return f"""
     <div class="floor-card">
         <div class="floor-header">
@@ -352,27 +371,27 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
         <div class="reason">
             <strong>Reason:</strong> {html.escape(snapshot.reason)}
         </div>
-        
+
         <details open>
             <summary>Indoor Sensors</summary>
             {indoor_html}
         </details>
-        
+
         <details>
             <summary>Outdoor Conditions</summary>
             {outdoor_html}
         </details>
-        
+
         <details>
             <summary>Air Quality</summary>
             {aqi_html}
         </details>
-        
+
         <details>
             <summary>Gate Evaluations</summary>
             {gates_html}
         </details>
-        
+
         {notif_html}
     </div>
     """
@@ -652,6 +671,22 @@ def _get_css() -> str:
         }
         
         .aqi-unhealthy {
+            color: #c62828;
+            font-weight: 600;
+        }
+
+        .data-freshness {
+            font-size: 0.8em;
+            color: #777;
+            padding: 4px 10px 8px;
+            font-style: italic;
+        }
+
+        .data-freshness.data-warn {
+            color: #f57c00;
+        }
+
+        .data-freshness.data-stale {
             color: #c62828;
             font-weight: 600;
         }

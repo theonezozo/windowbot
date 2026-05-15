@@ -218,11 +218,16 @@ class PurpleAirClient:
             aqi, median_pm25, len(top),
         )
 
+        # Use the oldest last_seen among contributing sensors as the observation time.
+        last_seen_times = [s["last_seen"] for s in top if s.get("last_seen") is not None]
+        oldest_seen = min(last_seen_times).isoformat() if last_seen_times else None
+
         return {
             "aqi": aqi,
             "pm25": round(median_pm25, 1),
             "source": "purpleair",
             "sensor_count": len(top),
+            "observation_time": oldest_seen,
         }
 
     @staticmethod

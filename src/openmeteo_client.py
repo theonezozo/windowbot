@@ -213,4 +213,5 @@ class OpenMeteoClient:
             "is_fallback": True,
             "used_cache": False,
             "source": "openmeteo",
+            "observation_time": data["timestamp"].isoformat() if data.get("timestamp") else None,
         }

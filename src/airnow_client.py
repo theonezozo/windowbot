@@ -91,4 +91,5 @@ class AirNowClient:
             "source": "airnow",
             "category": category,
             "parameter": parameter,
+            "observation_time": None,  # AirNow API doesn't expose observation timestamps
         }

@@ -553,12 +553,17 @@ class NWSClient:
         humidities = [o["humidity"] for o in observations if o["humidity"] is not None]
         winds = [o["wind_speed_mph"] for o in observations if o["wind_speed_mph"] is not None]
 
+        # Oldest observation timestamp among contributors — reflects actual data age.
+        timestamps = [o["timestamp"] for o in observations if o.get("timestamp") is not None]
+        oldest_ts = min(timestamps).isoformat() if timestamps else None
+
         return {
             "temperature_f": round(statistics.median(temps), 1),
             "humidity": round(statistics.median(humidities), 1) if humidities else None,
             "wind_speed_mph": round(statistics.median(winds), 1) if winds else None,
             "station_count": len(observations),
             "is_fallback": is_fallback,
+            "observation_time": oldest_ts,
         }
 
     def _record_freshness_metric(

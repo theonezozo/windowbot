@@ -72,6 +72,8 @@ class FloorSnapshot:
     last_notification_type: str | None
     last_notification_time: str | None
     timestamp: str
+    outdoor_observation_time: str | None = None
+    aqi_observation_time: str | None = None
 
     def to_json(self) -> str:
         """Serialize to JSON for Table Storage."""
@@ -86,6 +88,9 @@ class FloorSnapshot:
         obj["outdoor_stations"] = [OutdoorStation(**s) for s in obj["outdoor_stations"]]
         obj["aqi_stations"] = [AQIStation(**s) for s in obj["aqi_stations"]]
         obj["gates"] = [GateEvaluation(**g) for g in obj["gates"]]
+        # Tolerate snapshots written before freshness fields were added.
+        obj.setdefault("outdoor_observation_time", None)
+        obj.setdefault("aqi_observation_time", None)
         return cls(**obj)
 
 
