@@ -148,28 +148,18 @@ class BeestatClient:
         data = self._fetch_all()
         raw_sensors = data.get("sensors", {})
 
-        # --- Pass 1: collect all non-inactive sensors -----------------
-        active_items: list[tuple[str, dict]] = []
+        # Collect all non-inactive sensors. The Ecobee `in_use` flag reflects
+        # comfort-profile participation (e.g. a sensor only in the "Home"
+        # profile is in_use=False while in "Away" mode) — it is NOT a
+        # hardware status indicator. We include every sensor that isn't
+        # explicitly decommissioned so all floors are represented regardless
+        # of the active comfort setting.
+        selected: list[tuple[str, dict]] = []
         for sensor_id, raw in raw_sensors.items():
             if raw.get("inactive", False):
                 logger.debug("Skipping inactive sensor %s", sensor_id)
                 continue
-            active_items.append((sensor_id, raw))
-
-        # --- Pass 2: prefer only in_use sensors, but fall back --------
-        in_use_items = [
-            (sid, r) for sid, r in active_items if r.get("in_use", True)
-        ]
-        if in_use_items:
-            selected = in_use_items
-        else:
-            # Ecobee rotated all remotes off — use every non-inactive sensor
-            logger.warning(
-                "All %d non-inactive sensors have in_use=False; "
-                "ignoring in_use filter so downstream gets data.",
-                len(active_items),
-            )
-            selected = active_items
+            selected.append((sensor_id, raw))
 
         # --- Build sensor dicts from selected items -------------------
         sensors: list[dict] = []

@@ -249,8 +249,9 @@ class TestGetSensorsFiltering:
         assert sensors[0]["name"] == "Active"
 
     @patch("src.beestat_client.requests.post")
-    def test_not_in_use_sensors_excluded(self, mock_post):
-        """Sensors with in_use != 1 are skipped."""
+    def test_not_in_use_sensors_included(self, mock_post):
+        """Sensors with in_use=False are NOT excluded — in_use is a comfort-profile
+        flag, not a hardware status indicator."""
         sid1, s1 = _raw_sensor(1, "Used", in_use=1)
         sid2, s2 = _raw_sensor(2, "Unused", in_use=False)
         body = _beestat_response(
@@ -262,8 +263,7 @@ class TestGetSensorsFiltering:
 
         sensors = client.get_sensors()
 
-        assert len(sensors) == 1
-        assert sensors[0]["name"] == "Used"
+        assert len(sensors) == 2
 
     @patch("src.beestat_client.requests.post")
     def test_supported_types_included(self, mock_post):
@@ -283,19 +283,19 @@ class TestGetSensorsFiltering:
 
 
 # ------------------------------------------------------------------
-# get_sensors() — in_use fallback behaviour
+# get_sensors() — in_use is ignored (comfort-profile flag only)
 # ------------------------------------------------------------------
 
 
-class TestGetSensorsInUseFallback:
-    """When ALL non-inactive sensors have in_use=False the client must
-    fall back to returning every non-inactive sensor instead of an
-    empty list.
+class TestGetSensorsInUseIgnored:
+    """The in_use flag reflects Ecobee comfort-profile participation, NOT
+    hardware status. All non-inactive sensors must be returned regardless
+    of their in_use value.
     """
 
     @patch("src.beestat_client.requests.post")
-    def test_all_sensors_not_in_use_triggers_fallback(self, mock_post):
-        """All non-inactive sensors have in_use=False → all returned."""
+    def test_all_sensors_not_in_use_still_returned(self, mock_post):
+        """All non-inactive sensors returned even when all have in_use=False."""
         sid1, s1 = _raw_sensor(1, "Room A", in_use=False)
         sid2, s2 = _raw_sensor(2, "Room B", in_use=False)
         body = _beestat_response(
@@ -312,8 +312,8 @@ class TestGetSensorsInUseFallback:
         assert names == {"Room A", "Room B"}
 
     @patch("src.beestat_client.requests.post")
-    def test_mix_in_use_true_and_false_returns_only_in_use(self, mock_post):
-        """Some in_use=True, some False → only in_use=True returned."""
+    def test_mix_in_use_true_and_false_returns_all(self, mock_post):
+        """Mix of in_use=True and False → ALL returned (in_use not filtered)."""
         sid1, s1 = _raw_sensor(1, "Active", in_use=True)
         sid2, s2 = _raw_sensor(2, "Rotated Off", in_use=False)
         sid3, s3 = _raw_sensor(3, "Also Active", in_use=True)
@@ -326,9 +326,9 @@ class TestGetSensorsInUseFallback:
 
         sensors = client.get_sensors()
 
-        assert len(sensors) == 2
+        assert len(sensors) == 3
         names = {s["name"] for s in sensors}
-        assert names == {"Active", "Also Active"}
+        assert names == {"Active", "Rotated Off", "Also Active"}
 
     @patch("src.beestat_client.requests.post")
     def test_all_sensors_in_use_returns_all(self, mock_post):
@@ -348,9 +348,8 @@ class TestGetSensorsInUseFallback:
         assert len(sensors) == 3
 
     @patch("src.beestat_client.requests.post")
-    def test_inactive_excluded_but_not_in_use_returned_via_fallback(self, mock_post):
-        """Inactive sensors always excluded; remaining not-in-use sensors
-        returned through the fallback when none are in_use=True."""
+    def test_inactive_excluded_regardless_of_in_use(self, mock_post):
+        """Inactive sensors always excluded; non-inactive sensors always included."""
         sid1, s1 = _raw_sensor(1, "Inactive", inactive=True, in_use=False)
         sid2, s2 = _raw_sensor(2, "Not In Use A", inactive=False, in_use=False)
         sid3, s3 = _raw_sensor(3, "Not In Use B", inactive=False, in_use=False)
@@ -369,8 +368,8 @@ class TestGetSensorsInUseFallback:
         assert names == {"Not In Use A", "Not In Use B"}
 
     @patch("src.beestat_client.requests.post")
-    def test_fallback_logs_warning(self, mock_post, caplog):
-        """Warning is logged when the in_use fallback triggers."""
+    def test_no_warning_logged_for_in_use_false(self, mock_post, caplog):
+        """No in_use-related warning is ever logged — in_use is not a filter."""
         sid1, s1 = _raw_sensor(1, "Room A", in_use=False)
         sid2, s2 = _raw_sensor(2, "Room B", in_use=False)
         body = _beestat_response(
@@ -383,24 +382,7 @@ class TestGetSensorsInUseFallback:
         with caplog.at_level(logging.WARNING, logger="windowbot.beestat"):
             client.get_sensors()
 
-        assert any("in_use=False" in msg for msg in caplog.messages)
-
-    @patch("src.beestat_client.requests.post")
-    def test_normal_path_no_fallback_warning(self, mock_post, caplog):
-        """No warning when at least one sensor is in_use=True."""
-        sid1, s1 = _raw_sensor(1, "Active", in_use=True)
-        sid2, s2 = _raw_sensor(2, "Off", in_use=False)
-        body = _beestat_response(
-            sensors={sid1: s1, sid2: s2},
-            thermostat=_raw_thermostat(),
-        )
-        mock_post.return_value = _ok_post(body)
-        client = BeestatClient("key")
-
-        with caplog.at_level(logging.WARNING, logger="windowbot.beestat"):
-            client.get_sensors()
-
-        assert not any("in_use=False" in msg for msg in caplog.messages)
+        assert not any("in_use" in msg for msg in caplog.messages)
 
 
 # ------------------------------------------------------------------
@@ -708,8 +690,8 @@ class TestEdgeCases:
         assert sensors[0]["is_online"] is False
 
     @patch("src.beestat_client.requests.post")
-    def test_both_inactive_and_not_in_use_excluded(self, mock_post):
-        """Sensor that is both inactive AND not in use is excluded."""
+    def test_inactive_excluded_not_in_use_included(self, mock_post):
+        """Sensor with inactive=True is excluded; sensor with in_use=False is kept."""
         sid, s = _raw_sensor(1, "Ghost", inactive=True, in_use=False)
         sid2, s2 = _raw_sensor(2, "Alive")
         body = _beestat_response(
