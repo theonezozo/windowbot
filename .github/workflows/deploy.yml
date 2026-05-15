@@ -49,4 +49,6 @@ jobs:
         with:
           app-name: 'windowbot-func'
           package: '.'
+          # Required when using publish-profile auth for Flex Consumption apps
+          sku: 'flexconsumption'
           publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
