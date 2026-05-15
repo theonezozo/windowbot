@@ -56,9 +56,18 @@ jobs:
 
           profile_xml = os.environ.get("AZURE_FUNCTIONAPP_PUBLISH_PROFILE", "").strip()
           if not profile_xml:
-              raise SystemExit("AZURE_FUNCTIONAPP_PUBLISH_PROFILE secret is empty or not configured.")
+              raise SystemExit(
+                  "Fatal: AZURE_FUNCTIONAPP_PUBLISH_PROFILE secret is not configured. "
+                  "Add this secret in GitHub repository settings before deploying."
+              )
 
-          root = ET.fromstring(profile_xml)
+          try:
+              root = ET.fromstring(profile_xml)
+          except ET.ParseError as exc:
+              raise SystemExit(
+                  "AZURE_FUNCTIONAPP_PUBLISH_PROFILE is not valid XML. "
+                  "Re-download the publish profile from Azure and update the secret."
+              ) from exc
           app_name = None
 
           # Prefer SCM-enabled publish profiles used by Azure/functions-action.
@@ -76,7 +85,10 @@ jobs:
                       break
 
           if not app_name:
-              raise SystemExit("Could not determine Function App name from AZURE_FUNCTIONAPP_PUBLISH_PROFILE.")
+              raise SystemExit(
+                  "Could not determine Function App name from AZURE_FUNCTIONAPP_PUBLISH_PROFILE. "
+                  "Verify the publish profile XML includes 'msdeploySite' or 'siteName'."
+              )
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"app_name={app_name}\n")
