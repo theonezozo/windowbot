@@ -216,10 +216,18 @@ def _render_html(
             header_html += '</ul></div>'
     
     # Floor cards
+    sorted_floors = sorted(floor_snapshots, key=lambda s: s.floor)
+
+    # Shared environmental conditions (outdoor + AQI are the same across floors,
+    # since they come from the same coordinates).
+    environment_html = ""
+    if sorted_floors:
+        environment_html = _render_environment_section(sorted_floors[0])
+
     floors_html = ""
-    for snapshot in sorted(floor_snapshots, key=lambda s: s.floor):
+    for snapshot in sorted_floors:
         floors_html += _render_floor_card(snapshot)
-    
+
     html_content = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -236,6 +244,7 @@ def _render_html(
         <h1>🪟 WindowBot Status</h1>
         {freshness_html}
         {header_html}
+        {environment_html}
         {floors_html}
         <div class="footer">
             <p>Page loaded: {now.strftime('%Y-%m-%d %H:%M:%S UTC')} · auto-refreshes in {refresh_seconds}s</p>
@@ -263,29 +272,11 @@ def _render_html(
     )
 
 
-def _render_floor_card(snapshot: FloorSnapshot) -> str:
-    """Render one floor as an HTML card."""
-    decision_class = "open" if snapshot.decision == "OPEN" else "closed"
+def _render_environment_section(snapshot: FloorSnapshot) -> str:
+    """Render the shared outdoor + AQI section (same data across all floors)."""
     now = datetime.now(timezone.utc)
 
-    # Indoor sensors — freshness derived from poll timestamp (sensors read at poll time)
-    sensor_poll_time = datetime.fromisoformat(snapshot.timestamp)
-    sensor_age = _format_age(sensor_poll_time)
-    indoor_html = f"<div class='data-freshness'>read {sensor_age} ago</div><ul class='sensor-list'>"
-    for sensor in snapshot.indoor_sensors:
-        temp_str = f"{sensor.temperature_f:.1f}°F" if sensor.temperature_f else "N/A"
-        status = "online" if sensor.is_online else "offline"
-        coolest_mark = " 🌡️" if sensor.is_coolest else ""
-        indoor_html += f"""
-        <li>
-            <span class="sensor-name">{html.escape(sensor.name)}{coolest_mark}</span>
-            <span class="sensor-value">{temp_str}</span>
-            <span class="sensor-status badge-{status}">{status}</span>
-        </li>
-        """
-    indoor_html += "</ul>"
-
-    # Outdoor — show observation age if available, else fall back to poll time
+    # Outdoor freshness
     outdoor_obs_age = ""
     if snapshot.outdoor_observation_time:
         obs_time = datetime.fromisoformat(snapshot.outdoor_observation_time)
@@ -312,7 +303,7 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
         </div>
         """
 
-    # AQI — show observation age if available
+    # AQI
     aqi_class = "good" if snapshot.aqi_value < 50 else ("moderate" if snapshot.aqi_value < 100 else "unhealthy")
     aqi_obs_age = ""
     if snapshot.aqi_observation_time:
@@ -332,6 +323,46 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
         <span class="value">{html.escape(snapshot.aqi_source)}</span>
     </div>
     """
+
+    return f"""
+    <div class="floor-card environment-card">
+        <div class="floor-header">
+            <h2>🌤️ Environment</h2>
+        </div>
+
+        <details open>
+            <summary>Outdoor Conditions</summary>
+            {outdoor_html}
+        </details>
+
+        <details open>
+            <summary>Air Quality</summary>
+            {aqi_html}
+        </details>
+    </div>
+    """
+
+
+def _render_floor_card(snapshot: FloorSnapshot) -> str:
+    """Render one floor as an HTML card."""
+    decision_class = "open" if snapshot.decision == "OPEN" else "closed"
+
+    # Indoor sensors — freshness derived from poll timestamp (sensors read at poll time)
+    sensor_poll_time = datetime.fromisoformat(snapshot.timestamp)
+    sensor_age = _format_age(sensor_poll_time)
+    indoor_html = f"<div class='data-freshness'>read {sensor_age} ago</div><ul class='sensor-list'>"
+    for sensor in snapshot.indoor_sensors:
+        temp_str = f"{sensor.temperature_f:.1f}°F" if sensor.temperature_f else "N/A"
+        status = "online" if sensor.is_online else "offline"
+        coolest_mark = " 🌡️" if sensor.is_coolest else ""
+        indoor_html += f"""
+        <li>
+            <span class="sensor-name">{html.escape(sensor.name)}{coolest_mark}</span>
+            <span class="sensor-value">{temp_str}</span>
+            <span class="sensor-status badge-{status}">{status}</span>
+        </li>
+        """
+    indoor_html += "</ul>"
 
     # Gates
     gates_html = "<ul class='gates-list'>"
@@ -375,16 +406,6 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
         <details open>
             <summary>Indoor Sensors</summary>
             {indoor_html}
-        </details>
-
-        <details>
-            <summary>Outdoor Conditions</summary>
-            {outdoor_html}
-        </details>
-
-        <details>
-            <summary>Air Quality</summary>
-            {aqi_html}
         </details>
 
         <details>
