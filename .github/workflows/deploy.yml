@@ -6,7 +6,7 @@
 # REQUIRED SECRET:
 # You must configure the AZURE_FUNCTIONAPP_PUBLISH_PROFILE secret in GitHub:
 #   1. Go to Azure Portal: https://portal.azure.com
-#   2. Navigate to your Function App: windowbot-func
+#   2. Navigate to your target Function App
 #   3. Click "Overview" in the left menu
 #   4. Click "Get publish profile" button in the top menu bar
 #   5. Download the .PublishSettings XML file
@@ -44,10 +44,60 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Resolve Function App name from publish profile
+        id: profile
+        shell: bash
+        env:
+          AZURE_FUNCTIONAPP_PUBLISH_PROFILE: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          profile_xml = os.environ.get("AZURE_FUNCTIONAPP_PUBLISH_PROFILE", "").strip()
+          if not profile_xml:
+              raise SystemExit(
+                  "Fatal: AZURE_FUNCTIONAPP_PUBLISH_PROFILE secret is not configured. "
+                  "Add this secret in GitHub repository settings before deploying."
+              )
+
+          try:
+              root = ET.fromstring(profile_xml)
+          except ET.ParseError as exc:
+              raise SystemExit(
+                  "AZURE_FUNCTIONAPP_PUBLISH_PROFILE is not valid XML. "
+                  "Re-download the publish profile from Azure and update the secret."
+              ) from exc
+          app_name = None
+
+          # Prefer SCM-enabled publish profiles used by Azure/functions-action.
+          for profile in root.findall("publishProfile"):
+              if profile.get("publishMethod") in {"ZipDeploy", "MSDeploy"}:
+                  app_name = profile.get("msdeploySite")
+                  if app_name:
+                      break
+
+          # Fallback for profile formats that don't include msdeploySite.
+          if not app_name:
+              for profile in root.findall("publishProfile"):
+                  app_name = profile.get("siteName")
+                  if app_name:
+                      break
+
+          if not app_name:
+              raise SystemExit(
+                  "Could not determine Function App name from AZURE_FUNCTIONAPP_PUBLISH_PROFILE. "
+                  "Verify the publish profile XML includes 'msdeploySite' or 'siteName'."
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"app_name={app_name}\n")
+          PY
+
       - name: Deploy to Azure Function App
         uses: Azure/functions-action@v1
         with:
-          app-name: 'windowbot-func'
+          app-name: ${{ steps.profile.outputs.app_name }}
           package: '.'
           # Required when using publish-profile auth for Flex Consumption apps
           sku: 'flexconsumption'
