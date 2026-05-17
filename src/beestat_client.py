@@ -148,6 +148,31 @@ class BeestatClient:
         data = self._fetch_all()
         raw_sensors = data.get("sensors", {})
 
+        # Build a lookup from ecobee_sensor_id → live temp from the
+        # ecobee_thermostat remoteSensors, so we can cross-check (and
+        # override stale sensor-resource values when available).
+        # ecobee_thermostat stores capability temps in tenths of °F (e.g. 740
+        # = 74.0°F); divide by 10 to get actual °F.
+        live_temps: dict[int, float] = {}
+        for _tid, tstat in data.get("thermostat", {}).items():
+            for rs in tstat.get("remoteSensors", []):
+                rs_id = rs.get("id", "")  # e.g. "rs:100123456:1"
+                ecobee_sensor_id = rs.get("ecobee_sensor_id")
+                for cap in rs.get("capability", []):
+                    if cap.get("type") == "temperature":
+                        raw_val = cap.get("value")
+                        try:
+                            raw_int = int(raw_val)
+                            if raw_int > 0:
+                                live_temps_key = ecobee_sensor_id or rs_id
+                                live_temps[live_temps_key] = raw_int / 10.0
+                        except (ValueError, TypeError):
+                            pass
+        if live_temps:
+            logger.debug(
+                "Live temps from ecobee_thermostat remoteSensors: %s", live_temps
+            )
+
         # Collect all non-inactive sensors. The Ecobee `in_use` flag reflects
         # comfort-profile participation (e.g. a sensor only in the "Home"
         # profile is in_use=False while in "Away" mode) — it is NOT a
@@ -166,17 +191,31 @@ class BeestatClient:
         for sensor_id, raw in selected:
             name = raw.get("name", "Unknown")
 
-            # Temperature: Beestat stores actual °F (already /10 from Ecobee)
+            # Temperature: prefer live reading from ecobee_thermostat
+            # remoteSensors (tenths of °F, divided by 10) when available.
+            # Fall back to the sensor-resource value which may lag by a few
+            # minutes because Beestat aggregates it for charting.
             temp_f: float | None = None
-            raw_temp = raw.get("temperature")
-            if raw_temp is not None:
-                try:
-                    temp_f = float(raw_temp)
-                except (ValueError, TypeError):
-                    logger.warning(
-                        "Bad temperature value '%s' for sensor '%s'.",
-                        raw_temp, name,
-                    )
+            ecobee_sensor_id = raw.get("ecobee_sensor_id")
+            if ecobee_sensor_id and ecobee_sensor_id in live_temps:
+                temp_f = live_temps[ecobee_sensor_id]
+                logger.debug(
+                    "Sensor '%s': using live temp %.1f°F from ecobee_thermostat",
+                    name, temp_f,
+                )
+            else:
+                raw_temp = raw.get("temperature")
+                logger.debug(
+                    "Sensor '%s': raw sensor-resource temperature = %r", name, raw_temp
+                )
+                if raw_temp is not None:
+                    try:
+                        temp_f = float(raw_temp)
+                    except (ValueError, TypeError):
+                        logger.warning(
+                            "Bad temperature value '%s' for sensor '%s'.",
+                            raw_temp, name,
+                        )
 
             # Humidity: Beestat stores value/10, so 4.5 means 45%.
             # Multiply by 10 and round to int for the standard interface.

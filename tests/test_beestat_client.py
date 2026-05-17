@@ -79,13 +79,32 @@ def _raw_thermostat(
     thermostat_id: int = 789,
     *,
     hvac_mode: str = "cool",
+    remote_sensors: list[dict] | None = None,
 ) -> dict:
     """Build a raw Beestat thermostat dict keyed by ID."""
     return {
         str(thermostat_id): {
             "ecobee_thermostat_id": thermostat_id,
             "settings": {"hvacMode": hvac_mode},
+            "remoteSensors": remote_sensors or [],
         }
+    }
+
+
+def _remote_sensor_entry(
+    ecobee_sensor_id: int,
+    name: str,
+    *,
+    temperature_tenths_f: int,
+) -> dict:
+    """Build a remoteSensors entry (ecobee_thermostat style, tenths of °F)."""
+    return {
+        "id": f"rs:{ecobee_sensor_id}:1",
+        "name": name,
+        "ecobee_sensor_id": ecobee_sensor_id,
+        "capability": [
+            {"type": "temperature", "value": str(temperature_tenths_f)},
+        ],
     }
 
 
@@ -146,8 +165,38 @@ class TestGetSensorsHappyPath:
         assert "Bedroom" in names
 
     @patch("src.beestat_client.requests.post")
+    def test_live_temp_from_thermostat_overrides_sensor_resource(self, mock_post):
+        """Live temp from ecobee_thermostat remoteSensors overrides sensor-resource value."""
+        sid, s = _raw_sensor(123, "Kid's Room", temperature=70.7)  # stale sensor-resource value
+        rs = _remote_sensor_entry(123, "Kid's Room", temperature_tenths_f=740)  # 74.0°F live
+        body = _beestat_response(
+            sensors={sid: s},
+            thermostat=_raw_thermostat(remote_sensors=[rs]),
+        )
+        mock_post.return_value = _ok_post(body)
+
+        sensors = BeestatClient("key").get_sensors()
+
+        # Live reading (740/10 = 74.0°F) should win over stale sensor-resource (70.7)
+        assert sensors[0]["temperature_f"] == 74.0
+
+    @patch("src.beestat_client.requests.post")
+    def test_falls_back_to_sensor_resource_when_no_remote_sensors(self, mock_post):
+        """Falls back to sensor-resource temperature when thermostat has no remoteSensors."""
+        sid, s = _raw_sensor(123, "Test", temperature=72.5)
+        body = _beestat_response(
+            sensors={sid: s},
+            thermostat=_raw_thermostat(),  # no remoteSensors
+        )
+        mock_post.return_value = _ok_post(body)
+
+        sensors = BeestatClient("key").get_sensors()
+
+        assert sensors[0]["temperature_f"] == 72.5
+
+    @patch("src.beestat_client.requests.post")
     def test_temperature_not_divided_by_10(self, mock_post):
-        """Beestat temperature is already actual °F — must NOT divide by 10 again."""
+        """Sensor-resource temperature is already actual °F — must NOT divide by 10 again."""
         sid, s = _raw_sensor(123, "Test", temperature=72.5)
         body = _beestat_response(
             sensors={sid: s},
