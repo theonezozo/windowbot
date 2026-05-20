@@ -16,7 +16,12 @@ from datetime import datetime, timezone
 import azure.functions as func
 
 from src.state import get_state_manager
-from src.diagnostic import SnapshotManager, FloorSnapshot, GlobalSnapshot
+from src.diagnostic import (
+    SnapshotManager,
+    FloorSnapshot,
+    GlobalSnapshot,
+    TemperatureHistoryEntry,
+)
 
 logger = logging.getLogger("windowbot.status")
 
@@ -72,7 +77,14 @@ def render_status_page(req: func.HttpRequest) -> func.HttpResponse:
         # Fetch snapshots
         floor_snapshots = mgr.get_all_floor_snapshots()
         global_snapshot = mgr.get_global_snapshot()
-        
+
+        # Fetch history (best-effort; absence must not break the page).
+        try:
+            history = mgr.get_temperature_history(hours=12)
+        except Exception:
+            logger.exception("Failed to fetch temperature history.")
+            history = []
+
         if not floor_snapshots and not global_snapshot:
             return _no_data_response(
                 "No diagnostic data available yet. WindowBot will populate this page after its first poll cycle.",
@@ -81,9 +93,9 @@ def render_status_page(req: func.HttpRequest) -> func.HttpResponse:
         
         # Render as JSON or HTML
         if wants_json:
-            return _render_json(floor_snapshots, global_snapshot)
+            return _render_json(floor_snapshots, global_snapshot, history)
         else:
-            return _render_html(floor_snapshots, global_snapshot)
+            return _render_html(floor_snapshots, global_snapshot, history)
     
     except Exception as exc:
         logger.exception("Failed to render status page.")
@@ -127,12 +139,14 @@ def _no_data_response(message: str, is_json: bool) -> func.HttpResponse:
 
 def _render_json(
     floor_snapshots: list[FloorSnapshot],
-    global_snapshot: GlobalSnapshot | None
+    global_snapshot: GlobalSnapshot | None,
+    history: list[TemperatureHistoryEntry] | None = None,
 ) -> func.HttpResponse:
     """Render status as JSON."""
     data = {
         "global": json.loads(global_snapshot.to_json()) if global_snapshot else None,
-        "floors": {s.floor: json.loads(s.to_json()) for s in floor_snapshots}
+        "floors": {s.floor: json.loads(s.to_json()) for s in floor_snapshots},
+        "history": [json.loads(h.to_json()) for h in (history or [])],
     }
     return func.HttpResponse(
         json.dumps(data, indent=2),
@@ -143,7 +157,8 @@ def _render_json(
 
 def _render_html(
     floor_snapshots: list[FloorSnapshot],
-    global_snapshot: GlobalSnapshot | None
+    global_snapshot: GlobalSnapshot | None,
+    history: list[TemperatureHistoryEntry] | None = None,
 ) -> func.HttpResponse:
     """Render status as HTML."""
     now = datetime.now(timezone.utc)
@@ -228,6 +243,8 @@ def _render_html(
     for snapshot in sorted_floors:
         floors_html += _render_floor_card(snapshot)
 
+    history_html = _render_history_card(history or [])
+
     html_content = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -246,6 +263,7 @@ def _render_html(
         {header_html}
         {environment_html}
         {floors_html}
+        {history_html}
         <div class="footer">
             <p>Page loaded: {now.strftime('%Y-%m-%d %H:%M:%S UTC')} · auto-refreshes in {refresh_seconds}s</p>
             <p><a href="?format=json">View as JSON</a></p>
@@ -414,6 +432,72 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
         </details>
 
         {notif_html}
+    </div>
+    """
+
+
+def _render_history_card(history: list[TemperatureHistoryEntry]) -> str:
+    """Render the collapsible 12-hour temperature history table.
+
+    Returns "" when there are no entries so the page doesn't show an empty
+    expando.
+    """
+    if not history:
+        return ""
+
+    # Union of floor keys across all entries, sorted for stable column order.
+    floor_names: list[str] = sorted({
+        floor for entry in history for floor in entry.indoor_temps.keys()
+    })
+
+    header_cells = "".join(
+        f"<th>{html.escape(name.title())}</th>" for name in floor_names
+    )
+
+    rows_html = []
+    for entry in history:  # already newest-first
+        try:
+            ts = datetime.fromisoformat(entry.timestamp)
+            time_label = ts.strftime("%m-%d %H:%M")
+        except (TypeError, ValueError):
+            time_label = html.escape(str(entry.timestamp))
+
+        outdoor_cell = (
+            f"{entry.outdoor_temp_f:.1f}°F"
+            if entry.outdoor_temp_f is not None
+            else "—"
+        )
+        floor_cells = []
+        for name in floor_names:
+            val = entry.indoor_temps.get(name)
+            floor_cells.append(
+                f"<td>{val:.1f}°F</td>" if val is not None else "<td>—</td>"
+            )
+        rows_html.append(
+            f"<tr><td>{time_label}</td><td>{outdoor_cell}</td>"
+            + "".join(floor_cells)
+            + "</tr>"
+        )
+
+    return f"""
+    <div class="floor-card history-card">
+        <details>
+            <summary>📈 Temperature History (last 12h)</summary>
+            <div class="history-scroll">
+                <table class="history-table">
+                    <thead>
+                        <tr>
+                            <th>Time (UTC)</th>
+                            <th>Outdoor</th>
+                            {header_cells}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {''.join(rows_html)}
+                    </tbody>
+                </table>
+            </div>
+        </details>
     </div>
     """
 
@@ -710,6 +794,41 @@ def _get_css() -> str:
         .data-freshness.data-stale {
             color: #c62828;
             font-weight: 600;
+        }
+
+        .history-scroll {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        .history-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85em;
+            margin-top: 4px;
+        }
+
+        .history-table th,
+        .history-table td {
+            border: 1px solid #e0e0e0;
+            padding: 6px 10px;
+            text-align: right;
+            white-space: nowrap;
+        }
+
+        .history-table th {
+            background: #f5f5f5;
+            font-weight: 600;
+            text-align: center;
+        }
+
+        .history-table th:first-child,
+        .history-table td:first-child {
+            text-align: left;
+        }
+
+        .history-table tbody tr:nth-child(even) {
+            background: #fafafa;
         }
         
         .gates-list li {
@@ -1041,6 +1160,24 @@ def _get_css() -> str:
             
             .footer a {
                 color: #64b5f6;
+            }
+
+            .history-table th,
+            .history-table td {
+                border-color: #3a3a3a;
+            }
+
+            .history-table th {
+                background: #303030;
+                color: #e0e0e0;
+            }
+
+            .history-table tbody tr:nth-child(even) {
+                background: #252525;
+            }
+
+            .history-table td {
+                color: #d0d0d0;
             }
         }
     """

@@ -28,6 +28,7 @@ from src.diagnostic import (
     OutdoorStation,
     AQIStation,
     GateEvaluation,
+    TemperatureHistoryEntry,
 )
 
 logger = logging.getLogger("windowbot")
@@ -235,8 +236,23 @@ def run_check() -> None:
             next_poll_eta=next_poll.isoformat(),
             errors=errors,
         )
-        
-        _persist_snapshots(state_mgr, floor_snapshots, global_snapshot)
+
+        # Build temperature history entry for this cycle.  Coolest valid
+        # indoor reading per floor; outdoor median temp (or None).
+        indoor_temps: dict[str, float | None] = {}
+        for floor_name, snap in floor_snapshots.items():
+            valid = [
+                s.temperature_f for s in snap.indoor_sensors
+                if s.temperature_f is not None
+            ]
+            indoor_temps[floor_name] = min(valid) if valid else None
+        history_entry = TemperatureHistoryEntry(
+            timestamp=poll_end.isoformat(),
+            outdoor_temp_f=outdoor.get("temperature_f"),
+            indoor_temps=indoor_temps,
+        )
+
+        _persist_snapshots(state_mgr, floor_snapshots, global_snapshot, history_entry)
 
         logger.info("WindowBot check complete.")
 
@@ -737,6 +753,7 @@ def _persist_snapshots(
     state_mgr: StateManager,
     floor_snapshots: dict[str, FloorSnapshot],
     global_snapshot: GlobalSnapshot,
+    history_entry: TemperatureHistoryEntry | None = None,
 ) -> None:
     """Persist all diagnostic snapshots to Table Storage."""
     try:
@@ -748,6 +765,16 @@ def _persist_snapshots(
                 mgr.save_floor_snapshot(snapshot)
             
             mgr.save_global_snapshot(global_snapshot)
+
+            if history_entry is not None:
+                try:
+                    mgr.record_temperature_history(history_entry)
+                except Exception:
+                    # Defensive — record_temperature_history is already
+                    # best-effort, but a history-write failure must never
+                    # break the poll cycle.
+                    logger.exception("Temperature history write failed.")
+
             logger.info("Diagnostic snapshots persisted successfully.")
         else:
             logger.warning("Snapshot table not available (local state mode).")

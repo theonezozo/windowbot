@@ -992,3 +992,121 @@ class TestWeatherFallbackChain:
 
         mock_eval_floor.assert_not_called()
 
+
+# ------------------------------------------------------------------
+# Temperature history recording (Gregory's 2026-05-19 feature)
+# ------------------------------------------------------------------
+
+
+class TestTemperatureHistoryRecording:
+    """``run_check`` writes one history entry per cycle, and a history-write
+    failure never breaks the cycle."""
+
+    @staticmethod
+    def _wire(
+        mock_config,
+        mock_state_cls,
+        mock_ecobee_cls,
+        mock_nws_cls,
+        mock_om_cls,
+        *,
+        sensor_temps,
+        outdoor_temp,
+        outdoor_humidity=50.0,
+        hvac_mode="cool",
+        current_state="CLOSED",
+    ):
+        mock_config.return_value = _base_config()
+
+        mock_state = MagicMock()
+        mock_state.get_floor_state.return_value = {"CurrentState": current_state}
+        mock_state_cls.return_value = mock_state
+
+        sensors = [
+            {"name": name, "temperature_f": temp, "is_online": True}
+            for name, temp in sensor_temps.items()
+        ]
+        mock_ecobee = MagicMock()
+        mock_ecobee.get_sensors.return_value = sensors
+        mock_ecobee.get_hvac_mode.return_value = hvac_mode
+        mock_ecobee_cls.return_value = mock_ecobee
+
+        mock_nws = MagicMock()
+        mock_nws.get_outdoor_conditions.return_value = {
+            "temperature_f": outdoor_temp,
+            "humidity": outdoor_humidity,
+            "source": "nws",
+        }
+        mock_nws_cls.return_value = mock_nws
+
+        # OM peer fails — keeps the path simple; NWS is the sole source.
+        mock_om_cls.return_value.get_observation.side_effect = OpenMeteoError("no peer")
+        return mock_state
+
+    @patch("src.orchestrator.SnapshotManager")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_record_called_once_with_floors_and_outdoor_temp(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_snap_mgr_cls,
+    ):
+        """Successful cycle → ``record_temperature_history`` called once with
+        an entry whose ``outdoor_temp_f`` matches the outdoor reading and
+        whose ``indoor_temps`` covers each floor that produced a snapshot."""
+        self._wire(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
+            sensor_temps={"sensor_up": 70.0, "sensor_down": 72.0},
+            outdoor_temp=65.0,
+        )
+        mock_fetch_aqi.return_value = {"aqi": 25, "source": "purpleair"}
+
+        snap_mgr = MagicMock()
+        mock_snap_mgr_cls.return_value = snap_mgr
+
+        run_check()
+
+        snap_mgr.record_temperature_history.assert_called_once()
+        entry = snap_mgr.record_temperature_history.call_args[0][0]
+        assert entry.outdoor_temp_f == 65.0
+        # Both floors produced snapshots, so both keys present.
+        assert set(entry.indoor_temps.keys()) == {"upstairs", "downstairs"}
+        # Coolest valid reading per floor (single sensor each → that reading).
+        assert entry.indoor_temps["upstairs"] == 70.0
+        assert entry.indoor_temps["downstairs"] == 72.0
+
+    @patch("src.orchestrator.SnapshotManager")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_history_write_failure_does_not_break_cycle(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_snap_mgr_cls,
+    ):
+        """If ``record_temperature_history`` raises, floor + global snapshots
+        still persist and the cycle completes without propagating."""
+        self._wire(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
+            sensor_temps={"sensor_up": 70.0, "sensor_down": 70.0},
+            outdoor_temp=65.0,
+        )
+        mock_fetch_aqi.return_value = {"aqi": 25, "source": "purpleair"}
+
+        snap_mgr = MagicMock()
+        snap_mgr.record_temperature_history.side_effect = RuntimeError("history exploded")
+        mock_snap_mgr_cls.return_value = snap_mgr
+
+        # Must not raise.
+        run_check()
+
+        # Floor + global snapshots persisted before the history write.
+        assert snap_mgr.save_floor_snapshot.call_count >= 1
+        snap_mgr.save_global_snapshot.assert_called_once()
+        snap_mgr.record_temperature_history.assert_called_once()
+

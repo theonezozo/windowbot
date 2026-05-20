@@ -9,13 +9,14 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, asdict, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from azure.data.tables import TableClient
 
 logger = logging.getLogger("windowbot.diagnostic")
 
 SNAPSHOT_TABLE = "windowbotsnapshot"
+HISTORY_PARTITION = "history"
 
 
 @dataclass
@@ -115,6 +116,26 @@ class GlobalSnapshot:
         return cls(**json.loads(data))
 
 
+@dataclass
+class TemperatureHistoryEntry:
+    """A single point in the rolling temperature history.
+
+    Captured once per poll cycle. ``indoor_temps`` maps floor name to the
+    coolest valid sensor reading for that floor (or ``None`` if no valid
+    reading was available).
+    """
+    timestamp: str
+    outdoor_temp_f: float | None
+    indoor_temps: dict[str, float | None]
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_json(cls, data: str) -> TemperatureHistoryEntry:
+        return cls(**json.loads(data))
+
+
 class SnapshotManager:
     """Manages diagnostic snapshots in Azure Table Storage."""
 
@@ -171,7 +192,7 @@ class SnapshotManager:
         """Retrieve all floor snapshots."""
         snapshots = []
         try:
-            query = "PartitionKey ne 'global' and RowKey eq 'snapshot'"
+            query = "PartitionKey ne 'global' and PartitionKey ne 'history' and RowKey eq 'snapshot'"
             for entity in self._table.query_entities(query):
                 try:
                     snapshots.append(FloorSnapshot.from_json(entity["Data"]))
@@ -180,3 +201,51 @@ class SnapshotManager:
         except Exception:
             logger.exception("Failed to query floor snapshots.")
         return snapshots
+
+    # ------------------------------------------------------------------
+    # Temperature history
+    # ------------------------------------------------------------------
+    # No retention/cleanup logic — the table grows naturally.  Volume is
+    # ~144 rows/day at the current 10-minute poll interval; we can add a
+    # pruning pass later if it ever matters.
+
+    def record_temperature_history(self, entry: TemperatureHistoryEntry) -> None:
+        """Best-effort append of a history row.  Never raises."""
+        ts = entry.timestamp
+        try:
+            self._table.upsert_entity({
+                "PartitionKey": HISTORY_PARTITION,
+                "RowKey": ts,
+                "Data": entry.to_json(),
+                "Timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception:
+            logger.exception("Failed to record temperature history at %s.", ts)
+
+    def get_temperature_history(
+        self, hours: int = 12
+    ) -> list[TemperatureHistoryEntry]:
+        """Return history entries newer than ``now - hours``, newest-first.
+
+        Uses a RowKey range filter so the table is not scanned in full.
+        Per-row parse failures are skipped with a warning.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        query = f"PartitionKey eq '{HISTORY_PARTITION}' and RowKey ge '{cutoff}'"
+        entries: list[TemperatureHistoryEntry] = []
+        try:
+            for entity in self._table.query_entities(query):
+                try:
+                    entries.append(TemperatureHistoryEntry.from_json(entity["Data"]))
+                except Exception:
+                    logger.warning(
+                        "Skipping unparseable history row %s.",
+                        entity.get("RowKey"),
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.exception("Failed to query temperature history.")
+            return []
+
+        entries.sort(key=lambda e: e.timestamp, reverse=True)
+        return entries
