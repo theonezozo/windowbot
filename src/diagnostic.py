@@ -26,6 +26,12 @@ class SensorReading:
     temperature_f: float | None
     is_online: bool
     is_coolest: bool = False
+    # Provenance / freshness. ``source`` is one of
+    # "beestat:live_temps" | "beestat:sensor-resource" | "ecobee:direct" | None.
+    # ``data_age_seconds`` is the age of the upstream sync at read time;
+    # None means "unknown" (older snapshots, or Beestat sync_status missing).
+    source: str | None = None
+    data_age_seconds: float | None = None
 
 
 @dataclass
@@ -91,6 +97,10 @@ class FloorSnapshot:
         """Deserialize from JSON."""
         obj = json.loads(data)
         # Reconstruct dataclasses from dicts
+        for s in obj["indoor_sensors"]:
+            # Tolerate snapshots written before source/data_age_seconds were added.
+            s.setdefault("source", None)
+            s.setdefault("data_age_seconds", None)
         obj["indoor_sensors"] = [SensorReading(**s) for s in obj["indoor_sensors"]]
         obj["outdoor_stations"] = [OutdoorStation(**s) for s in obj["outdoor_stations"]]
         obj["aqi_stations"] = [AQIStation(**s) for s in obj["aqi_stations"]]

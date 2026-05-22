@@ -312,3 +312,79 @@ class TestFloorSnapshotFreshnessFieldsBackCompat:
 
         assert restored.outdoor_newest_observation_time == "2026-05-21T12:34:56+00:00"
         assert restored.outdoor_contributor_count == 3
+
+
+# ------------------------------------------------------------------
+# SensorReading provenance + sync-age round-trip / back-compat
+# (2026-05-21 Beestat sync-prefix change)
+# ------------------------------------------------------------------
+
+
+class TestSensorReadingProvenanceBackCompat:
+    """``SensorReading.source`` and ``data_age_seconds`` are optional fields
+    added by the 2026-05-21 Beestat sync-prefix change. ``FloorSnapshot.from_json``
+    must ``setdefault`` both to ``None`` for snapshots persisted before the
+    fields existed; new snapshots round-trip both intact.
+    """
+
+    def _payload_with_indoor_sensor(self, sensor_obj: dict) -> dict:
+        return {
+            "floor": "main",
+            "decision": "OPEN",
+            "reason": "comfortable",
+            "indoor_sensors": [sensor_obj],
+            "outdoor_temp_f": 70.0,
+            "outdoor_source": "nws",
+            "outdoor_stations": [],
+            "outdoor_humidity": 50.0,
+            "aqi_value": 25,
+            "aqi_source": "purpleair",
+            "aqi_stations": [],
+            "gates": [],
+            "last_notification_type": None,
+            "last_notification_time": None,
+            "timestamp": "2026-05-21T12:00:00+00:00",
+            "outdoor_observation_time": None,
+            "aqi_observation_time": None,
+        }
+
+    def test_round_trip_preserves_source_and_data_age_seconds(self):
+        """Populated source + data_age_seconds → both preserved on round-trip."""
+        from src.diagnostic import FloorSnapshot
+
+        sensor_obj = {
+            "name": "Living Room",
+            "temperature_f": 71.0,
+            "is_online": True,
+            "is_coolest": False,
+            "source": "beestat:live_temps",
+            "data_age_seconds": 180.5,
+        }
+        payload = self._payload_with_indoor_sensor(sensor_obj)
+
+        snap = FloorSnapshot.from_json(json.dumps(payload))
+        restored = FloorSnapshot.from_json(snap.to_json())
+
+        assert restored.indoor_sensors[0].source == "beestat:live_temps"
+        assert restored.indoor_sensors[0].data_age_seconds == 180.5
+
+    def test_old_snapshot_without_source_or_age_defaults_to_none(self):
+        """Pre-existing JSON without the two new fields → both default to None.
+        Pins the ``setdefault`` back-compat path so a future refactor that
+        drops the ``setdefault`` lines surfaces immediately.
+        """
+        from src.diagnostic import FloorSnapshot
+
+        sensor_obj = {
+            "name": "Living Room",
+            "temperature_f": 71.0,
+            "is_online": True,
+            "is_coolest": False,
+            # source / data_age_seconds deliberately absent.
+        }
+        payload = self._payload_with_indoor_sensor(sensor_obj)
+
+        snap = FloorSnapshot.from_json(json.dumps(payload))
+
+        assert snap.indoor_sensors[0].source is None
+        assert snap.indoor_sensors[0].data_age_seconds is None

@@ -11,7 +11,7 @@ import json
 import logging
 import math
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import azure.functions as func
 
@@ -409,11 +409,18 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
         temp_str = f"{sensor.temperature_f:.1f}°F" if sensor.temperature_f else "N/A"
         status = "online" if sensor.is_online else "offline"
         coolest_mark = " 🌡️" if sensor.is_coolest else ""
+
+        # Provenance + upstream sync age. Subtle, single line per sensor,
+        # mirrors the outdoor section's .data-freshness pattern. Old
+        # snapshots predating these fields render no extra line at all.
+        provenance_html = _render_sensor_provenance(sensor.source, sensor.data_age_seconds)
+
         indoor_html += f"""
         <li>
             <span class="sensor-name">{html.escape(sensor.name)}{coolest_mark}</span>
             <span class="sensor-value">{temp_str}</span>
             <span class="sensor-status badge-{status}">{status}</span>
+            {provenance_html}
         </li>
         """
     indoor_html += "</ul>"
@@ -536,6 +543,53 @@ def _render_history_card(history: list[TemperatureHistoryEntry]) -> str:
         </details>
     </div>
     """
+
+
+_SENSOR_SOURCE_LABELS = {
+    "beestat:live_temps": "via Beestat",
+    "beestat:sensor-resource": "via Beestat",
+    "ecobee:direct": "via Ecobee direct",
+}
+
+
+def _render_sensor_provenance(source: str | None, data_age_seconds: float | None) -> str:
+    """Render the per-sensor provenance + sync-age line.
+
+    Returns an empty string for back-compat snapshots (``source is None``)
+    so the row falls back to the pre-change rendering exactly.
+
+    Freshness buckets mirror the Beestat client's WARN threshold:
+    ``data-fresh`` < 5 min, ``data-warn`` 5–10 min, ``data-stale`` > 10 min.
+    When ``data_age_seconds`` is ``None`` (unknown — sync_status missing
+    or this is Ecobee direct), no CSS bucket class is applied.
+    """
+    if source is None:
+        return ""
+
+    label = _SENSOR_SOURCE_LABELS.get(source, source)
+    age_class = ""
+    age_suffix = ""
+
+    if source.startswith("beestat:"):
+        if data_age_seconds is None:
+            age_suffix = " · sync age unknown"
+        else:
+            age_minutes = data_age_seconds / 60
+            if age_minutes < 5:
+                age_class = "data-fresh"
+            elif age_minutes < 10:
+                age_class = "data-warn"
+            else:
+                age_class = "data-stale"
+            # Reuse the same datetime-relative formatter outdoor uses so
+            # "Xmin ago" / "Xs ago" formatting stays consistent.
+            synced_at = datetime.now(timezone.utc) - timedelta(seconds=data_age_seconds)
+            age_suffix = f" · synced {_format_age(synced_at)} ago"
+
+    css_classes = "sensor-provenance data-freshness"
+    if age_class:
+        css_classes += f" {age_class}"
+    return f"<div class='{css_classes}'>{html.escape(label)}{html.escape(age_suffix)}</div>"
 
 
 def _format_age(dt: datetime, future: bool = False) -> str:

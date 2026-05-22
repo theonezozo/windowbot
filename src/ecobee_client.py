@@ -225,6 +225,11 @@ class EcobeeClient:
                     "temperature_f": temp_f,
                     "humidity": humidity,
                     "is_online": is_online,
+                    # Provenance tag — keeps Ecobee/Beestat dicts symmetric so the
+                    # orchestrator and status page don't need provider branching.
+                    # Direct Ecobee has no upstream sync timestamp, so age is unknown.
+                    "source": "ecobee:direct",
+                    "data_age_seconds": None,
                 }
             )
 

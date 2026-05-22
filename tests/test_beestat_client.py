@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -258,7 +259,10 @@ class TestGetSensorsHappyPath:
 
     @patch("src.beestat_client.requests.post")
     def test_sensor_output_keys(self, mock_post):
-        """Each sensor dict has exactly the expected keys."""
+        """Each sensor dict has exactly the expected keys, including the new
+        ``source`` and ``data_age_seconds`` provenance/freshness fields
+        added by the 2026-05-21 Beestat sync-prefix change.
+        """
         sid, s = _raw_sensor(123, "S1", temperature=70.0, humidity=5.0)
         body = _beestat_response(
             sensors={sid: s},
@@ -269,7 +273,14 @@ class TestGetSensorsHappyPath:
 
         sensors = client.get_sensors()
 
-        assert set(sensors[0].keys()) == {"name", "temperature_f", "humidity", "is_online"}
+        assert set(sensors[0].keys()) == {
+            "name",
+            "temperature_f",
+            "humidity",
+            "is_online",
+            "source",
+            "data_age_seconds",
+        }
 
 
 # ------------------------------------------------------------------
@@ -590,7 +601,15 @@ class TestBatchRequestFormat:
 
     @patch("src.beestat_client.requests.post")
     def test_batch_request_format(self, mock_post):
-        """POST body contains correct batch JSON and api_key."""
+        """POST body contains correct batch JSON, api_key, and the 5-call
+        sync-before-read ordering required to force a fresh Ecobee pull
+        before the reads execute (2026-05-21 sync-prefix change).
+
+        Pins the ordering invariant explicitly — the two ``*.sync`` calls
+        MUST come before the three ``*.read_id`` calls; ``user.read_id``
+        MUST come before ``sensor.read_id`` and ``ecobee_thermostat.read_id``
+        so ``user.sync_status`` is surfaced for freshness reasoning.
+        """
         body = _beestat_response(sensors={}, thermostat=_raw_thermostat())
         mock_post.return_value = _ok_post(body)
         client = BeestatClient("my_key_123")
@@ -603,7 +622,19 @@ class TestBatchRequestFormat:
 
         assert sent_json["api_key"] == "my_key_123"
         batch = json.loads(sent_json["batch"])
-        assert len(batch) == 2
+        assert len(batch) == 5
+
+        # Sync-before-read ordering is the contract.
+        assert batch[0]["resource"] == "thermostat"
+        assert batch[0]["method"] == "sync"
+        assert batch[1]["resource"] == "sensor"
+        assert batch[1]["method"] == "sync"
+        assert batch[2]["resource"] == "user"
+        assert batch[2]["method"] == "read_id"
+        assert batch[3]["resource"] == "sensor"
+        assert batch[3]["method"] == "read_id"
+        assert batch[4]["resource"] == "ecobee_thermostat"
+        assert batch[4]["method"] == "read_id"
 
     @patch("src.beestat_client.requests.post")
     def test_batch_aliases_correct(self, mock_post):
@@ -777,3 +808,285 @@ class TestEdgeCases:
         sensors = client.get_sensors()
 
         assert sensors[0]["name"] == "Unknown"
+
+
+# ------------------------------------------------------------------
+# Sync-prefix + freshness extraction (2026-05-21 audit + Gregory's fix)
+# ------------------------------------------------------------------
+
+_FROZEN_NOW = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _user_block(
+    thermo_iso: str | None = None,
+    sensor_iso: str | None = None,
+) -> dict:
+    """Build a Beestat ``user.read_id`` payload keyed by user_id."""
+    sync_status: dict = {}
+    if thermo_iso is not None:
+        sync_status["thermostat"] = thermo_iso
+    if sensor_iso is not None:
+        sync_status["sensor"] = sensor_iso
+    return {"42": {"sync_status": sync_status}}
+
+
+def _response_with_user(
+    sensors: dict | None = None,
+    thermostat: dict | None = None,
+    user: dict | None = None,
+    *,
+    success: bool = True,
+) -> dict:
+    """Like :func:`_beestat_response` but also carries a ``user`` alias."""
+    body = _beestat_response(sensors=sensors, thermostat=thermostat, success=success)
+    if user is not None:
+        body["data"]["user"] = user
+    return body
+
+
+class _FakeDateTime:
+    """Pinned ``datetime`` substitute. ``now()`` returns ``_FROZEN_NOW``;
+    ``fromisoformat`` delegates to the real implementation so the parser in
+    :func:`src.beestat_client._extract_sync_age_seconds` keeps behaving
+    normally.
+    """
+
+    _now = _FROZEN_NOW
+
+    @classmethod
+    def now(cls, tz=None):  # noqa: D401 — matches ``datetime.now`` signature
+        return cls._now
+
+    fromisoformat = staticmethod(datetime.fromisoformat)
+
+
+class TestBeestatSyncFreshness:
+    """The 2026-05-21 Beestat sync-prefix fix lands these gates:
+
+    - Each sensor dict carries a ``source`` tag identifying the temperature
+      path taken (``"beestat:live_temps"`` or ``"beestat:sensor-resource"``).
+    - ``data_age_seconds`` is the upstream sync age — the OLDER of the
+      thermostat / sensor sync timestamps (pool-level worst-case staleness,
+      mirroring the outdoor ``_aggregate`` "oldest contributor" semantic).
+    - ``None`` means "unknown" — NOT zero, NOT a large default.
+    - The 10-min WARN threshold is pinned at literal 600 s (never imports
+      ``_SYNC_AGE_WARN_SECONDS`` so a drift surfaces immediately).
+    - The per-cycle path-summary INFO log makes the live_temps vs fallback
+      counts self-falsifying without DEBUG.
+    """
+
+    @patch("src.beestat_client.requests.post")
+    def test_source_tag_live_temps_when_remote_sensor_matches(self, mock_post):
+        """Sensor whose ``ecobee_sensor_id`` matches a remoteSensor with a
+        temperature capability → ``source == "beestat:live_temps"``.
+        """
+        sid, s = _raw_sensor(12345, "Living Room", temperature=70.0)
+        rs = _remote_sensor_entry(12345, "Living Room", temperature_tenths_f=740)
+        body = _response_with_user(
+            sensors={sid: s},
+            thermostat=_raw_thermostat(remote_sensors=[rs]),
+            user=_user_block(),
+        )
+        mock_post.return_value = _ok_post(body)
+
+        sensors = BeestatClient("key").get_sensors()
+
+        assert sensors[0]["source"] == "beestat:live_temps"
+
+    @patch("src.beestat_client.requests.post")
+    def test_source_tag_sensor_resource_when_no_remote_sensor_match(self, mock_post):
+        """No matching remoteSensor → falls back to the sensor-resource value,
+        ``source == "beestat:sensor-resource"``.
+        """
+        sid, s = _raw_sensor(12345, "Living Room", temperature=70.0)
+        # Mismatched ecobee_sensor_id in the remoteSensors list.
+        rs = _remote_sensor_entry(99999, "Other", temperature_tenths_f=740)
+        body = _response_with_user(
+            sensors={sid: s},
+            thermostat=_raw_thermostat(remote_sensors=[rs]),
+            user=_user_block(),
+        )
+        mock_post.return_value = _ok_post(body)
+
+        sensors = BeestatClient("key").get_sensors()
+
+        assert sensors[0]["source"] == "beestat:sensor-resource"
+
+    @patch("src.beestat_client.requests.post")
+    def test_data_age_seconds_from_thermostat_sync_timestamp(self, mock_post):
+        """Sync 6 min ago on both → ``data_age_seconds`` ≈ 360.
+
+        Pool-level: every sensor in one batch shares the same age.
+        """
+        iso = (_FROZEN_NOW - timedelta(seconds=360)).isoformat()
+        sid1, s1 = _raw_sensor(1, "A", temperature=70.0)
+        sid2, s2 = _raw_sensor(2, "B", temperature=71.0)
+        body = _response_with_user(
+            sensors={sid1: s1, sid2: s2},
+            thermostat=_raw_thermostat(),
+            user=_user_block(thermo_iso=iso, sensor_iso=iso),
+        )
+        mock_post.return_value = _ok_post(body)
+
+        with patch("src.beestat_client.datetime", _FakeDateTime):
+            sensors = BeestatClient("key").get_sensors()
+
+        assert len(sensors) == 2
+        for s in sensors:
+            assert s["data_age_seconds"] == pytest.approx(360, abs=2)
+
+    @patch("src.beestat_client.requests.post")
+    def test_data_age_uses_older_of_two_sync_timestamps(self, mock_post):
+        """thermostat synced 3 min ago, sensor synced 8 min ago → 480 s wins.
+
+        Pool-level worst-case staleness, mirroring the outdoor ``_aggregate``
+        "oldest contributor" semantic. Pinned with literal seconds so a
+        future refactor that flips to min/max/avg surfaces immediately.
+        """
+        thermo_iso = (_FROZEN_NOW - timedelta(seconds=180)).isoformat()
+        sensor_iso = (_FROZEN_NOW - timedelta(seconds=480)).isoformat()
+        sid, s = _raw_sensor(1, "S", temperature=70.0)
+        body = _response_with_user(
+            sensors={sid: s},
+            thermostat=_raw_thermostat(),
+            user=_user_block(thermo_iso=thermo_iso, sensor_iso=sensor_iso),
+        )
+        mock_post.return_value = _ok_post(body)
+
+        with patch("src.beestat_client.datetime", _FakeDateTime):
+            sensors = BeestatClient("key").get_sensors()
+
+        assert sensors[0]["data_age_seconds"] == pytest.approx(480, abs=2)
+
+    @patch("src.beestat_client.requests.post")
+    def test_data_age_is_none_when_user_alias_missing(self, mock_post, caplog):
+        """No ``user`` key in the batch response → ``data_age_seconds`` is
+        ``None`` on every sensor (NOT 0, NOT a default). An INFO log explains
+        the unknown-age state so operators can spot the missing alias.
+        """
+        sid1, s1 = _raw_sensor(1, "A", temperature=70.0)
+        sid2, s2 = _raw_sensor(2, "B", temperature=71.0)
+        body = _beestat_response(
+            sensors={sid1: s1, sid2: s2},
+            thermostat=_raw_thermostat(),
+        )
+        mock_post.return_value = _ok_post(body)
+        caplog.set_level(logging.INFO, logger="windowbot.beestat")
+
+        sensors = BeestatClient("key").get_sensors()
+
+        assert len(sensors) == 2
+        for s in sensors:
+            assert s["data_age_seconds"] is None
+        assert any(
+            "sync_status unavailable" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    @patch("src.beestat_client.requests.post")
+    def test_data_age_is_none_when_sync_status_malformed(self, mock_post):
+        """``user`` present but ``sync_status`` absent → ``None``, no crash."""
+        sid, s = _raw_sensor(1, "S", temperature=70.0)
+        # User entry without sync_status.
+        user = {"42": {"some_other_field": "value"}}
+        body = _response_with_user(
+            sensors={sid: s},
+            thermostat=_raw_thermostat(),
+            user=user,
+        )
+        mock_post.return_value = _ok_post(body)
+
+        sensors = BeestatClient("key").get_sensors()
+
+        assert sensors[0]["data_age_seconds"] is None
+
+    @pytest.mark.parametrize(
+        "age_seconds, expect_warn",
+        [
+            (599, False),
+            (601, True),
+        ],
+    )
+    @patch("src.beestat_client.requests.post")
+    def test_warn_at_10_min_boundary(self, mock_post, caplog, age_seconds, expect_warn):
+        """Literal 600 s threshold: 599 s → no WARN, 601 s → WARN.
+
+        Pinned with literal ``timedelta(seconds=N)``; never imports the
+        production ``_SYNC_AGE_WARN_SECONDS`` constant so a drift would
+        silently follow the import and become invisible.
+        """
+        iso = (_FROZEN_NOW - timedelta(seconds=age_seconds)).isoformat()
+        sid, s = _raw_sensor(1, "S", temperature=70.0)
+        body = _response_with_user(
+            sensors={sid: s},
+            thermostat=_raw_thermostat(),
+            user=_user_block(thermo_iso=iso, sensor_iso=iso),
+        )
+        mock_post.return_value = _ok_post(body)
+        caplog.set_level(logging.WARNING, logger="windowbot.beestat")
+
+        with patch("src.beestat_client.datetime", _FakeDateTime):
+            BeestatClient("key").get_sensors()
+
+        warn_msgs = [
+            rec.getMessage() for rec in caplog.records
+            if rec.levelno == logging.WARNING
+        ]
+        has_threshold_warn = any(
+            "exceeds 10min threshold" in m for m in warn_msgs
+        )
+        assert has_threshold_warn is expect_warn
+
+    @patch("src.beestat_client.requests.post")
+    def test_per_cycle_path_summary_info_log(self, mock_post, caplog):
+        """Per-cycle INFO summary names exact counts: 2 via live_temps + 1
+        via sensor-resource fallback. Matches Gregory's literal format string.
+        """
+        sid1, s1 = _raw_sensor(11, "A", temperature=70.0)
+        sid2, s2 = _raw_sensor(22, "B", temperature=71.0)
+        sid3, s3 = _raw_sensor(33, "C", temperature=72.0)
+        # Sensors 11 and 22 resolve via live_temps; 33 has no matching remote.
+        remote = [
+            _remote_sensor_entry(11, "A", temperature_tenths_f=700),
+            _remote_sensor_entry(22, "B", temperature_tenths_f=710),
+        ]
+        body = _response_with_user(
+            sensors={sid1: s1, sid2: s2, sid3: s3},
+            thermostat=_raw_thermostat(remote_sensors=remote),
+            user=_user_block(),
+        )
+        mock_post.return_value = _ok_post(body)
+        caplog.set_level(logging.INFO, logger="windowbot.beestat")
+
+        BeestatClient("key").get_sensors()
+
+        summary_msgs = [
+            rec.getMessage() for rec in caplog.records
+            if "Beestat get_sensors:" in rec.getMessage()
+        ]
+        assert summary_msgs, "expected per-cycle path-summary INFO log"
+        assert (
+            "3 sensors (2 via live_temps, 1 via sensor-resource fallback)"
+            in summary_msgs[0]
+        )
+
+    @patch("src.beestat_client.requests.post")
+    def test_data_age_parses_mysql_style_timestamp(self, mock_post):
+        """Beestat sometimes returns ``YYYY-MM-DD HH:MM:SS`` (no ``T``,
+        no tz). Parser must treat as UTC and compute the correct age.
+        """
+        mysql_iso = (_FROZEN_NOW - timedelta(seconds=300)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        sid, s = _raw_sensor(1, "S", temperature=70.0)
+        body = _response_with_user(
+            sensors={sid: s},
+            thermostat=_raw_thermostat(),
+            user=_user_block(thermo_iso=mysql_iso, sensor_iso=mysql_iso),
+        )
+        mock_post.return_value = _ok_post(body)
+
+        with patch("src.beestat_client.datetime", _FakeDateTime):
+            sensors = BeestatClient("key").get_sensors()
+
+        assert sensors[0]["data_age_seconds"] == pytest.approx(300, abs=2)

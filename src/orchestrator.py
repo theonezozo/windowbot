@@ -635,6 +635,8 @@ def _build_floor_snapshot(
                 temperature_f=s.get("temperature_f"),
                 is_online=s.get("is_online", False),
                 is_coolest=(s.get("temperature_f") == coolest_temp if coolest_temp else False),
+                source=s.get("source"),
+                data_age_seconds=s.get("data_age_seconds"),
             ))
     
     # Outdoor stations — we don't have per-station detail from NWS's aggregated result,

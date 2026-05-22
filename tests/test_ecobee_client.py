@@ -254,6 +254,39 @@ class TestSensorParsing:
 
     @patch("src.ecobee_client.requests.get")
     @patch("src.ecobee_client.requests.post")
+    def test_direct_ecobee_source_tag_and_unknown_age(self, mock_post, mock_get):
+        """Direct Ecobee readings carry ``source="ecobee:direct"`` and
+        ``data_age_seconds=None`` (Ecobee's API returns the live cloud-side
+        value with no upstream sync timestamp). Keeps the Ecobee/Beestat
+        client dicts symmetric so the orchestrator and status page don't
+        need provider branching. ``None`` (unknown) is the correct semantic
+        for the age — NOT zero.
+        """
+        body = _thermostat_body(
+            sensors=[
+                _raw_sensor("Living Room", temp_f10=740, humidity=45),
+                _raw_sensor("Bedroom", temp_f10=685),
+            ]
+        )
+        mock_post.return_value = MagicMock(
+            status_code=200, ok=True,
+            json=lambda: {"access_token": "a", "refresh_token": "r"},
+        )
+        mock_get.return_value = MagicMock(
+            status_code=200, ok=True, json=lambda: body,
+        )
+        sm = _make_state_manager()
+        client = EcobeeClient("cid", "r", sm)
+
+        sensors = client.get_sensors()
+
+        assert len(sensors) == 2
+        for s in sensors:
+            assert s["source"] == "ecobee:direct"
+            assert s["data_age_seconds"] is None
+
+    @patch("src.ecobee_client.requests.get")
+    @patch("src.ecobee_client.requests.post")
     def test_sensor_offline_no_temp(self, mock_post, mock_get):
         """Sensor with no temperature capability → is_online=False."""
         body = _thermostat_body(sensors=[_raw_sensor("Garage")])

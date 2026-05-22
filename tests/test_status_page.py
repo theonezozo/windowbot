@@ -607,3 +607,141 @@ class TestRenderJsonIncludesVersion:
         # ``worker_started_at`` is a parseable ISO-8601 datetime string.
         parsed = datetime.fromisoformat(v["worker_started_at"])
         assert parsed.tzinfo is not None
+
+
+# ------------------------------------------------------------------
+# Indoor sensor provenance / sync-age rendering
+# (2026-05-21 Beestat sync-prefix change)
+# ------------------------------------------------------------------
+
+
+class TestIndoorSensorProvenanceRendering:
+    """``_render_sensor_provenance`` paints the per-sensor "via …" line and
+    the freshness bucket directly from ``SensorReading.source`` and
+    ``SensorReading.data_age_seconds``.
+
+    Buckets mirror the Beestat client's WARN threshold:
+    - ``data-fresh``  → sync age < 5 min
+    - ``data-warn``   → 5–10 min
+    - ``data-stale``  → > 10 min
+
+    Boundary tests pin literal seconds — they MUST NOT import the
+    production threshold so a drift surfaces immediately.
+    """
+
+    def _floor_snap_with_sensor(self, sensor: "SensorReading") -> FloorSnapshot:
+        snap = _floor_snapshot("upstairs")
+        snap.indoor_sensors = [sensor]
+        return snap
+
+    def test_beestat_with_fresh_age_renders_via_beestat_and_data_fresh(self):
+        """source=beestat:live_temps, age 120 s → "via Beestat · synced 2min ago"
+        with the ``data-fresh`` CSS bucket.
+        """
+        from src.status_page import _render_floor_card
+
+        sensor = SensorReading(
+            name="Living Room",
+            temperature_f=72.0,
+            is_online=True,
+            source="beestat:live_temps",
+            data_age_seconds=120,
+        )
+        snap = self._floor_snap_with_sensor(sensor)
+
+        html_out = _render_floor_card(snap)
+
+        assert "via Beestat" in html_out
+        assert "synced 2min ago" in html_out
+        assert "data-freshness data-fresh" in html_out
+        # No accidental warn/stale class on this sensor's line.
+        assert "data-warn" not in html_out
+        assert "data-stale" not in html_out
+
+    @pytest.mark.parametrize(
+        "age_seconds, expected_class, forbidden_classes",
+        [
+            (240, "data-fresh", ("data-warn", "data-stale")),  # 4 min → fresh
+            (360, "data-warn", ("data-fresh", "data-stale")),   # 6 min → warn
+            (720, "data-stale", ("data-fresh", "data-warn")),   # 12 min → stale
+        ],
+    )
+    def test_freshness_bucket_boundaries(
+        self, age_seconds, expected_class, forbidden_classes
+    ):
+        """Pin the 5-min and 10-min CSS-bucket transitions with literal
+        seconds. Reuses the same boundary discipline as the outdoor 20/45-min
+        and AQI 30/60-min bucket tests. Matches the FULL
+        ``data-freshness data-{bucket}`` pattern so ``data-fresh`` doesn't
+        substring-collide with ``data-freshness``.
+        """
+        from src.status_page import _render_sensor_provenance
+
+        html_out = _render_sensor_provenance(
+            source="beestat:live_temps",
+            data_age_seconds=age_seconds,
+        )
+
+        assert f"data-freshness {expected_class}" in html_out
+        for forbidden in forbidden_classes:
+            assert f"data-freshness {forbidden}" not in html_out
+
+    def test_ecobee_direct_renders_via_ecobee_direct_without_freshness_bucket(self):
+        """source=ecobee:direct, data_age_seconds=None → "via Ecobee direct",
+        no fresh/warn/stale CSS bucket (Ecobee API returns the live cloud
+        value with no upstream sync timestamp).
+        """
+        from src.status_page import _render_sensor_provenance
+
+        html_out = _render_sensor_provenance(
+            source="ecobee:direct",
+            data_age_seconds=None,
+        )
+
+        assert "via Ecobee direct" in html_out
+        for bucket in ("data-fresh", "data-warn", "data-stale"):
+            assert f"data-freshness {bucket}" not in html_out
+        # No "synced Xmin ago" suffix — Ecobee direct has no sync age.
+        assert "synced" not in html_out
+
+    def test_old_snapshot_with_source_none_renders_no_provenance_line(self):
+        """source=None (pre-change snapshot) → empty string; the indoor block
+        falls back to the exact pre-change visual.
+        """
+        from src.status_page import _render_floor_card, _render_sensor_provenance
+
+        # The helper returns empty for source=None.
+        assert _render_sensor_provenance(None, None) == ""
+
+        sensor = SensorReading(
+            name="Living Room",
+            temperature_f=72.0,
+            is_online=True,
+            source=None,
+            data_age_seconds=None,
+        )
+        snap = self._floor_snap_with_sensor(sensor)
+        html_out = _render_floor_card(snap)
+
+        # No "via " provenance text rendered for this sensor.
+        assert "via Beestat" not in html_out
+        assert "via Ecobee" not in html_out
+
+    def test_beestat_unknown_age_renders_label_without_freshness_bucket(self):
+        """source=beestat:*, data_age_seconds=None → "via Beestat · sync age
+        unknown", no fresh/warn/stale CSS bucket and no "synced Xmin ago"
+        suffix.
+        """
+        from src.status_page import _render_sensor_provenance
+
+        html_out = _render_sensor_provenance(
+            source="beestat:sensor-resource",
+            data_age_seconds=None,
+        )
+
+        assert "via Beestat" in html_out
+        assert "sync age unknown" in html_out
+        # No relative-time suffix because the age itself is unknown.
+        assert "synced" not in html_out
+        for bucket in ("data-fresh", "data-warn", "data-stale"):
+            assert f"data-freshness {bucket}" not in html_out
