@@ -409,3 +409,169 @@ class TestStationDiscovery:
         official_count = sum(1 for s in client._stations if not s["is_personal"])
         assert personal_count == 2  # CW001, EW002
         assert official_count == 2  # KORD, KJFK
+
+
+# ------------------------------------------------------------------
+# Outdoor Freshness Boundary (20-min cutoff — Jacob's audit)
+# ------------------------------------------------------------------
+
+
+class TestOutdoorFreshnessBoundary:
+    """Pin the 20-minute outdoor staleness cutoff with literal-minute boundary
+    tests so a regression on ``_MAX_OBS_AGE`` (e.g., reverting to 30 min) is
+    caught immediately. These tests deliberately do NOT import the constant
+    — they assert against a literal value to detect drift from the agreed
+    contract.
+    """
+
+    @patch("src.nws_client.requests.get")
+    def test_fetch_single_observation_rejects_at_21_min(self, mock_get):
+        """21-minute-old observation → None, skip reason includes 'stale'."""
+        client = NWSClient(40.0, -74.0)
+        mock_get.return_value = MagicMock(
+            ok=True,
+            json=lambda: _obs("KORD", temp_c=20.0, age_minutes=21),
+        )
+        now = datetime.now(timezone.utc)
+        result = client._fetch_single_observation("KORD", now)
+        assert result is None
+        assert client._last_skip_reason is not None
+        assert "stale" in client._last_skip_reason
+
+    @patch("src.nws_client.requests.get")
+    def test_fetch_single_observation_accepts_at_19_min(self, mock_get):
+        """19-minute-old observation → valid dict (just inside the 20-min cap)."""
+        client = NWSClient(40.0, -74.0)
+        mock_get.return_value = MagicMock(
+            ok=True,
+            json=lambda: _obs("KORD", temp_c=20.0, age_minutes=19),
+        )
+        now = datetime.now(timezone.utc)
+        result = client._fetch_single_observation("KORD", now)
+        assert result is not None
+        assert result["temperature_f"] == pytest.approx(68.0)
+
+    @patch("src.nws_client.requests.get")
+    def test_fetch_single_observation_walks_past_no_temp_newest(self, mock_get):
+        """Newest two features have null temp; the 15-min fresh-with-temp
+        feature is picked (regression guard for the no-temp ``continue`` walk).
+
+        The 25-min stale-with-temp feature must NOT be reached.
+        """
+        now = datetime.now(timezone.utc)
+        ts5 = (now - timedelta(minutes=5)).isoformat()
+        ts8 = (now - timedelta(minutes=8)).isoformat()
+        ts15 = (now - timedelta(minutes=15)).isoformat()
+        ts25 = (now - timedelta(minutes=25)).isoformat()
+        client = NWSClient(40.0, -74.0)
+        mock_get.return_value = MagicMock(
+            ok=True,
+            json=lambda: {
+                "features": [
+                    {"properties": {
+                        "timestamp": ts5,
+                        "temperature": {"value": None},
+                        "relativeHumidity": {"value": 50.0},
+                        "windSpeed": {"value": 10.0},
+                    }},
+                    {"properties": {
+                        "timestamp": ts8,
+                        "temperature": {"value": None},
+                        "relativeHumidity": {"value": 50.0},
+                        "windSpeed": {"value": 10.0},
+                    }},
+                    {"properties": {
+                        "timestamp": ts15,
+                        "temperature": {"value": 20.0},  # 68°F → picked
+                        "relativeHumidity": {"value": 50.0},
+                        "windSpeed": {"value": 10.0},
+                    }},
+                    {"properties": {
+                        "timestamp": ts25,
+                        "temperature": {"value": 38.0},  # 100°F → must NOT be picked
+                        "relativeHumidity": {"value": 50.0},
+                        "windSpeed": {"value": 10.0},
+                    }},
+                ]
+            },
+        )
+        result = client._fetch_single_observation("KORD", now)
+        assert result is not None
+        assert result["temperature_f"] == pytest.approx(68.0)
+        # Timestamp matches the 15-min candidate, not the 25-min one.
+        assert result["timestamp"].isoformat() == ts15
+
+    def test_aggregate_filters_stale_defence_in_depth(self):
+        """``_aggregate`` re-applies the 20-min cutoff even if upstream forwards
+        a mix of fresh and stale observations. The 25-min stale sample must
+        not contribute to any returned field.
+        """
+        now = datetime.now(timezone.utc)
+        ts5 = now - timedelta(minutes=5)
+        ts7 = now - timedelta(minutes=7)
+        ts25 = now - timedelta(minutes=25)
+        obs = [
+            {"station_id": "A", "temperature_f": 60.0, "humidity": 50.0,
+             "wind_speed_mph": 5.0, "timestamp": ts5},
+            {"station_id": "B", "temperature_f": 62.0, "humidity": 50.0,
+             "wind_speed_mph": 5.0, "timestamp": ts7},
+            {"station_id": "C", "temperature_f": 100.0, "humidity": 80.0,
+             "wind_speed_mph": 25.0, "timestamp": ts25},
+        ]
+        result = NWSClient._aggregate(obs, is_fallback=False, now=now)
+        assert result["temperature_f"] == pytest.approx(61.0)  # median(60, 62)
+        assert result["contributor_count"] == 2
+        assert result["station_count"] == 2
+        # Oldest fresh contributor drives observation_time (worst-case bucket).
+        assert result["observation_time"] == ts7.isoformat()
+        # 100°F sample is entirely excluded.
+        assert result["temperature_f"] != pytest.approx(62.0)
+
+    def test_aggregate_falls_back_when_refilter_empties(self, caplog):
+        """When EVERY observation is stale (LKG cache path), ``_aggregate`` must
+        not raise — it keeps the original pool and logs a WARNING.
+        """
+        import logging
+        caplog.set_level(logging.WARNING, logger="windowbot.nws")
+        now = datetime.now(timezone.utc)
+        ts30 = now - timedelta(minutes=30)
+        ts35 = now - timedelta(minutes=35)
+        ts40 = now - timedelta(minutes=40)
+        obs = [
+            {"station_id": "A", "temperature_f": 60.0, "humidity": 50.0,
+             "wind_speed_mph": 5.0, "timestamp": ts30},
+            {"station_id": "B", "temperature_f": 62.0, "humidity": 50.0,
+             "wind_speed_mph": 5.0, "timestamp": ts35},
+            {"station_id": "C", "temperature_f": 64.0, "humidity": 50.0,
+             "wind_speed_mph": 5.0, "timestamp": ts40},
+        ]
+        result = NWSClient._aggregate(obs, is_fallback=False, now=now)
+        assert result["temperature_f"] == pytest.approx(62.0)  # median(60, 62, 64)
+        assert result["contributor_count"] == 3
+        assert result["station_count"] == 3
+        assert any(
+            "re-filter removed all readings" in rec.getMessage()
+            for rec in caplog.records
+        ), f"Expected warning about re-filter; got: {[r.getMessage() for r in caplog.records]}"
+
+    def test_aggregate_newest_observation_time_distinct_from_oldest(self):
+        """``newest_observation_time`` is the freshest contributor; the legacy
+        ``observation_time`` remains the oldest. They must differ when the
+        pool spans a range of ages.
+        """
+        now = datetime.now(timezone.utc)
+        ts3 = now - timedelta(minutes=3)
+        ts8 = now - timedelta(minutes=8)
+        ts18 = now - timedelta(minutes=18)
+        obs = [
+            {"station_id": "A", "temperature_f": 60.0, "humidity": 50.0,
+             "wind_speed_mph": 5.0, "timestamp": ts3},
+            {"station_id": "B", "temperature_f": 62.0, "humidity": 50.0,
+             "wind_speed_mph": 5.0, "timestamp": ts8},
+            {"station_id": "C", "temperature_f": 64.0, "humidity": 50.0,
+             "wind_speed_mph": 5.0, "timestamp": ts18},
+        ]
+        result = NWSClient._aggregate(obs, is_fallback=False, now=now)
+        assert result["newest_observation_time"] == ts3.isoformat()
+        assert result["observation_time"] == ts18.isoformat()
+        assert result["newest_observation_time"] != result["observation_time"]

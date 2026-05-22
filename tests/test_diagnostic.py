@@ -243,3 +243,72 @@ class TestGetAllFloorSnapshotsExcludesHistory:
         assert "PartitionKey ne 'global'" in query
         assert "PartitionKey ne 'history'" in query
         assert "RowKey eq 'snapshot'" in query
+
+
+# ------------------------------------------------------------------
+# FloorSnapshot back-compat for new outdoor-freshness fields
+# ------------------------------------------------------------------
+
+
+class TestFloorSnapshotFreshnessFieldsBackCompat:
+    """``FloorSnapshot.from_json`` must tolerate pre-existing snapshots that
+    lack the new ``outdoor_newest_observation_time`` and
+    ``outdoor_contributor_count`` fields, defaulting them to ``None``. New
+    snapshots must round-trip the populated values intact.
+    """
+
+    def _old_style_payload(self) -> dict:
+        """Build a FloorSnapshot dict WITHOUT the two new freshness fields,
+        matching the on-disk shape before Jacob's audit landed.
+        """
+        return {
+            "floor": "upstairs",
+            "decision": "OPEN",
+            "reason": "comfortable",
+            "indoor_sensors": [],
+            "outdoor_temp_f": 70.0,
+            "outdoor_source": "nws",
+            "outdoor_stations": [],
+            "outdoor_humidity": 50.0,
+            "aqi_value": 25,
+            "aqi_source": "purpleair",
+            "aqi_stations": [],
+            "gates": [],
+            "last_notification_type": None,
+            "last_notification_time": None,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "outdoor_observation_time": "2026-01-01T00:00:00+00:00",
+            "aqi_observation_time": "2026-01-01T00:00:00+00:00",
+            # Deliberately omitted: outdoor_newest_observation_time,
+            # outdoor_contributor_count.
+        }
+
+    def test_old_snapshot_defaults_new_fields_to_none(self):
+        """Pre-existing JSON without the new fields → loads with both None."""
+        from src.diagnostic import FloorSnapshot
+
+        old_json = json.dumps(self._old_style_payload())
+        snapshot = FloorSnapshot.from_json(old_json)
+
+        assert snapshot.outdoor_newest_observation_time is None
+        assert snapshot.outdoor_contributor_count is None
+        # Pre-existing fields still come back intact.
+        assert snapshot.outdoor_observation_time == "2026-01-01T00:00:00+00:00"
+        assert snapshot.outdoor_temp_f == 70.0
+
+    def test_round_trip_preserves_new_freshness_fields(self):
+        """New snapshot with populated freshness fields → round-trip preserves
+        both ``outdoor_newest_observation_time`` and ``outdoor_contributor_count``
+        exactly.
+        """
+        from src.diagnostic import FloorSnapshot
+
+        payload = self._old_style_payload()
+        payload["outdoor_newest_observation_time"] = "2026-05-21T12:34:56+00:00"
+        payload["outdoor_contributor_count"] = 3
+
+        snapshot = FloorSnapshot.from_json(json.dumps(payload))
+        restored = FloorSnapshot.from_json(snapshot.to_json())
+
+        assert restored.outdoor_newest_observation_time == "2026-05-21T12:34:56+00:00"
+        assert restored.outdoor_contributor_count == 3

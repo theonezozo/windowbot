@@ -544,3 +544,74 @@ class TestGetObservation:
         assert call_args[1] == 65.3  # temperature
         assert "5m ago" in call_args[2]  # age string
 
+
+# ------------------------------------------------------------------
+# Outdoor Freshness Boundary (20-min peer / 60-min last-resort — Jacob's audit)
+# ------------------------------------------------------------------
+
+
+class TestOutdoorFreshnessBoundary:
+    """Pin both OpenMeteo cutoffs with literal-minute boundary tests:
+
+    - ``get_observation()`` peer-pool cutoff: 20 min.
+    - ``get_outdoor_conditions()`` last-resort hard cap: 60 min.
+
+    These tests patch ``_fetch`` directly (not the HTTP layer) so the only
+    variable under test is the staleness gate.
+    """
+
+    def test_get_observation_rejects_at_21_min(self):
+        """21-min-old timestamp → OpenMeteoError ('stale')."""
+        now = datetime.now(timezone.utc)
+        client = OpenMeteoClient(_LAT, _LON)
+        with patch.object(client, "_fetch", return_value={
+            "temperature_f": 65.0,
+            "humidity": 50.0,
+            "wind_speed_mph": 5.0,
+            "timestamp": now - timedelta(minutes=21),
+        }):
+            with pytest.raises(OpenMeteoError, match="stale"):
+                client.get_observation()
+
+    def test_get_observation_accepts_at_19_min(self):
+        """19-min-old timestamp → returns observation dict."""
+        now = datetime.now(timezone.utc)
+        client = OpenMeteoClient(_LAT, _LON)
+        with patch.object(client, "_fetch", return_value={
+            "temperature_f": 65.0,
+            "humidity": 50.0,
+            "wind_speed_mph": 5.0,
+            "timestamp": now - timedelta(minutes=19),
+        }):
+            result = client.get_observation()
+        assert result["station_id"] == "OPENMETEO"
+        assert result["temperature_f"] == pytest.approx(65.0)
+
+    def test_get_outdoor_conditions_rejects_at_61_min(self):
+        """61-min-old timestamp on last-resort path → OpenMeteoError."""
+        now = datetime.now(timezone.utc)
+        client = OpenMeteoClient(_LAT, _LON)
+        with patch.object(client, "_fetch", return_value={
+            "temperature_f": 65.0,
+            "humidity": 50.0,
+            "wind_speed_mph": 5.0,
+            "timestamp": now - timedelta(minutes=61),
+        }):
+            with pytest.raises(OpenMeteoError, match="too stale"):
+                client.get_outdoor_conditions()
+
+    def test_get_outdoor_conditions_accepts_at_59_min(self):
+        """59-min-old timestamp on last-resort path → returns conditions dict."""
+        now = datetime.now(timezone.utc)
+        client = OpenMeteoClient(_LAT, _LON)
+        with patch.object(client, "_fetch", return_value={
+            "temperature_f": 65.0,
+            "humidity": 50.0,
+            "wind_speed_mph": 5.0,
+            "timestamp": now - timedelta(minutes=59),
+        }):
+            result = client.get_outdoor_conditions()
+        assert result["temperature_f"] == pytest.approx(65.0)
+        assert result["source"] == "openmeteo"
+        assert result["is_fallback"] is True
+

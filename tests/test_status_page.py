@@ -250,3 +250,126 @@ class TestPinDeniedShortCircuits:
         # PIN gate ran before any snapshot work — nothing fetched.
         mock_get_state.assert_not_called()
         mock_snap_mgr_cls.assert_not_called()
+
+
+# ------------------------------------------------------------------
+# Outdoor freshness bucket + range-format rendering (Jacob's audit gates)
+# ------------------------------------------------------------------
+
+
+class TestOutdoorFreshnessBucketRendering:
+    """The status page paints the outdoor ``data-freshness`` block based on
+    the OLDEST contributor (worst-case bucket): ``data-fresh`` < 20 min,
+    ``data-warn`` 20–45 min, ``data-stale`` ≥ 45 min. The AQI bucket is
+    intentionally asymmetric (30/60 min) — this class pins that delta.
+    """
+
+    def _snapshot_with_outdoor_age(
+        self,
+        outdoor_minutes: int,
+        *,
+        newest_minutes: int | None = None,
+        contributor_count: int | None = None,
+        aqi_minutes: int = 5,
+    ) -> FloorSnapshot:
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        snap = _floor_snapshot("upstairs")
+        snap.outdoor_observation_time = (
+            now - timedelta(minutes=outdoor_minutes)
+        ).isoformat()
+        if newest_minutes is not None:
+            snap.outdoor_newest_observation_time = (
+                now - timedelta(minutes=newest_minutes)
+            ).isoformat()
+        else:
+            snap.outdoor_newest_observation_time = None
+        snap.outdoor_contributor_count = contributor_count
+        snap.aqi_observation_time = (
+            now - timedelta(minutes=aqi_minutes)
+        ).isoformat()
+        return snap
+
+    def test_outdoor_10_min_is_fresh(self):
+        """10 min old → ``data-fresh`` class on the outdoor block."""
+        from src.status_page import _render_environment_section
+
+        snap = self._snapshot_with_outdoor_age(10)
+        html = _render_environment_section(snap)
+        assert "data-freshness data-fresh" in html
+        # Sanity: not warn/stale.
+        assert "data-freshness data-warn" not in html.split("Air Quality")[0]
+        assert "data-freshness data-stale" not in html.split("Air Quality")[0]
+
+    def test_outdoor_30_min_is_warn(self):
+        """30 min old → ``data-warn`` on the outdoor block (past 20-min fresh,
+        before 45-min stale).
+        """
+        from src.status_page import _render_environment_section
+
+        snap = self._snapshot_with_outdoor_age(30)
+        html = _render_environment_section(snap)
+        outdoor_section = html.split("Air Quality")[0]
+        assert "data-freshness data-warn" in outdoor_section
+
+    def test_outdoor_50_min_is_stale(self):
+        """50 min old → ``data-stale`` on the outdoor block (past 45-min cap)."""
+        from src.status_page import _render_environment_section
+
+        snap = self._snapshot_with_outdoor_age(50)
+        html = _render_environment_section(snap)
+        outdoor_section = html.split("Air Quality")[0]
+        assert "data-freshness data-stale" in outdoor_section
+
+    def test_aqi_25_min_is_fresh_despite_outdoor_20_min_threshold(self):
+        """AQI bucket is 30/60 — asymmetric with outdoor 20/45. A 25-min-old
+        AQI reading is still ``data-fresh`` even though it would be ``data-warn``
+        under the outdoor thresholds. Pins the asymmetry from Jacob's audit.
+        """
+        from src.status_page import _render_environment_section
+
+        # Force outdoor into a known bucket so it doesn't interfere with the AQI assertion.
+        snap = self._snapshot_with_outdoor_age(5, aqi_minutes=25)
+        html = _render_environment_section(snap)
+        aqi_section = html.split("Air Quality")[1]
+        assert "data-freshness data-fresh" in aqi_section
+
+    def test_range_format_renders_when_oldest_differs_from_newest(self):
+        """Multiple contributors spanning ages → renders the en-dash range
+        string ``"observed Xmin–Ymin ago (N readings)"`` exactly as Gregory
+        wrote it (note the U+2013 en-dash, not a hyphen).
+        """
+        from src.status_page import _render_environment_section
+
+        snap = self._snapshot_with_outdoor_age(
+            outdoor_minutes=25,
+            newest_minutes=3,
+            contributor_count=3,
+        )
+        html = _render_environment_section(snap)
+        # Exact substring: 25min en-dash 3min ago (3 readings).
+        # \u2013 is the en-dash from src/status_page.py line 320.
+        assert "observed 25min\u20133min ago (3 readings)" in html
+        # The outdoor block is in the warn bucket (oldest = 25 min).
+        outdoor_section = html.split("Air Quality")[0]
+        assert "data-freshness data-warn" in outdoor_section
+
+    def test_single_contributor_uses_legacy_single_age_format(self):
+        """When there is only one contributor (or the newest matches the
+        oldest), the legacy ``"observed Xmin ago"`` string is used and the
+        range-format substring does NOT appear.
+        """
+        from src.status_page import _render_environment_section
+
+        snap = self._snapshot_with_outdoor_age(
+            outdoor_minutes=10,
+            newest_minutes=10,  # same as oldest → suppresses range format
+            contributor_count=1,
+        )
+        html = _render_environment_section(snap)
+        assert "observed 10min ago" in html
+        # No range delimiter must appear in the outdoor block.
+        outdoor_section = html.split("Air Quality")[0]
+        assert "\u2013" not in outdoor_section
+        assert "readings)" not in outdoor_section
