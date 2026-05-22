@@ -272,6 +272,15 @@ az functionapp config appsettings set --name func-windowbot-prod \
   --settings BEESTAT_API_KEY=xxx PURPLEAIR_API_KEY=xxx ...
 ```
 
+### Manual deploys
+
+Before running `func azure functionapp publish windowbot-func --python`, stamp the version metadata so the status page shows the deployed commit:
+
+    ./scripts/stamp_version.sh
+    func azure functionapp publish windowbot-func --python
+
+The CI workflows (`deploy.yml` and `main_windowbot-func.yml`) do this automatically.
+
 ### Estimated Cost
 
 **$0.00–0.05/month** on the Azure Functions Consumption plan. The free grant covers 1M executions/month — WindowBot uses ~4,320 (every 10 min × 30 days).

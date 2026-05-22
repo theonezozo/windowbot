@@ -22,6 +22,12 @@ from src.diagnostic import (
     GlobalSnapshot,
     TemperatureHistoryEntry,
 )
+from src.version_info import (
+    VERSION,
+    WORKER_STARTED_AT,
+    is_dev_build,
+    parse_iso_utc,
+)
 
 logger = logging.getLogger("windowbot.status")
 
@@ -143,7 +149,14 @@ def _render_json(
     history: list[TemperatureHistoryEntry] | None = None,
 ) -> func.HttpResponse:
     """Render status as JSON."""
+    now = datetime.now(timezone.utc)
     data = {
+        "version": {
+            **VERSION,
+            "is_dev_build": is_dev_build(),
+            "worker_started_at": WORKER_STARTED_AT.isoformat(),
+            "worker_uptime_seconds": int((now - WORKER_STARTED_AT).total_seconds()),
+        },
         "global": json.loads(global_snapshot.to_json()) if global_snapshot else None,
         "floors": {s.floor: json.loads(s.to_json()) for s in floor_snapshots},
         "history": [json.loads(h.to_json()) for h in (history or [])],
@@ -265,6 +278,7 @@ def _render_html(
         {floors_html}
         {history_html}
         <div class="footer">
+            {_render_build_info()}
             <p>Page loaded: {now.strftime('%Y-%m-%d %H:%M:%S UTC')} · auto-refreshes in {refresh_seconds}s</p>
             <p><a href="?format=json">View as JSON</a></p>
         </div>
@@ -547,6 +561,58 @@ def _format_age(dt: datetime, future: bool = False) -> str:
     else:
         days = int(abs_delta / 86400)
         return f"{prefix}{days}d"
+
+
+def _render_build_info() -> str:
+    """Render the small build/version footer line.
+
+    Always renders something — never crashes the status page even if every
+    version field is missing or malformed.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        worker_uptime = _format_age(WORKER_STARTED_AT)
+
+        if is_dev_build():
+            return (
+                f'<div class="build-info">'
+                f'Build: <strong>dev</strong> (local) · worker up {worker_uptime}'
+                f'</div>'
+            )
+
+        sha = VERSION.get("commit_sha") or "unknown"
+        branch = VERSION.get("branch") or "unknown"
+        commit_url = VERSION.get("commit_url")
+
+        if commit_url:
+            sha_html = (
+                f'<a href="{html.escape(commit_url)}" target="_blank" rel="noopener">'
+                f'{html.escape(sha)}</a>'
+            )
+        else:
+            sha_html = f'<strong>{html.escape(sha)}</strong>'
+
+        parts = [f'Build: {sha_html} ({html.escape(branch)})']
+
+        commit_time = parse_iso_utc(VERSION.get("commit_time"))
+        if commit_time is not None:
+            parts.append(f'committed {_format_age(commit_time)} ago')
+
+        build_time = parse_iso_utc(VERSION.get("build_time"))
+        stale_class = ""
+        if build_time is not None:
+            parts.append(f'deployed {_format_age(build_time)} ago')
+            # Heuristic: flag if the build is older than 7 days.
+            if (now - build_time).total_seconds() > 7 * 86400:
+                stale_class = " build-stale"
+
+        parts.append(f'worker up {worker_uptime}')
+
+        return f'<div class="build-info{stale_class}">{" · ".join(parts)}</div>'
+    except Exception:
+        # Diagnostic info should NEVER break the page.
+        logger.exception("Failed to render build info; omitting from footer.")
+        return ""
 
 
 def _get_css() -> str:
@@ -936,6 +1002,31 @@ def _get_css() -> str:
         .footer a:hover {
             text-decoration: underline;
         }
+
+        .build-info {
+            font-size: 0.8em;
+            color: #888;
+            margin-top: 8px;
+            margin-bottom: 12px;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            line-height: 1.5;
+        }
+
+        .build-info a {
+            color: #1976d2;
+            text-decoration: none;
+            padding: 0;
+            display: inline;
+        }
+
+        .build-info a:hover {
+            text-decoration: underline;
+        }
+
+        .build-info.build-stale {
+            color: #b26a00;
+        }
         
         @media (max-width: 600px) {
             body {
@@ -1182,6 +1273,18 @@ def _get_css() -> str:
             
             .footer a {
                 color: #64b5f6;
+            }
+
+            .build-info {
+                color: #777;
+            }
+
+            .build-info a {
+                color: #64b5f6;
+            }
+
+            .build-info.build-stale {
+                color: #d4a056;
             }
 
             .history-table th,

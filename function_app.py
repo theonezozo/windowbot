@@ -5,9 +5,18 @@ import logging
 
 from src.orchestrator import run_check
 from src.status_page import render_status_page
+from src.version_info import VERSION, WORKER_STARTED_AT
 
 # Suppress Azure SDK HTTP transport logs (request/response traces) unless errors occur.
 logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+
+logging.getLogger("windowbot").info(
+    "WindowBot worker started: commit=%s branch=%s build_time=%s started_at=%s",
+    VERSION["commit_sha"],
+    VERSION["branch"],
+    VERSION["build_time"],
+    WORKER_STARTED_AT.isoformat(),
+)
 
 app = func.FunctionApp()
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import azure.functions as func
@@ -373,3 +374,236 @@ class TestOutdoorFreshnessBucketRendering:
         outdoor_section = html.split("Air Quality")[0]
         assert "\u2013" not in outdoor_section
         assert "readings)" not in outdoor_section
+
+
+# ------------------------------------------------------------------
+# Build-info footer (deploy-stamped version surface)
+# ------------------------------------------------------------------
+#
+# Contract: ``.squad/decisions/inbox/gregory-version-info-runtime.md``
+#
+# - ``_render_build_info`` returns a ``<div class="build-info">`` line.
+# - Dev build (no ``_version.py``): shows ``Build: dev`` and ``worker up``,
+#   without the ``build-stale`` modifier.
+# - Stamped build: shows the short SHA (linked to ``commit_url``,
+#   ``target="_blank" rel="noopener"`` for the new-tab safety pattern),
+#   the branch, ``committed Xh ago`` from commit_time, ``deployed Yh ago``
+#   from build_time, and ``worker up`` for the process uptime.
+# - The ``build-stale`` modifier is added IFF ``build_time`` is older than
+#   exactly 7 days (literal ``timedelta(days=N)`` — no production constant
+#   rides).
+# - ``_render_json`` includes a top-level ``"version"`` block carrying
+#   ``commit_sha``, ``is_dev_build``, ``worker_started_at`` (parseable ISO),
+#   and ``worker_uptime_seconds`` (non-negative int).
+# - Bad timestamps (``commit_time = "not-a-date"``) must not crash the
+#   render; the SHA still appears, the broken-age substring does not.
+
+
+class TestRenderBuildInfo:
+    """Direct unit tests for ``_render_build_info``."""
+
+    def _patch_version(self, monkeypatch, version: dict, is_dev: bool) -> None:
+        """Patch the build-info inputs as the renderer sees them.
+
+        ``status_page`` did ``from src.version_info import VERSION, is_dev_build``
+        so the bound names live in the ``status_page`` namespace — patch
+        there, not in ``version_info``.
+        """
+        monkeypatch.setattr("src.status_page.VERSION", version)
+        monkeypatch.setattr("src.status_page.is_dev_build", lambda: is_dev)
+
+    def test_dev_mode_renders_build_info_without_stale_class(self, monkeypatch):
+        # Force the dev-build code path. No version stamp present.
+        self._patch_version(
+            monkeypatch,
+            version=dict(
+                commit_sha="dev",
+                commit_sha_full="dev",
+                commit_time=None,
+                build_time=None,
+                branch="local",
+                commit_url=None,
+            ),
+            is_dev=True,
+        )
+        from src.status_page import _render_build_info
+
+        html = _render_build_info()
+
+        assert 'class="build-info"' in html
+        assert "Build:" in html
+        assert "dev" in html
+        # Dev build never gets the stale modifier.
+        assert 'class="build-info build-stale"' not in html
+        # Worker uptime is part of the dev-mode line too.
+        assert "worker up" in html
+
+    def test_deployed_version_shows_sha_branch_commit_and_deploy_ages(
+        self, monkeypatch
+    ):
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        commit_url = "https://github.com/foo/bar/commit/abc..."
+        self._patch_version(
+            monkeypatch,
+            version=dict(
+                commit_sha="abc1234",
+                commit_sha_full="abc1234def567890abc1234def567890abc12345",
+                # Literal timedelta — no production-constant ride.
+                commit_time=(now - timedelta(hours=3)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                build_time=(now - timedelta(hours=2)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                branch="main",
+                commit_url=commit_url,
+            ),
+            is_dev=False,
+        )
+        from src.status_page import _render_build_info
+
+        html = _render_build_info()
+
+        # Short SHA appears (rendered inside the anchor text).
+        assert "abc1234" in html
+        # Branch name appears.
+        assert "main" in html
+        # ``_format_age`` on a 3-hour delta produces ``"3h 0min"`` —
+        # substring ``"committed 3h"`` is the stable contract surface.
+        assert "committed 3h" in html
+        assert "deployed 2h" in html
+        # Worker uptime line is present.
+        assert "worker up" in html
+        # Commit URL is linkified, new-tab-safe, and the href appears intact.
+        assert commit_url in html
+        assert 'target="_blank"' in html
+        # ``rel="noopener"`` is the security pattern that prevents the
+        # opened tab from accessing window.opener — must always pair with
+        # ``target="_blank"``.
+        assert 'rel="noopener"' in html
+
+    @pytest.mark.parametrize(
+        "build_days_ago, expects_stale",
+        [
+            (6, False),  # Just under the 7-day cap → no stale class.
+            (8, True),   # Past the 7-day cap → stale class applied.
+        ],
+    )
+    def test_build_stale_class_applied_at_7_day_threshold(
+        self, monkeypatch, build_days_ago, expects_stale
+    ):
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        self._patch_version(
+            monkeypatch,
+            version=dict(
+                commit_sha="abc1234",
+                commit_sha_full="abc1234def567890abc1234def567890abc12345",
+                commit_time=(now - timedelta(days=build_days_ago)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                build_time=(now - timedelta(days=build_days_ago)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                branch="main",
+                commit_url="https://github.com/foo/bar/commit/abc",
+            ),
+            is_dev=False,
+        )
+        from src.status_page import _render_build_info
+
+        html = _render_build_info()
+
+        if expects_stale:
+            assert 'class="build-info build-stale"' in html
+        else:
+            # Plain class — explicitly NOT the stale variant.
+            assert 'class="build-info"' in html
+            assert 'class="build-info build-stale"' not in html
+
+    def test_render_build_info_does_not_crash_on_unparseable_timestamps(
+        self, monkeypatch
+    ):
+        """Garbage timestamps must NOT crash the render. The SHA still
+        appears; the broken-age substring does NOT appear.
+        """
+        self._patch_version(
+            monkeypatch,
+            version=dict(
+                commit_sha="abc1234",
+                commit_sha_full="abc1234def567890abc1234def567890abc12345",
+                commit_time="not-a-date",
+                build_time="also-not-a-date",
+                branch="main",
+                commit_url="https://github.com/foo/bar/commit/abc",
+            ),
+            is_dev=False,
+        )
+        from src.status_page import _render_build_info
+
+        # No exception escapes.
+        html = _render_build_info()
+
+        # SHA still renders.
+        assert "abc1234" in html
+        # Broken age fragments are silently dropped — ``committed`` and
+        # ``deployed`` substrings must not appear when their timestamps
+        # failed to parse.
+        assert "committed " not in html
+        assert "deployed " not in html
+
+
+class TestRenderJsonIncludesVersion:
+    """``?format=json`` exposes a top-level ``"version"`` block."""
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_json_output_includes_version_block(
+        self, mock_get_state, mock_snap_mgr_cls, monkeypatch
+    ):
+        # State + snapshot wiring (mirrors TestRenderStatusPageJsonHistory).
+        state_mgr = MagicMock()
+        state_mgr.get_snapshot_table.return_value = MagicMock()
+        mock_get_state.return_value = state_mgr
+
+        snap_mgr = MagicMock()
+        snap_mgr.get_all_floor_snapshots.return_value = [_floor_snapshot("upstairs")]
+        snap_mgr.get_global_snapshot.return_value = _global_snapshot()
+        snap_mgr.get_temperature_history.return_value = []
+        mock_snap_mgr_cls.return_value = snap_mgr
+
+        # Patch VERSION + is_dev_build at the status_page level (where
+        # ``_render_json`` resolves them).
+        monkeypatch.setattr(
+            "src.status_page.VERSION",
+            dict(
+                commit_sha="abc1234",
+                commit_sha_full="abc1234def567890abc1234def567890abc12345",
+                commit_time="2026-05-21T18:30:00Z",
+                build_time="2026-05-21T18:35:12Z",
+                branch="main",
+                commit_url="https://github.com/foo/bar/commit/abc1234",
+            ),
+        )
+        monkeypatch.setattr("src.status_page.is_dev_build", lambda: False)
+
+        resp = render_status_page(_make_request(params={"format": "json"}))
+
+        assert resp.status_code == 200
+        assert resp.mimetype == "application/json"
+        payload = json.loads(resp.get_body().decode())
+
+        assert "version" in payload
+        v = payload["version"]
+        assert v["commit_sha"] == "abc1234"
+        assert v["is_dev_build"] is False
+        # ``worker_uptime_seconds`` is a non-negative int (zero is allowed
+        # if the test runs in the same wall-clock second as module import).
+        assert isinstance(v["worker_uptime_seconds"], int)
+        assert v["worker_uptime_seconds"] >= 0
+        # ``worker_started_at`` is a parseable ISO-8601 datetime string.
+        parsed = datetime.fromisoformat(v["worker_started_at"])
+        assert parsed.tzinfo is not None
