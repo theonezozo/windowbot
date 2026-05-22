@@ -294,13 +294,35 @@ def _render_environment_section(snapshot: FloorSnapshot) -> str:
     """Render the shared outdoor + AQI section (same data across all floors)."""
     now = datetime.now(timezone.utc)
 
-    # Outdoor freshness
+    # Outdoor freshness.
+    # Age class is driven by the OLDEST contributor (worst-case bucket) so
+    # the colour matches the staleness of the pool, not its best member.
+    # Thresholds match the 20-min peer cutoff (fresh < 20m, warn 20-45m, stale > 45m).
     outdoor_obs_age = ""
     if snapshot.outdoor_observation_time:
         obs_time = datetime.fromisoformat(snapshot.outdoor_observation_time)
         obs_age_mins = (now - obs_time).total_seconds() / 60
-        age_class = "data-fresh" if obs_age_mins < 30 else ("data-warn" if obs_age_mins < 60 else "data-stale")
-        outdoor_obs_age = f"<div class='data-freshness {age_class}'>observed {_format_age(obs_time)} ago</div>"
+        age_class = "data-fresh" if obs_age_mins < 20 else ("data-warn" if obs_age_mins < 45 else "data-stale")
+
+        newest_iso = snapshot.outdoor_newest_observation_time
+        contributor_count = snapshot.outdoor_contributor_count
+        newest_time = (
+            datetime.fromisoformat(newest_iso) if newest_iso else None
+        )
+        if (
+            newest_time is not None
+            and newest_iso != snapshot.outdoor_observation_time
+            and contributor_count and contributor_count > 0
+        ):
+            # Multiple contributors spanning a range of ages — surface both ends
+            # so the reader can tell a fresher peer was blended with an older one.
+            label = (
+                f"observed {_format_age(obs_time)}\u2013{_format_age(newest_time)} ago "
+                f"({contributor_count} reading{'s' if contributor_count != 1 else ''})"
+            )
+        else:
+            label = f"observed {_format_age(obs_time)} ago"
+        outdoor_obs_age = f"<div class='data-freshness {age_class}'>{label}</div>"
 
     outdoor_html = f"""
     {outdoor_obs_age}

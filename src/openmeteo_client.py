@@ -5,8 +5,10 @@ Open-Meteo API.  Completely free, requires NO API key, and returns
 model-interpolated data for exact coordinates.
 
 In normal operation Open-Meteo acts as a **peer station** alongside NWS:
-when its reading is fresh (≤30 min) it is blended into the NWS median pool.
-If all NWS stations fail, Open-Meteo serves as the sole fallback source.
+when its reading is fresh (≤20 min) it is blended into the NWS median pool.
+If all NWS stations fail, Open-Meteo serves as the sole fallback source
+(with a generous 60-min hard cap so a stuck timestamp can't display
+hours-old data).
 
 Reference: https://open-meteo.com/en/docs
 """
@@ -21,7 +23,14 @@ import requests
 logger = logging.getLogger("windowbot.openmeteo")
 
 # Observations older than this are not blended into the NWS peer pool.
-_MAX_OBS_AGE = timedelta(minutes=30)
+# Matches ``nws_client._MAX_OBS_AGE`` so the median pool ages are symmetric
+# across sources.
+_MAX_OBS_AGE = timedelta(minutes=20)
+# Hard cap for the last-resort ``get_outdoor_conditions`` path. Generous on
+# purpose — only fires when the Open-Meteo API itself returns a stuck
+# timestamp; under normal conditions current-weather responses are well
+# under this bound.
+_LAST_RESORT_MAX_AGE = timedelta(minutes=60)
 
 
 class OpenMeteoError(Exception):
@@ -123,7 +132,7 @@ class OpenMeteoClient:
         """Fetch current weather and return an NWS-compatible observation dict.
 
         The observation is considered fresh only if its timestamp is within
-        30 minutes of now.  Stale readings raise an error so the caller can
+        20 minutes of now.  Stale readings raise an error so the caller can
         skip this peer without using outdated data.
 
         Returns:
@@ -132,7 +141,7 @@ class OpenMeteoClient:
             ``wind_speed_mph``, ``timestamp``.
 
         Raises:
-            OpenMeteoError: On network/API errors or stale data (> 30 min).
+            OpenMeteoError: On network/API errors or stale data (> 20 min).
         """
         data = self._fetch()
         age = datetime.now(timezone.utc) - data["timestamp"]
@@ -171,11 +180,13 @@ class OpenMeteoClient:
         }
 
     def get_outdoor_conditions(self) -> dict:
-        """Fetch current weather as a last-resort fallback (no freshness check).
+        """Fetch current weather as a last-resort fallback.
 
-        Unlike ``get_observation()``, this method does NOT enforce the 30-minute
-        freshness limit.  Use it only when all NWS stations have failed and no
-        fresh OM peer reading is available.
+        Unlike ``get_observation()``, this method does NOT enforce the 20-minute
+        peer-pool freshness limit.  Used only when all NWS stations have failed
+        and no fresh OM peer reading is available.  A generous 60-minute hard
+        cap still applies so a stuck timestamp from the API cannot propagate
+        hours-old data to the status page.
 
         Returns:
             Dict matching the NWS aggregated-conditions format:
@@ -183,12 +194,22 @@ class OpenMeteoClient:
             ``station_count``, ``is_fallback``, ``used_cache``, ``source``.
 
         Raises:
-            OpenMeteoError: On any network or API failure.
+            OpenMeteoError: On any network or API failure, or if the returned
+                observation is older than the 60-minute hard cap.
         """
         data = self._fetch()
 
-        # Format age consistently with NWS
+        # Hard cap: even on the last-resort path we refuse to surface an
+        # observation older than _LAST_RESORT_MAX_AGE. This catches the
+        # "OM API returns a stuck timestamp" failure mode.
         age = datetime.now(timezone.utc) - data["timestamp"]
+        if age > _LAST_RESORT_MAX_AGE:
+            raise OpenMeteoError(
+                f"Open-Meteo last-resort observation too stale "
+                f"({int(age.total_seconds() // 60)}m old)"
+            )
+
+        # Format age consistently with NWS
         total_secs = int(age.total_seconds())
         hours, remainder = divmod(total_secs, 3600)
         minutes = remainder // 60

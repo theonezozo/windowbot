@@ -25,10 +25,13 @@ REQUIRED_HEADERS = {
     "Accept": "application/geo+json",
 }
 
-# Observations older than this are rejected as stale.
-_MAX_OBS_AGE = timedelta(minutes=30)
+# Observations older than this are rejected as stale. Kept symmetric with
+# OpenMeteo's peer cutoff so the median pool ages match across sources.
+_MAX_OBS_AGE = timedelta(minutes=20)
 _REQUEST_TIMEOUT = 15
 # Cached readings older than this are not used (hard eviction threshold).
+# Independent of the fresh-pool cutoff: LKG only fires when zero fresh
+# readings exist (see ``_fetch_batch``), so a wider cache window is safe.
 _CACHE_MAX_AGE = timedelta(hours=2)
 # Only consider stations within this radius; prevents distant outliers from
 # bloating the search and keeps results hyperlocal.
@@ -205,7 +208,7 @@ class NWSClient:
     def get_observations(self, max_stations: int = 3) -> list[dict]:
         """Fetch the latest observation from each of the nearest stations.
 
-        Observations older than 30 minutes are rejected.
+        Observations older than 20 minutes are rejected.
 
         Args:
             max_stations: Maximum number of stations to query.
@@ -240,9 +243,10 @@ class NWSClient:
 
         Queries ``/observations?limit=5`` rather than ``/observations/latest``
         because the ``latest`` endpoint is aggressively cached and frequently
-        lags the underlying observation list by 30+ minutes.  We walk the
+        lags the underlying observation list by 20+ minutes.  We walk the
         returned features newest-first and accept the first one that is both
-        fresh (within ``_MAX_OBS_AGE``) and has a temperature value.
+        fresh (within ``_MAX_OBS_AGE`` — 20 minutes) and has a temperature
+        value.
 
         Sets ``self._last_skip_reason`` to a human-readable string whenever
         returning ``None`` so callers can log the specific rejection cause.
@@ -288,7 +292,10 @@ class NWSClient:
         for cand_ts, cand_props in candidates:
             age = now - cand_ts
             if age > _MAX_OBS_AGE:
-                break  # remaining candidates are older still
+                # continue (not break) — NWS occasionally returns out-of-order
+                # timestamps for personal stations; a stale candidate near the
+                # top of the list must not short-circuit a fresh one below it.
+                continue
             if cand_props.get("temperature", {}).get("value") is None:
                 continue
             ts, props = cand_ts, cand_props
@@ -413,7 +420,7 @@ class NWSClient:
             )
         used_cache = any(o.get("is_cached", False) for o in nws_observations)
 
-        result = self._aggregate(all_observations, is_fallback)
+        result = self._aggregate(all_observations, is_fallback, now=now)
         result["used_cache"] = used_cache
         result["source"] = "nws"
         logger.info(
@@ -547,23 +554,65 @@ class NWSClient:
         return results, batch_stats
 
     @staticmethod
-    def _aggregate(observations: list[dict], is_fallback: bool) -> dict:
-        """Compute MEDIAN values from a list of observations."""
-        temps = [o["temperature_f"] for o in observations]
-        humidities = [o["humidity"] for o in observations if o["humidity"] is not None]
-        winds = [o["wind_speed_mph"] for o in observations if o["wind_speed_mph"] is not None]
+    def _aggregate(
+        observations: list[dict],
+        is_fallback: bool,
+        now: datetime | None = None,
+    ) -> dict:
+        """Compute MEDIAN values from a list of observations.
 
-        # Oldest observation timestamp among contributors — reflects actual data age.
-        timestamps = [o["timestamp"] for o in observations if o.get("timestamp") is not None]
+        Defence-in-depth: re-filter ``observations`` against ``_MAX_OBS_AGE``
+        even though upstream callers (``_fetch_single_observation``,
+        ``OpenMeteoClient.get_observation``) already enforce the same cutoff.
+        Any future caller that forwards observations directly into this
+        aggregator (e.g., a new peer source, or a refactor that bypasses the
+        per-station gate) inherits the freshness guarantee for free.
+
+        If the re-filter would empty the pool we keep the original list. This
+        is the LKG-cache-fallback path: ``_fetch_batch`` already decided that
+        every contributor is stale-but-acceptable, and double-rejecting here
+        would convert a degraded-but-usable cycle into an outright failure.
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+
+        fresh_obs = [
+            o for o in observations
+            if o.get("timestamp") is not None
+            and (now - o["timestamp"]) <= _MAX_OBS_AGE
+        ]
+        if not fresh_obs:
+            # LKG-cache fallback path (or all-stale OM-only fallback): keep the
+            # original pool so the cycle still produces a number.
+            logger.warning(
+                "_aggregate 20-min re-filter removed all readings — "
+                "proceeding with cached/stale pool of %d observations",
+                len(observations),
+            )
+            fresh_obs = list(observations)
+
+        temps = [o["temperature_f"] for o in fresh_obs]
+        humidities = [o["humidity"] for o in fresh_obs if o["humidity"] is not None]
+        winds = [o["wind_speed_mph"] for o in fresh_obs if o["wind_speed_mph"] is not None]
+
+        timestamps = [o["timestamp"] for o in fresh_obs if o.get("timestamp") is not None]
         oldest_ts = min(timestamps).isoformat() if timestamps else None
+        newest_ts = max(timestamps).isoformat() if timestamps else None
 
         return {
             "temperature_f": round(statistics.median(temps), 1),
             "humidity": round(statistics.median(humidities), 1) if humidities else None,
             "wind_speed_mph": round(statistics.median(winds), 1) if winds else None,
-            "station_count": len(observations),
+            "station_count": len(fresh_obs),
             "is_fallback": is_fallback,
+            # Oldest contributor — drives the status page's freshness bucket
+            # (worst-case age). Kept under the original key for back-compat.
             "observation_time": oldest_ts,
+            # Newest contributor and contributor count — surfaced so the
+            # status page can render "observed Xm–Ym ago (N readings)" when
+            # the pool spans a range of ages.
+            "newest_observation_time": newest_ts,
+            "contributor_count": len(fresh_obs),
         }
 
     def _record_freshness_metric(

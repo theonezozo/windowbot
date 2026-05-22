@@ -75,6 +75,12 @@ class FloorSnapshot:
     timestamp: str
     outdoor_observation_time: str | None = None
     aqi_observation_time: str | None = None
+    # Newest contributor timestamp + total contributor count for the outdoor
+    # median pool. Lets the status page render a range ("Xm–Ym ago") when
+    # contributors span ages; ``outdoor_observation_time`` remains the oldest
+    # so the freshness bucket continues to reflect worst-case staleness.
+    outdoor_newest_observation_time: str | None = None
+    outdoor_contributor_count: int | None = None
 
     def to_json(self) -> str:
         """Serialize to JSON for Table Storage."""
@@ -92,6 +98,8 @@ class FloorSnapshot:
         # Tolerate snapshots written before freshness fields were added.
         obj.setdefault("outdoor_observation_time", None)
         obj.setdefault("aqi_observation_time", None)
+        obj.setdefault("outdoor_newest_observation_time", None)
+        obj.setdefault("outdoor_contributor_count", None)
         return cls(**obj)
 
 

@@ -99,7 +99,7 @@ def run_check() -> None:
 
         # Fetch outdoor conditions.
         # Open-Meteo is always attempted as a fresh peer alongside NWS —
-        # if its reading is ≤30 min old it is blended into the NWS median.
+        # if its reading is ≤20 min old it is blended into the NWS median.
         # If NWS station discovery fails entirely, Open-Meteo is the sole source.
         lat, lon = config["user_latitude"], config["user_longitude"]
         om = OpenMeteoClient(lat, lon)
@@ -695,6 +695,10 @@ def _build_floor_snapshot(
         timestamp=now.isoformat(),
         outdoor_observation_time=outdoor.get("observation_time"),
         aqi_observation_time=aqi_data.get("observation_time"),
+        outdoor_newest_observation_time=outdoor.get("newest_observation_time"),
+        outdoor_contributor_count=(
+            outdoor.get("contributor_count") or outdoor.get("station_count")
+        ),
     )
 
 
