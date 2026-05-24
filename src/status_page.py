@@ -12,6 +12,7 @@ import logging
 import math
 import os
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import azure.functions as func
 
@@ -150,6 +151,7 @@ def _render_json(
 ) -> func.HttpResponse:
     """Render status as JSON."""
     now = datetime.now(timezone.utc)
+    tz = _get_display_tz()
     data = {
         "version": {
             **VERSION,
@@ -157,6 +159,9 @@ def _render_json(
             "worker_started_at": WORKER_STARTED_AT.isoformat(),
             "worker_uptime_seconds": int((now - WORKER_STARTED_AT).total_seconds()),
         },
+        "local_timezone": str(tz),
+        "page_loaded_utc": now.isoformat(),
+        "page_loaded_local": now.astimezone(tz).isoformat(),
         "global": json.loads(global_snapshot.to_json()) if global_snapshot else None,
         "floors": {s.floor: json.loads(s.to_json()) for s in floor_snapshots},
         "history": [json.loads(h.to_json()) for h in (history or [])],
@@ -175,6 +180,7 @@ def _render_html(
 ) -> func.HttpResponse:
     """Render status as HTML."""
     now = datetime.now(timezone.utc)
+    tz = _get_display_tz()
 
     # --- Cycle timing -------------------------------------------------------
     # The timer fires every POLLING_INTERVAL_MINUTES minutes.  Add 90 s of
@@ -194,7 +200,7 @@ def _render_html(
     freshness_html = ""
     freshness_class = "fresh"
     if global_snapshot:
-        poll_time = datetime.fromisoformat(global_snapshot.poll_start)
+        poll_time = _ensure_utc(datetime.fromisoformat(global_snapshot.poll_start))
         age_minutes = (now - poll_time).total_seconds() / 60
         if age_minutes > 20:
             freshness_class = "stale"
@@ -211,7 +217,7 @@ def _render_html(
     # Global header
     header_html = ""
     if global_snapshot:
-        next_poll_time = datetime.fromisoformat(global_snapshot.next_poll_eta)
+        next_poll_time = _ensure_utc(datetime.fromisoformat(global_snapshot.next_poll_eta))
         next_poll_in = _format_age(next_poll_time, future=True)
         
         header_html = f"""
@@ -256,7 +262,7 @@ def _render_html(
     for snapshot in sorted_floors:
         floors_html += _render_floor_card(snapshot)
 
-    history_html = _render_history_card(history or [])
+    history_html = _render_history_card(history or [], tz)
 
     html_content = f"""
 <!DOCTYPE html>
@@ -279,7 +285,7 @@ def _render_html(
         {history_html}
         <div class="footer">
             {_render_build_info()}
-            <p>Page loaded: {now.strftime('%Y-%m-%d %H:%M:%S UTC')} · auto-refreshes in {refresh_seconds}s</p>
+            <p>Page loaded: {_format_local_and_utc(now, tz)} · auto-refreshes in {refresh_seconds}s</p>
             <p><a href="?format=json">View as JSON</a></p>
         </div>
     </div>
@@ -314,14 +320,14 @@ def _render_environment_section(snapshot: FloorSnapshot) -> str:
     # Thresholds match the 20-min peer cutoff (fresh < 20m, warn 20-45m, stale > 45m).
     outdoor_obs_age = ""
     if snapshot.outdoor_observation_time:
-        obs_time = datetime.fromisoformat(snapshot.outdoor_observation_time)
+        obs_time = _ensure_utc(datetime.fromisoformat(snapshot.outdoor_observation_time))
         obs_age_mins = (now - obs_time).total_seconds() / 60
         age_class = "data-fresh" if obs_age_mins < 20 else ("data-warn" if obs_age_mins < 45 else "data-stale")
 
         newest_iso = snapshot.outdoor_newest_observation_time
         contributor_count = snapshot.outdoor_contributor_count
         newest_time = (
-            datetime.fromisoformat(newest_iso) if newest_iso else None
+            _ensure_utc(datetime.fromisoformat(newest_iso)) if newest_iso else None
         )
         if (
             newest_time is not None
@@ -361,7 +367,7 @@ def _render_environment_section(snapshot: FloorSnapshot) -> str:
     aqi_class = "good" if snapshot.aqi_value < 50 else ("moderate" if snapshot.aqi_value < 100 else "unhealthy")
     aqi_obs_age = ""
     if snapshot.aqi_observation_time:
-        obs_time = datetime.fromisoformat(snapshot.aqi_observation_time)
+        obs_time = _ensure_utc(datetime.fromisoformat(snapshot.aqi_observation_time))
         obs_age_mins = (now - obs_time).total_seconds() / 60
         age_class = "data-fresh" if obs_age_mins < 30 else ("data-warn" if obs_age_mins < 60 else "data-stale")
         aqi_obs_age = f"<div class='data-freshness {age_class}'>observed {_format_age(obs_time)} ago</div>"
@@ -402,7 +408,7 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
     decision_class = "open" if snapshot.decision == "OPEN" else "closed"
 
     # Indoor sensors — freshness derived from poll timestamp (sensors read at poll time)
-    sensor_poll_time = datetime.fromisoformat(snapshot.timestamp)
+    sensor_poll_time = _ensure_utc(datetime.fromisoformat(snapshot.timestamp))
     sensor_age = _format_age(sensor_poll_time)
     indoor_html = f"<div class='data-freshness'>read {sensor_age} ago</div><ul class='sensor-list'>"
     for sensor in snapshot.indoor_sensors:
@@ -445,7 +451,7 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
     # Last notification
     notif_html = ""
     if snapshot.last_notification_time:
-        notif_time = datetime.fromisoformat(snapshot.last_notification_time)
+        notif_time = _ensure_utc(datetime.fromisoformat(snapshot.last_notification_time))
         notif_age = _format_age(notif_time)
         notif_type = snapshot.last_notification_type or "unknown"
         notif_html = f"""
@@ -479,7 +485,7 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
     """
 
 
-def _render_history_card(history: list[TemperatureHistoryEntry]) -> str:
+def _render_history_card(history: list[TemperatureHistoryEntry], tz: ZoneInfo) -> str:
     """Render the collapsible 12-hour temperature history table.
 
     Returns "" when there are no entries so the page doesn't show an empty
@@ -501,7 +507,7 @@ def _render_history_card(history: list[TemperatureHistoryEntry]) -> str:
     for entry in history:  # already newest-first
         try:
             ts = datetime.fromisoformat(entry.timestamp)
-            time_label = ts.strftime("%m-%d %H:%M")
+            time_label = _format_local_and_utc_compact(ts, tz)
         except (TypeError, ValueError):
             time_label = html.escape(str(entry.timestamp))
 
@@ -530,7 +536,7 @@ def _render_history_card(history: list[TemperatureHistoryEntry]) -> str:
                 <table class="history-table">
                     <thead>
                         <tr>
-                            <th>Time (UTC)</th>
+                            <th>Time (Local / UTC)</th>
                             <th>Outdoor</th>
                             {header_cells}
                         </tr>
@@ -592,6 +598,51 @@ def _render_sensor_provenance(source: str | None, data_age_seconds: float | None
     return f"<div class='{css_classes}'>{html.escape(label)}{html.escape(age_suffix)}</div>"
 
 
+def _get_display_tz() -> ZoneInfo:
+    """Return the timezone used for user-visible local timestamps.
+
+    Reuses the ``QUIET_HOURS_TIMEZONE`` env var (same IANA name the quiet-hours
+    feature uses), defaulting to ``America/Los_Angeles``. Falls back to UTC
+    silently if the configured name is not a valid IANA zone — a bad value
+    must never crash the page.
+    """
+    name = os.environ.get("QUIET_HOURS_TIMEZONE", "").strip() or "America/Los_Angeles"
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        logger.warning("Invalid IANA timezone %r; falling back to UTC.", name)
+        return ZoneInfo("UTC")
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    """Treat naive datetimes as UTC (some historical snapshots predate tz-awareness)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _format_local_and_utc(dt_utc: datetime, tz: ZoneInfo) -> str:
+    """Format an aware UTC datetime as ``YYYY-MM-DD HH:MM:SS PDT (HH:MM:SS UTC)``.
+
+    The local-tz abbreviation (e.g. ``PST``/``PDT``) comes from ``strftime('%Z')``
+    on the converted datetime, so DST is handled automatically.
+    """
+    dt_utc = _ensure_utc(dt_utc)
+    local = dt_utc.astimezone(tz)
+    local_label = local.strftime("%Y-%m-%d %H:%M:%S %Z")
+    utc_label = dt_utc.strftime("%H:%M:%S UTC")
+    return f"{local_label} ({utc_label})"
+
+
+def _format_local_and_utc_compact(dt_utc: datetime, tz: ZoneInfo) -> str:
+    """Compact variant for table cells: ``MM-DD HH:MM PDT / HH:MM UTC``."""
+    dt_utc = _ensure_utc(dt_utc)
+    local = dt_utc.astimezone(tz)
+    local_label = local.strftime("%m-%d %H:%M %Z")
+    utc_label = dt_utc.strftime("%H:%M UTC")
+    return f"{local_label} / {utc_label}"
+
+
 def _format_age(dt: datetime, future: bool = False) -> str:
     """Format datetime as human-readable age."""
     now = datetime.now(timezone.utc)
@@ -601,7 +652,7 @@ def _format_age(dt: datetime, future: bool = False) -> str:
     else:
         delta = (now - dt).total_seconds()
         prefix = ""
-    
+
     abs_delta = abs(delta)
     
     if abs_delta < 60:

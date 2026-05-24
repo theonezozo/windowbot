@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import azure.functions as func
 import pytest
@@ -106,12 +107,12 @@ class TestRenderHistoryCard:
 
     def test_empty_history_omits_card_entirely(self):
         # No entries → no card markup at all (avoids an empty expando).
-        assert _render_history_card([]) == ""
+        assert _render_history_card([], ZoneInfo("America/Los_Angeles")) == ""
 
     def test_card_present_and_collapsed_by_default(self):
         entries = [_entry("2026-05-19T14:00:00+00:00", 70.0, {"upstairs": 71.0})]
 
-        html = _render_history_card(entries)
+        html = _render_history_card(entries, ZoneInfo("America/Los_Angeles"))
 
         # Card was rendered.
         assert "history-card" in html
@@ -132,14 +133,16 @@ class TestRenderHistoryCard:
             _entry("2026-05-19T12:00:00+00:00", 65.0, {"upstairs": 70.0}),
         ]
 
-        html = _render_history_card(entries)
+        html = _render_history_card(entries, ZoneInfo("America/Los_Angeles"))
 
         # Three <tr> rows in <tbody> (the header <tr> is in <thead>).
         # Count by data-row content via the formatted timestamps.
+        # New format is "<local> <ZONE> / <utc> UTC"; the UTC-side token
+        # is the stable anchor regardless of whether the user is on PST/PDT.
         assert html.count("<tr>") == 4  # 1 thead + 3 tbody rows
-        idx_14 = html.find("05-19 14:00")
-        idx_13 = html.find("05-19 13:00")
-        idx_12 = html.find("05-19 12:00")
+        idx_14 = html.find("14:00 UTC")
+        idx_13 = html.find("13:00 UTC")
+        idx_12 = html.find("12:00 UTC")
         assert idx_14 != -1 and idx_13 != -1 and idx_12 != -1
         # Newest-first ordering preserved in the rendered HTML.
         assert idx_14 < idx_13 < idx_12
@@ -160,7 +163,7 @@ class TestRenderHistoryCard:
             ),
         ]
 
-        html = _render_history_card(entries)
+        html = _render_history_card(entries, ZoneInfo("America/Los_Angeles"))
 
         # Both floor columns appear in the header.
         assert "<th>Upstairs</th>" in html
@@ -170,10 +173,14 @@ class TestRenderHistoryCard:
         # The older row's downstairs cell is —, but its upstairs cell is 70.5.
         # And the outdoor cell on that row is —.
         # Locate the older row by its timestamp and verify cell contents.
-        row2_start = html.find("05-19 13:00")
-        # The next ~200 chars of the row should contain 70.5 (upstairs)
+        # Format is now "<local> <ZONE> / <utc> UTC" — the "13:00 UTC"
+        # token anchors the row regardless of the local zone offset.
+        row2_start = html.find("13:00 UTC")
+        assert row2_start != -1
+        # The next ~500 chars of the row should contain 70.5 (upstairs)
         # and at least two — sentinels (outdoor + downstairs missing).
-        row2_chunk = html[row2_start:row2_start + 400]
+        # Window widened from 400 to 500 to absorb the local/UTC suffix.
+        row2_chunk = html[row2_start:row2_start + 500]
         assert "70.5°F" in row2_chunk
         assert row2_chunk.count("—") >= 2
 
@@ -745,3 +752,308 @@ class TestIndoorSensorProvenanceRendering:
         assert "synced" not in html_out
         for bucket in ("data-fresh", "data-warn", "data-stale"):
             assert f"data-freshness {bucket}" not in html_out
+
+
+# ------------------------------------------------------------------
+# Local timezone display (PST/PDT alongside UTC)
+# (2026-05-24 status page timezone display change)
+# ------------------------------------------------------------------
+#
+# Contract (Gregory's spawn):
+# - Helper picks display tz from ``QUIET_HOURS_TIMEZONE`` env var,
+#   defaulting to ``"America/Los_Angeles"``, falling back to UTC silently
+#   on an invalid IANA name.
+# - Every user-visible HTML timestamp shows local time alongside UTC.
+# - JSON output adds a top-level ``"local_timezone"`` field. Existing
+#   UTC-bearing fields (``version.worker_started_at``, ``global.poll_start``)
+#   remain ISO-8601 \u2014 do NOT regress.
+# - DST abbreviation comes from ``strftime('%Z')``; January renders as
+#   ``PST``, July as ``PDT`` \u2014 never hard-coded.
+# - Relative ages (``5min ago``) are unchanged.
+# - Naive datetimes in snapshots are treated as UTC (back-compat).
+#
+# Boundary discipline (same as Session 25 / Session 26): tests assert the
+# CONTRACT (PST/PDT marker appears, ``local_timezone`` key present, JSON
+# UTC fields still ISO) without pinning exact byte strings that would
+# tightly couple to Gregory's formatting choices.
+
+
+class TestStatusPageTimezoneDisplay:
+    """User-visible timestamps show local time (PST/PDT) alongside UTC."""
+
+    def _state_mgr(self) -> MagicMock:
+        sm = MagicMock()
+        sm.get_snapshot_table.return_value = MagicMock()
+        return sm
+
+    def _snap_mgr(
+        self,
+        *,
+        floors: list[FloorSnapshot] | None = None,
+        history: list[TemperatureHistoryEntry] | None = None,
+        global_snap: GlobalSnapshot | None = None,
+    ) -> MagicMock:
+        mgr = MagicMock()
+        mgr.get_all_floor_snapshots.return_value = (
+            floors if floors is not None else [_floor_snapshot("upstairs")]
+        )
+        mgr.get_global_snapshot.return_value = (
+            global_snap if global_snap is not None else _global_snapshot()
+        )
+        mgr.get_temperature_history.return_value = history or []
+        return mgr
+
+    # ----- 1. HTML footer shows both local and UTC ---------------------
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_html_footer_shows_both_utc_and_pacific(
+        self, mock_get_state, mock_snap_mgr_cls, monkeypatch,
+    ):
+        """Rendered HTML for ``/api/status`` contains both ``UTC`` and a
+        Pacific marker (``PST`` or ``PDT`` \u2014 either is acceptable, season
+        is not pinned).
+        """
+        monkeypatch.setenv("QUIET_HOURS_TIMEZONE", "America/Los_Angeles")
+        mock_get_state.return_value = self._state_mgr()
+        mock_snap_mgr_cls.return_value = self._snap_mgr()
+
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        body = resp.get_body().decode()
+        assert "UTC" in body
+        # Accept either abbreviation \u2014 the season depends on when this test
+        # actually runs. The dynamic-DST test below pins each season explicitly.
+        assert ("PST" in body) or ("PDT" in body), (
+            "Footer must show a Pacific timezone abbreviation alongside UTC."
+        )
+
+    # ----- 2. History table rows show both timezones -------------------
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_history_table_rows_show_both_timezones(
+        self, mock_get_state, mock_snap_mgr_cls, monkeypatch,
+    ):
+        """When history entries exist, each rendered row's time cell carries
+        both a UTC marker and a Pacific marker (or the table has both
+        columns). Format is intentionally not pinned to exact bytes \u2014 the
+        contract is that both representations appear.
+        """
+        monkeypatch.setenv("QUIET_HOURS_TIMEZONE", "America/Los_Angeles")
+        mock_get_state.return_value = self._state_mgr()
+        mock_snap_mgr_cls.return_value = self._snap_mgr(
+            history=[
+                _entry("2026-05-19T14:00:00+00:00", 70.0, {"upstairs": 71.0}),
+                _entry("2026-05-19T13:00:00+00:00", 68.0, {"upstairs": 70.5}),
+            ],
+        )
+
+        resp = render_status_page(_make_request())
+        assert resp.status_code == 200
+        body = resp.get_body().decode()
+
+        # Isolate the history card so other UTC/PDT occurrences elsewhere
+        # in the page don't satisfy the assertion accidentally.
+        assert "history-card" in body
+        card_start = body.find("history-card")
+        card_end = body.find("</details>", card_start)
+        assert card_end != -1
+        card = body[card_start:card_end]
+
+        # Both representations appear inside the history card itself \u2014
+        # either side-by-side in each cell or as separate columns.
+        assert "UTC" in card
+        assert ("PST" in card) or ("PDT" in card), (
+            "History card must show a Pacific timezone alongside UTC."
+        )
+
+    # ----- 3. JSON adds local_timezone, retains UTC fields -------------
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_json_includes_local_timezone_and_preserves_utc_fields(
+        self, mock_get_state, mock_snap_mgr_cls, monkeypatch,
+    ):
+        """JSON has ``local_timezone == "America/Los_Angeles"`` when env is
+        set, AND existing UTC-bearing fields remain ISO-8601 \u2014 must not
+        regress.
+        """
+        monkeypatch.setenv("QUIET_HOURS_TIMEZONE", "America/Los_Angeles")
+        mock_get_state.return_value = self._state_mgr()
+        mock_snap_mgr_cls.return_value = self._snap_mgr()
+
+        resp = render_status_page(_make_request(params={"format": "json"}))
+        assert resp.status_code == 200
+        assert resp.mimetype == "application/json"
+
+        payload = json.loads(resp.get_body().decode())
+
+        # New contract: local_timezone field at top level.
+        assert payload.get("local_timezone") == "America/Los_Angeles"
+
+        # Regression guards \u2014 existing UTC-bearing fields still present
+        # and parseable as ISO-8601.
+        worker_iso = payload["version"]["worker_started_at"]
+        parsed_worker = datetime.fromisoformat(worker_iso)
+        assert parsed_worker.tzinfo is not None, (
+            "worker_started_at must remain tz-aware ISO-8601 (UTC) \u2014 "
+            "the local-tz feature must not strip the UTC stamp."
+        )
+
+        poll_iso = payload["global"]["poll_start"]
+        parsed_poll = datetime.fromisoformat(poll_iso)
+        assert parsed_poll.tzinfo is not None, (
+            "global.poll_start must remain tz-aware ISO-8601 (UTC) \u2014 "
+            "the local-tz feature must not strip the UTC stamp."
+        )
+
+    # ----- 4. Default timezone when env var unset ----------------------
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_default_local_timezone_is_america_los_angeles(
+        self, mock_get_state, mock_snap_mgr_cls, monkeypatch,
+    ):
+        """With ``QUIET_HOURS_TIMEZONE`` unset, ``local_timezone`` defaults
+        to ``"America/Los_Angeles"``. The default is a contract \u2014 do not
+        ride a constant import.
+        """
+        monkeypatch.delenv("QUIET_HOURS_TIMEZONE", raising=False)
+        mock_get_state.return_value = self._state_mgr()
+        mock_snap_mgr_cls.return_value = self._snap_mgr()
+
+        resp = render_status_page(_make_request(params={"format": "json"}))
+        assert resp.status_code == 200
+        payload = json.loads(resp.get_body().decode())
+        assert payload.get("local_timezone") == "America/Los_Angeles"
+
+    # ----- 5. Invalid timezone falls back to UTC -----------------------
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_invalid_timezone_falls_back_to_utc_without_crash(
+        self, mock_get_state, mock_snap_mgr_cls, monkeypatch,
+    ):
+        """A garbage IANA name must NOT crash the page. Both HTML and JSON
+        responses render 200; JSON ``local_timezone == "UTC"``.
+        """
+        monkeypatch.setenv("QUIET_HOURS_TIMEZONE", "Not/AReal/Zone")
+        mock_get_state.return_value = self._state_mgr()
+        mock_snap_mgr_cls.return_value = self._snap_mgr()
+
+        # HTML path \u2014 must not 500.
+        html_resp = render_status_page(_make_request())
+        assert html_resp.status_code == 200, (
+            "Invalid tz must not crash the HTML render."
+        )
+
+        # JSON path \u2014 must report the UTC fallback explicitly.
+        # Reset the snapshot mock since render_status_page consumed it once.
+        mock_get_state.return_value = self._state_mgr()
+        mock_snap_mgr_cls.return_value = self._snap_mgr()
+        json_resp = render_status_page(_make_request(params={"format": "json"}))
+        assert json_resp.status_code == 200
+        payload = json.loads(json_resp.get_body().decode())
+        assert payload.get("local_timezone") == "UTC", (
+            f"Invalid tz must fall back to UTC, got {payload.get('local_timezone')!r}."
+        )
+
+    # ----- 6. DST abbreviation is dynamic, not hard-coded --------------
+
+    @pytest.mark.parametrize(
+        "fixed_now_iso, expected_abbrev, forbidden_abbrev",
+        [
+            # Mid-January \u2014 Pacific is on standard time (PST, UTC-8).
+            ("2026-01-15T20:00:00+00:00", "PST", "PDT"),
+            # Mid-July \u2014 Pacific is on daylight time (PDT, UTC-7).
+            ("2026-07-15T20:00:00+00:00", "PDT", "PST"),
+        ],
+    )
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_dst_abbreviation_matches_season(
+        self,
+        mock_get_state,
+        mock_snap_mgr_cls,
+        monkeypatch,
+        fixed_now_iso,
+        expected_abbrev,
+        forbidden_abbrev,
+    ):
+        """Render the page twice \u2014 once in January, once in July \u2014 and
+        assert the abbreviation in the footer matches the season. This
+        test FAILS the moment anyone hard-codes ``PST`` or ``PDT`` instead
+        of going through ``strftime('%Z')``.
+        """
+        monkeypatch.setenv("QUIET_HOURS_TIMEZONE", "America/Los_Angeles")
+
+        fixed_now = datetime.fromisoformat(fixed_now_iso)
+
+        class _FakeDatetime(datetime):
+            """Patch only ``now``; inherit everything else (``fromisoformat``,
+            ``strftime``, arithmetic) from the real ``datetime``.
+            """
+
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                if tz is None:
+                    return fixed_now.replace(tzinfo=None)
+                return fixed_now.astimezone(tz)
+
+        monkeypatch.setattr("src.status_page.datetime", _FakeDatetime)
+
+        # Pin snapshot timestamps to the same instant so freshness math
+        # stays sane and no stray "Xmonths ago" appears in the page.
+        global_snap = _global_snapshot()
+        global_snap.poll_start = fixed_now_iso
+        global_snap.next_poll_eta = fixed_now_iso
+
+        mock_get_state.return_value = self._state_mgr()
+        mock_snap_mgr_cls.return_value = self._snap_mgr(global_snap=global_snap)
+
+        resp = render_status_page(_make_request())
+        assert resp.status_code == 200
+        body = resp.get_body().decode()
+
+        assert expected_abbrev in body, (
+            f"Expected {expected_abbrev} in the rendered page for "
+            f"{fixed_now_iso} \u2014 DST abbreviation must come from "
+            f"strftime('%Z'), not be hard-coded."
+        )
+        # Negative gate \u2014 catches "PST" hard-coded everywhere (and vice versa).
+        assert forbidden_abbrev not in body, (
+            f"{forbidden_abbrev} must NOT appear when rendering at "
+            f"{fixed_now_iso}. Hard-coded abbreviation detected."
+        )
+
+    # ----- 7. Naive datetime in snapshot is treated as UTC -------------
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_naive_snapshot_timestamp_treated_as_utc(
+        self, mock_get_state, mock_snap_mgr_cls, monkeypatch,
+    ):
+        """A snapshot whose ``poll_start`` is an ISO string WITHOUT a tz
+        suffix must render cleanly. Predates tz-aware persistence \u2014
+        back-compat with already-stored snapshots.
+        """
+        monkeypatch.setenv("QUIET_HOURS_TIMEZONE", "America/Los_Angeles")
+
+        global_snap = _global_snapshot()
+        # No timezone suffix \u2014 naive ISO-8601.
+        global_snap.poll_start = "2026-05-19T14:30:00"
+        global_snap.next_poll_eta = "2026-05-19T14:40:00"
+
+        mock_get_state.return_value = self._state_mgr()
+        mock_snap_mgr_cls.return_value = self._snap_mgr(global_snap=global_snap)
+
+        resp = render_status_page(_make_request())
+        assert resp.status_code == 200, (
+            "Naive snapshot timestamps must NOT crash the render \u2014 "
+            "predates tz-aware persistence."
+        )
+        body = resp.get_body().decode()
+        # Sanity: the page actually rendered, not just a stub.
+        assert "WindowBot Status" in body
