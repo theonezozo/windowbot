@@ -1,0 +1,16 @@
+.squad/
+.git/
+.github/
+.copilot/
+.venv/
+venv/
+.vscode/
+__pycache__/
+*/__pycache__/
+*.pyc
+.python_packages/
+local.settings.json
+tests/
+.gitignore
+.gitattributes
+README.md

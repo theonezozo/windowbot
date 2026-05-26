@@ -34,7 +34,6 @@ nws_freshness_metrics.jsonl
 # Azure Functions
 local.settings.json
 .python_packages/
-.funcignore
 
 # IDE
 .vscode/
