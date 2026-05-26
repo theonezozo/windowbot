@@ -29,15 +29,12 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Create and start virtual environment
-        run: |
-          python -m venv venv
-          source venv/bin/activate
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      # Optional: Add step to run tests here
+      # NOTE (2026-05-25, Janine): The previous "Create and start virtual environment"
+      # and "Install dependencies" steps shipped a deps-less ZIP (venv contains only pip
+      # and setuptools; source `activate` doesn't persist to the next `run:` step; deps
+      # never landed in .python_packages/). Removed. Oryx remote build now installs deps
+      # server-side via scm-do-build-during-deployment + enable-oryx-build on the deploy
+      # step below.
 
       - name: Stamp build version
         shell: bash
@@ -70,15 +67,15 @@ jobs:
           cat src/_version.py
 
       - name: Zip artifact for deployment
-        run: zip release.zip ./* -r
+        # Exclude developer-only / build-artifact paths so Oryx gets a clean source tree.
+        # .funcignore is NOT consulted here — this manual zip ships whatever we include.
+        run: zip release.zip ./* -r -x "venv/*" ".venv/*" "__pycache__/*" "*/__pycache__/*" ".python_packages/*" "tests/*" ".squad/*" ".git/*" ".github/*" ".copilot/*"
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v5
         with:
           name: python-app
-          path: |
-            release.zip
-            !venv/
+          path: release.zip
 
   deploy:
     runs-on: ubuntu-latest
@@ -112,4 +109,38 @@ jobs:
           app-name: 'windowbot-func'
           slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          
+          # 2026-05-25 (Janine): tell Azure to run Oryx server-side so deps install into
+          # .python_packages/lib/site-packages/ and the host serves a proper squashfs via
+          # SCM_RUN_FROM_PACKAGE. Without these, the host gets a deps-less ZIP, every
+          # `from azure.data.tables import ...` raises ModuleNotFoundError, and the
+          # worker indexes zero functions (full outage — see 2026-05-21 entries).
+          scm-do-build-during-deployment: true
+          enable-oryx-build: true
+
+      # 2026-05-25 (Janine): post-deploy smoke test — fail the job if the host hasn't
+      # registered the functions. The publish step reports success even when indexing
+      # is broken; this is the gate that catches it. Mirrors the 2026-05-21 lesson:
+      # "never trust the publish exit code alone."
+      - name: Post-deploy smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Give Oryx + host re-index time to settle.
+          sleep 45
+          URL="https://windowbot-func.azurewebsites.net/api/check"
+          MAX_ATTEMPTS=6
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "$URL" --max-time 30 || echo "000")
+            echo "Attempt $i/$MAX_ATTEMPTS: POST $URL → HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "✅ Smoke test passed."
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "❌ Smoke test failed: /api/check never returned 200."
+          echo "   The deploy completed but the host is not serving functions."
+          echo "   This is the 2026-05-21 failure mode — check whether the artifact"
+          echo "   actually contains .python_packages/lib/site-packages/."
+          exit 1
+
