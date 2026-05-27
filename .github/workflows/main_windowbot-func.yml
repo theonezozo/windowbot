@@ -29,12 +29,25 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # NOTE (2026-05-25, Janine): The previous "Create and start virtual environment"
-      # and "Install dependencies" steps shipped a deps-less ZIP (venv contains only pip
-      # and setuptools; source `activate` doesn't persist to the next `run:` step; deps
-      # never landed in .python_packages/). Removed. Oryx remote build now installs deps
-      # server-side via scm-do-build-during-deployment + enable-oryx-build on the deploy
-      # step below.
+      # NOTE (2026-05-26, Janine): PR #5's reliance on Azure/functions-action@v1's
+      # `scm-do-build-during-deployment` + `enable-oryx-build` flags was wrong for our
+      # auth path. The action's deploy log shows:
+      #   "Will use WEBSITE_RUN_FROM_PACKAGE to deploy since RBAC is detected and your
+      #    function app is on Linux Consumption."
+      # On Linux Consumption + RBAC/OIDC the action skips Oryx entirely and just uploads
+      # the user-provided ZIP to a SAS-URL blob mounted read-only at WEBSITE_RUN_FROM_PACKAGE.
+      # Those build flags are no-ops on this path. So we install deps on the runner,
+      # ship them inside the ZIP under .python_packages/lib/site-packages/, and the host
+      # mounts a complete artifact (matches what `func azure functionapp publish` ships).
+
+      - name: Install dependencies into .python_packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install --target=".python_packages/lib/site-packages" -r requirements.txt
+          echo "--- .python_packages tree (top-level) ---"
+          ls .python_packages/lib/site-packages | head -30
+          test -d .python_packages/lib/site-packages/azure/functions || (echo "❌ azure.functions did not install"; exit 1)
+          test -d .python_packages/lib/site-packages/azure/data/tables || (echo "❌ azure.data.tables did not install"; exit 1)
 
       - name: Stamp build version
         shell: bash
@@ -67,9 +80,10 @@ jobs:
           cat src/_version.py
 
       - name: Zip artifact for deployment
-        # Exclude developer-only / build-artifact paths so Oryx gets a clean source tree.
-        # .funcignore is NOT consulted here — this manual zip ships whatever we include.
-        run: zip release.zip ./* -r -x "venv/*" ".venv/*" "__pycache__/*" "*/__pycache__/*" ".python_packages/*" "tests/*" ".squad/*" ".git/*" ".github/*" ".copilot/*"
+        # Exclude developer-only paths. NOTE: .python_packages is intentionally
+        # INCLUDED — the Install step above populates it with the deps Azure needs.
+        # .funcignore is NOT consulted here; these -x flags are the only enforcement.
+        run: zip release.zip ./* .python_packages -r -x "venv/*" ".venv/*" "__pycache__/*" "*/__pycache__/*" "tests/*" ".squad/*" ".git/*" ".github/*" ".copilot/*"
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v5
@@ -109,13 +123,13 @@ jobs:
           app-name: 'windowbot-func'
           slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          # 2026-05-25 (Janine): tell Azure to run Oryx server-side so deps install into
-          # .python_packages/lib/site-packages/ and the host serves a proper squashfs via
-          # SCM_RUN_FROM_PACKAGE. Without these, the host gets a deps-less ZIP, every
-          # `from azure.data.tables import ...` raises ModuleNotFoundError, and the
-          # worker indexes zero functions (full outage — see 2026-05-21 entries).
-          scm-do-build-during-deployment: true
-          enable-oryx-build: true
+          # 2026-05-26 (Janine): scm-do-build-during-deployment / enable-oryx-build
+          # were removed — they're NO-OPS on Linux Consumption + RBAC. The action
+          # takes the WEBSITE_RUN_FROM_PACKAGE SAS-URL path and skips Oryx (confirmed
+          # in PR #5 / PR #6 merge-run deploy logs: "Will use WEBSITE_RUN_FROM_PACKAGE
+          # to deploy since RBAC is detected and your function app is on Linux
+          # Consumption."). Deps are baked into the ZIP by the build job's Install
+          # step instead. Keeping the flags would be cargo-culting.
 
       # 2026-05-25 (Janine): post-deploy smoke test — fail the job if the host hasn't
       # registered the functions. The publish step reports success even when indexing
