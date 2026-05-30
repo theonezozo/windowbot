@@ -170,7 +170,6 @@ class SnapshotManager:
         }
         try:
             self._table.upsert_entity(entity)
-            logger.info("Saved diagnostic snapshot for floor '%s'.", snapshot.floor)
         except Exception:
             logger.exception("Failed to save snapshot for floor '%s'.", snapshot.floor)
 
@@ -184,7 +183,6 @@ class SnapshotManager:
         }
         try:
             self._table.upsert_entity(entity)
-            logger.info("Saved global diagnostic snapshot.")
         except Exception:
             logger.exception("Failed to save global snapshot.")
 

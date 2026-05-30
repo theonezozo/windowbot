@@ -309,7 +309,6 @@ def _fetch_aqi(config: dict) -> dict:
             )
             result = pa.get_aqi()
             if result and result.get("aqi") is not None:
-                logger.info("AQI from PurpleAir: %d (sensors: %d)", result["aqi"], result.get("sensor_count", 0))
                 return result
         except Exception:
             logger.warning("PurpleAir failed, falling back to AirNow.", exc_info=True)
@@ -322,42 +321,12 @@ def _fetch_aqi(config: dict) -> dict:
             )
             result = airnow.get_aqi()
             if result and result.get("aqi") is not None:
-                logger.info("AQI from AirNow: %d", result["aqi"])
                 return result
         except Exception:
             logger.warning("AirNow also failed.", exc_info=True)
 
     logger.warning("No AQI data available — proceeding without AQI gate.")
     return {"aqi": 0, "source": "none"}
-
-
-def _log_floor_sensor_range(
-    floor_name: str, all_sensors: list[dict], sensor_names: list[str]
-) -> None:
-    """Log the warmest and coolest sensors for a floor (regardless of online status)."""
-    valid = [
-        s for s in all_sensors
-        if s["name"] in sensor_names
-        and s.get("temperature_f") is not None
-    ]
-    if not valid:
-        return
-    warmest = max(valid, key=lambda s: s["temperature_f"])
-    coolest = min(valid, key=lambda s: s["temperature_f"])
-    warmest_status = "[online]" if warmest.get("is_online", False) else "[offline]"
-    coolest_status = "[online]" if coolest.get("is_online", False) else "[offline]"
-    if warmest["name"] == coolest["name"]:
-        logger.info(
-            "Floor %s indoor: %s → %.1f°F %s (only sensor)",
-            floor_name, warmest["name"], warmest["temperature_f"], warmest_status,
-        )
-    else:
-        logger.info(
-            "Floor %s indoor — warmest: %s %.1f°F %s  coolest: %s %.1f°F %s",
-            floor_name,
-            warmest["name"], warmest["temperature_f"], warmest_status,
-            coolest["name"], coolest["temperature_f"], coolest_status,
-        )
 
 
 def _log_coolest_sensor(
@@ -560,11 +529,6 @@ def _evaluate_floor(
             last_state=last_state,
             floor_group=sensor_names,
         )
-
-        # Log warmest/coolest indoor sensor for this floor (name + temperature).
-        # Sensor dicts have no per-sensor timestamp — readings are always from
-        # this cycle (< polling interval old).
-        _log_floor_sensor_range(floor_name, all_sensors, sensor_names)
 
         # Merge decision results into new_state_record (preserves any quiet-hours
         # fields already written above, e.g. from just_ended path).
