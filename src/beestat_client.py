@@ -196,7 +196,6 @@ class BeestatClient:
         # first/only entry.
         user_entry = next(iter(user_dict.values()), None)
         if not isinstance(user_entry, dict):
-            logger.info("Beestat sync_status unavailable — cannot determine data age")
             return None
 
         sync_status = user_entry.get("sync_status") or {}
@@ -221,7 +220,6 @@ class BeestatClient:
                 logger.debug("Could not parse Beestat sync_status.%s = %r", label, iso)
 
         if not parsed:
-            logger.info("Beestat sync_status unavailable — cannot determine data age")
             return None
 
         # Worst-case staleness = oldest sync timestamp.
@@ -385,11 +383,6 @@ class BeestatClient:
             "Beestat get_sensors: %d sensors (%d via live_temps, %d via "
             "sensor-resource fallback)",
             len(sensors), live_temps_count, fallback_count,
-        )
-        logger.info(
-            "Parsed %d sensors (%d online) from Beestat.",
-            len(sensors),
-            sum(1 for s in sensors if s["is_online"]),
         )
         return sensors
 
