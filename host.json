@@ -4,14 +4,30 @@
     "applicationInsights": {
       "samplingSettings": {
         "isEnabled": true,
-        "excludedTypes": "Request"
+        "maxTelemetryItemsPerSecond": 5,
+        "evaluationInterval": "00:00:15",
+        "initialSamplingPercentage": 100,
+        "minSamplingPercentage": 0.1
       }
     },
     "logLevel": {
       "default": "Information",
-      "Host.Results": "Error",
       "Function": "Information",
-      "Host.Aggregator": "Trace"
+      "Function.windowbot_check": "Information",
+      "Function.windowbot_check_http": "Information",
+      "Function.windowbot_status": "Information",
+      "Host.Results": "Error",
+      "Host.Aggregator": "Warning",
+      "Host.Triggers": "Warning",
+      "Host.Function.Console": "Warning",
+      "Worker": "Warning",
+      "Microsoft": "Warning",
+      "Microsoft.AspNetCore": "Warning",
+      "Microsoft.AspNetCore.Mvc": "None",
+      "Microsoft.AspNetCore.Hosting.Diagnostics": "Warning",
+      "Microsoft.AspNetCore.Routing": "Warning",
+      "Microsoft.Hosting.Lifetime": "Warning",
+      "Azure.Core": "Warning"
     }
   },
   "extensionBundle": {
