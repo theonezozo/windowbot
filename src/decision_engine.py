@@ -3,7 +3,11 @@
 Implements the per-floor open/close algorithm described in the architecture
 spec (Section 4) with all user-specified refinements:
 
-- 1 °F **symmetric** hysteresis (open diff = close diff = 1 °F)
+- Asymmetric hysteresis:
+    • OPEN side keeps a 1 °F open hysteresis (outdoor must be >1 °F cooler
+      than the warmest indoor temp before opening)
+    • CLOSE side has **no** hysteresis — the close fires as soon as the
+      outdoor temp exceeds the coolest indoor temp
 - Bidirectional AQI gating:
     • AQI ≥ 100 → CLOSE immediately (urgent, bypasses cooldown)
     • AQI 50–99 → neutral (no AQI-driven state change)
@@ -306,10 +310,10 @@ class DecisionEngine:
         aqi_value: int,
         last_state: str,
     ) -> FloorDecision:
-        """Apply temperature comparison with symmetric hysteresis.
+        """Apply temperature comparison with open-side-only hysteresis.
 
         - CLOSED → OPEN: outdoor < warmest − hysteresis_open **and** AQI < 50
-        - OPEN → CLOSED: outdoor > coolest + hysteresis_close
+        - OPEN → CLOSED: outdoor > coolest (no close hysteresis)
         """
         if last_state == "CLOSED":
             open_threshold = warmest - self.hysteresis_open
@@ -337,14 +341,13 @@ class DecisionEngine:
             )
 
         # last_state == "OPEN"
-        close_threshold = coolest + self.hysteresis_close
-        if outdoor_temp > close_threshold:
+        if outdoor_temp > coolest:
             return FloorDecision(
                 floor=floor,
                 new_state="CLOSED",
                 reason=(
                     f"Outdoor ({outdoor_temp:.1f}°F) warmer than coolest indoor "
-                    f"({coolest:.1f}°F) + {self.hysteresis_close:.1f}°F"
+                    f"({coolest:.1f}°F)"
                 ),
                 urgent=False,
                 changed=True,
@@ -355,7 +358,7 @@ class DecisionEngine:
             new_state="OPEN",
             reason=(
                 f"Still beneficial (outdoor {outdoor_temp:.1f}°F "
-                f"< coolest indoor {coolest:.1f}°F + {self.hysteresis_close:.1f}°F)"
+                f"<= coolest indoor {coolest:.1f}°F)"
             ),
             urgent=False,
             changed=False,
