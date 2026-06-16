@@ -60,7 +60,11 @@ def _decide(
 
 
 class TestTemperatureLogic:
-    """Temperature comparison with 1°F hysteresis on both sides."""
+    """Temperature comparison.
+
+    Open side (CLOSED→OPEN) uses 1°F hysteresis. Close side (OPEN→CLOSED) has
+    NO hysteresis — the window closes as soon as outdoor > coolest indoor.
+    """
 
     def test_open_when_outdoor_cooler_than_warmest_minus_1(self, engine):
         """indoor 74°F, outdoor 72°F → diff=2 > 1 → OPEN."""
@@ -80,8 +84,8 @@ class TestTemperatureLogic:
         assert result.new_state == "CLOSED"
         assert result.changed is False
 
-    def test_close_when_outdoor_warmer_than_coolest_plus_1(self, engine):
-        """OPEN, coolest 70°F, outdoor 72°F → diff=2 > 1 → CLOSE."""
+    def test_close_when_outdoor_warmer_than_coolest(self, engine):
+        """OPEN, coolest 70°F, outdoor 72°F → 72 > 70 → CLOSE."""
         result = _decide(
             engine,
             indoor_temps=[70.0],
@@ -93,7 +97,11 @@ class TestTemperatureLogic:
         assert result.changed is True
 
     def test_stay_open_when_outdoor_equals_coolest(self, engine):
-        """OPEN, coolest 70°F, outdoor 70°F → diff=0 ≤ 1 → stay OPEN."""
+        """OPEN, coolest 70°F, outdoor 70°F → 70 > 70 is False → stay OPEN.
+
+        Close uses a strict ``>`` comparison, so outdoor exactly equal to the
+        coolest indoor keeps the window OPEN.
+        """
         result = _decide(
             engine,
             indoor_temps=[70.0],
@@ -104,8 +112,12 @@ class TestTemperatureLogic:
         assert result.new_state == "OPEN"
         assert result.changed is False
 
-    def test_stay_open_at_exact_close_threshold(self, engine):
-        """OPEN, coolest 70°F, outdoor 71°F → diff=1 = threshold → stay OPEN (need >)."""
+    def test_close_when_outdoor_just_above_coolest_no_hysteresis(self, engine):
+        """OPEN, coolest 70°F, outdoor 71°F → 71 > 70 → CLOSE (no close hysteresis).
+
+        Previously this stayed OPEN (close threshold was coolest+1=71, needing
+        strictly >71). The close now fires the moment outdoor exceeds coolest.
+        """
         result = _decide(
             engine,
             indoor_temps=[70.0],
@@ -113,8 +125,8 @@ class TestTemperatureLogic:
             aqi=30,
             last_state="OPEN",
         )
-        assert result.new_state == "OPEN"
-        assert result.changed is False
+        assert result.new_state == "CLOSED"
+        assert result.changed is True
 
     def test_hysteresis_prevents_oscillation(self, engine):
         """Just barely crossed open threshold, then bounced back."""
@@ -122,8 +134,8 @@ class TestTemperatureLogic:
         r1 = _decide(engine, indoor_temps=[74.0], outdoor_temp=72.0, aqi=30)
         assert r1.new_state == "OPEN"
 
-        # Now outdoor warms to 73.5 — close threshold is coolest+1 = 75.
-        # 73.5 < 75 → stay open.
+        # Now outdoor warms to 73.5 — coolest indoor is 74, close fires only
+        # when outdoor > 74. 73.5 < 74 → stay open.
         r2 = _decide(
             engine,
             indoor_temps=[74.0],
@@ -154,18 +166,18 @@ class TestTemperatureLogic:
     @pytest.mark.parametrize(
         "outdoor, expected_state",
         [
-            (71.0, "OPEN"),     # below threshold → stay open
-            (71.1, "CLOSED"),   # 71.1 > 70+1=71 → CLOSE
-            (71.01, "CLOSED"),  # just above → CLOSE
-            (70.0, "OPEN"),     # equal to coolest → stay open
+            (70.0, "OPEN"),     # equal to coolest → stay open (strict >)
+            (70.01, "CLOSED"),  # just above coolest → CLOSE (no hysteresis)
+            (70.5, "CLOSED"),   # above coolest → CLOSE
+            (71.0, "CLOSED"),   # above coolest → CLOSE (was OPEN under old +1)
             (80.0, "CLOSED"),   # way above → CLOSE
         ],
     )
     def test_close_boundary_parametrized(self, engine, outdoor, expected_state):
         """Parametrized boundary tests for OPEN→CLOSED transition.
 
-        Indoor = 70°F (single sensor = coolest). Close threshold = 70+1 = 71.
-        Need outdoor > 71.
+        Indoor = 70°F (single sensor = coolest). No close hysteresis — the
+        window closes as soon as outdoor > 70.
         """
         result = _decide(
             engine,
@@ -175,6 +187,25 @@ class TestTemperatureLogic:
             last_state="OPEN",
         )
         assert result.new_state == expected_state
+
+    def test_close_fires_just_above_coolest_no_hysteresis(self, engine):
+        """OPEN, coolest 72°F, outdoor 72.5°F → 72.5 > 72 → CLOSE.
+
+        Focused guard on the new boundary: a window that is OPEN closes as
+        soon as outdoor exceeds the coolest indoor temp, with NO close-side
+        hysteresis. Under the old +1°F close offset this stayed OPEN (72.5 <
+        73). Pinned with a literal half-degree to fail if any close
+        hysteresis is reintroduced.
+        """
+        result = _decide(
+            engine,
+            indoor_temps=[72.0],
+            outdoor_temp=72.5,
+            aqi=30,
+            last_state="OPEN",
+        )
+        assert result.new_state == "CLOSED"
+        assert result.changed is True
 
     def test_very_large_differential_opens(self, engine):
         """outdoor 50°F, indoor 80°F → OPEN."""
@@ -195,7 +226,7 @@ class TestTemperatureLogic:
         assert result.changed is False
 
     def test_indoor_outdoor_equal_stays_open(self, engine):
-        """OPEN, indoor=outdoor=74°F → close threshold 74+1=75, outdoor 74 < 75 → stay OPEN."""
+        """OPEN, indoor=outdoor=74°F → 74 > 74 is False → stay OPEN (strict >)."""
         result = _decide(
             engine,
             indoor_temps=[74.0],
@@ -514,7 +545,7 @@ class TestSensorLogic:
         assert result.changed is True
 
     def test_multiple_sensors_uses_coolest_for_close(self, engine):
-        """OPEN. coolest=70, close threshold=71. outdoor 72 > 71 → CLOSE."""
+        """OPEN. coolest=70. outdoor 72 > 70 → CLOSE (close keys off coolest)."""
         result = _decide(
             engine,
             indoor_temps=[76.0, 72.0, 70.0],
@@ -659,8 +690,9 @@ class TestEdgeCases:
         """Temp bounces ±0.5°F around threshold — hysteresis prevents flip-flop.
 
         Indoor 74, open threshold 73. Outdoor oscillates 72.8 ↔ 73.2.
-        When CLOSED: 72.8 < 73 → OPEN. Then 73.2 — close threshold is 75.
-        73.2 < 75 → stays OPEN. Hysteresis working.
+        When CLOSED: 72.8 < 73 → OPEN. Then 73.2 — coolest is 74, close fires
+        only when outdoor > 74. 73.2 < 74 → stays OPEN. Open hysteresis still
+        prevents the immediate reopen flip-flop.
         """
         r1 = _decide(engine, indoor_temps=[74.0], outdoor_temp=72.8, aqi=30)
         assert r1.new_state == "OPEN"
@@ -897,7 +929,7 @@ class TestCombinedConditions:
             last_state="OPEN",
         )
         # AQI neutral returns None for OPEN → falls to temp logic
-        # close threshold = 70+1 = 71, outdoor 72 > 71 → CLOSE
+        # coolest = 70, outdoor 72 > 70 → CLOSE
         assert result.new_state == "CLOSED"
         assert result.changed is True
         assert result.urgent is False
