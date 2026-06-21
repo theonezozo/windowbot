@@ -16,7 +16,7 @@ from src.ecobee_client import EcobeeClient, EcobeeAuthError, EcobeeApiError
 from src.beestat_client import BeestatClient, BeestatAuthError, BeestatApiError
 from src.nws_client import NWSClient, NWSError
 from src.openmeteo_client import OpenMeteoClient, OpenMeteoError
-from src.outdoor_validator import validate_outdoor_temperature
+from src.outdoor_validator import validate_outdoor_temperature, OutdoorValidationResult
 from src.purpleair_client import PurpleAirClient
 from src.airnow_client import AirNowClient
 from src.decision_engine import DecisionEngine, FloorDecision, InsufficientDataError
@@ -52,6 +52,37 @@ def _get_nws_client(config: dict) -> NWSClient:
         _nws_client = NWSClient(lat, lon)
         _nws_client_key = key
     return _nws_client
+
+
+def _record_validation_metric(
+    now: datetime,
+    raw_temp: float,
+    result: "OutdoorValidationResult",
+) -> None:
+    """Append the outdoor jitter-validation outcome to the metrics JSONL.
+
+    Best-effort: never raises. Reuses WINDOWBOT_METRICS_PATH so validation
+    outcomes sit alongside the NWS freshness metrics.
+    """
+    try:
+        import json
+        import os
+        metrics_path = os.environ.get(
+            "WINDOWBOT_METRICS_PATH", "nws_freshness_metrics.jsonl"
+        )
+        record = {
+            "type": "outdoor_validation",
+            "timestamp": now.isoformat(),
+            "reason": result.reason,
+            "suppressed": result.suppressed,
+            "raw_temp_f": round(raw_temp, 1),
+            "validated_temp_f": round(result.temperature_f, 1),
+            "delta_f": round(result.temperature_f - raw_temp, 2),
+        }
+        with open(metrics_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        logger.debug("Could not write validation metric", exc_info=True)
 
 
 def run_check() -> None:
@@ -148,8 +179,9 @@ def run_check() -> None:
         # without lagging genuine movement (see outdoor_validator).
         try:
             prev_outdoor_state = state_mgr.get_floor_state("__global__")
+            _raw_outdoor_temp = outdoor["temperature_f"]
             _val = validate_outdoor_temperature(
-                fused_temp=outdoor["temperature_f"],
+                fused_temp=_raw_outdoor_temp,
                 contributors=outdoor.get("contributors", []),
                 prev_state=prev_outdoor_state,
                 jitter_threshold_f=config.get("outdoor_jitter_threshold_f", 0.5),
@@ -163,6 +195,9 @@ def run_check() -> None:
             outdoor["temperature_f"] = _val.temperature_f
             outdoor["validation_reason"] = _val.reason
             state_mgr.update_floor_state("__global__", _val.state_fields)
+            _record_validation_metric(
+                datetime.now(timezone.utc), _raw_outdoor_temp, _val
+            )
         except Exception:
             logger.exception("Outdoor temp validation failed — using raw fused temp.")
 
