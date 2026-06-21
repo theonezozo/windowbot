@@ -344,8 +344,20 @@ def _render_environment_section(snapshot: FloorSnapshot) -> str:
             label = f"observed {_format_age(obs_time)} ago"
         outdoor_obs_age = f"<div class='data-freshness {age_class}'>{label}</div>"
 
+    # Jitter-suppression indicator: only shown when a swing was actually held
+    # back this cycle, so the page stays clean during normal operation.
+    jitter_badge = ""
+    if snapshot.outdoor_validation_reason == "suppressed_jitter":
+        jitter_badge = (
+            "<div class='data-freshness data-warn'>"
+            "\U0001f6df Sensor swing suppressed \u2014 held steady "
+            "(a rotating sensor disagreed with the recent trend)"
+            "</div>"
+        )
+
     outdoor_html = f"""
     {outdoor_obs_age}
+    {jitter_badge}
     <div class="metric">
         <span class="label">Temperature:</span>
         <span class="value">{snapshot.outdoor_temp_f:.1f}°F</span>

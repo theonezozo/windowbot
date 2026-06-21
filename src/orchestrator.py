@@ -688,6 +688,7 @@ def _build_floor_snapshot(
         outdoor_contributor_count=(
             outdoor.get("contributor_count") or outdoor.get("station_count")
         ),
+        outdoor_validation_reason=outdoor.get("validation_reason"),
     )
 
 

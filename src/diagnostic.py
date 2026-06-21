@@ -87,6 +87,7 @@ class FloorSnapshot:
     # so the freshness bucket continues to reflect worst-case staleness.
     outdoor_newest_observation_time: str | None = None
     outdoor_contributor_count: int | None = None
+    outdoor_validation_reason: str | None = None
 
     def to_json(self) -> str:
         """Serialize to JSON for Table Storage."""
@@ -110,6 +111,7 @@ class FloorSnapshot:
         obj.setdefault("aqi_observation_time", None)
         obj.setdefault("outdoor_newest_observation_time", None)
         obj.setdefault("outdoor_contributor_count", None)
+        obj.setdefault("outdoor_validation_reason", None)
         return cls(**obj)
 
 
