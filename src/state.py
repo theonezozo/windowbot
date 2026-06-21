@@ -68,6 +68,9 @@ class LocalStateManager:
             "QuietHoursActive": False,
             "LastQuietHoursStart": None,
             "LastQuietHoursEnd": None,
+            "LastOutdoorTemp": None,
+            "LastOutdoorContributors": "",
+            "OutdoorTempHistory": "",
         }
 
     def update_floor_state(self, floor: str, state: dict) -> None:
@@ -220,6 +223,9 @@ class StateManager:
                 "QuietHoursActive": False,
                 "LastQuietHoursStart": None,
                 "LastQuietHoursEnd": None,
+                "LastOutdoorTemp": None,
+                "LastOutdoorContributors": "",
+                "OutdoorTempHistory": "",
             }
 
     def update_floor_state(self, floor: str, state: dict) -> None:

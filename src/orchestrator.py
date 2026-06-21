@@ -16,6 +16,7 @@ from src.ecobee_client import EcobeeClient, EcobeeAuthError, EcobeeApiError
 from src.beestat_client import BeestatClient, BeestatAuthError, BeestatApiError
 from src.nws_client import NWSClient, NWSError
 from src.openmeteo_client import OpenMeteoClient, OpenMeteoError
+from src.outdoor_validator import validate_outdoor_temperature
 from src.purpleair_client import PurpleAirClient
 from src.airnow_client import AirNowClient
 from src.decision_engine import DecisionEngine, FloorDecision, InsufficientDataError
@@ -142,6 +143,28 @@ def run_check() -> None:
                 logger.error("All outdoor sources failed. Open-Meteo: %s", exc)
                 errors.append(f"All outdoor sources failed: {exc}")
                 return
+
+        # Suppress availability-driven jitter in the fused outdoor temperature
+        # without lagging genuine movement (see outdoor_validator).
+        try:
+            prev_outdoor_state = state_mgr.get_floor_state("__global__")
+            _val = validate_outdoor_temperature(
+                fused_temp=outdoor["temperature_f"],
+                contributors=outdoor.get("contributors", []),
+                prev_state=prev_outdoor_state,
+                jitter_threshold_f=config.get("outdoor_jitter_threshold_f", 0.5),
+                trend_window=config.get("outdoor_jitter_trend_window", 6),
+            )
+            if _val.suppressed:
+                logger.info(
+                    "Outdoor temp jitter suppressed: %.1f°F → %.1f°F (%s)",
+                    outdoor["temperature_f"], _val.temperature_f, _val.reason,
+                )
+            outdoor["temperature_f"] = _val.temperature_f
+            outdoor["validation_reason"] = _val.reason
+            state_mgr.update_floor_state("__global__", _val.state_fields)
+        except Exception:
+            logger.exception("Outdoor temp validation failed — using raw fused temp.")
 
         # ------------------------------------------------------------------
         # Step 2: Evaluate each floor independently (lazy AQI fetching)

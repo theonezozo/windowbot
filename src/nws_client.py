@@ -599,6 +599,11 @@ class NWSClient:
         oldest_ts = min(timestamps).isoformat() if timestamps else None
         newest_ts = max(timestamps).isoformat() if timestamps else None
 
+        contributors = [
+            {"station_id": o.get("station_id"), "temperature_f": o.get("temperature_f")}
+            for o in fresh_obs
+        ]
+
         return {
             "temperature_f": round(statistics.median(temps), 1),
             "humidity": round(statistics.median(humidities), 1) if humidities else None,
@@ -613,6 +618,7 @@ class NWSClient:
             # the pool spans a range of ages.
             "newest_observation_time": newest_ts,
             "contributor_count": len(fresh_obs),
+            "contributors": contributors,
         }
 
     def _record_freshness_metric(
