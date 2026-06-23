@@ -1110,3 +1110,198 @@ class TestTemperatureHistoryRecording:
         snap_mgr.save_global_snapshot.assert_called_once()
         snap_mgr.record_temperature_history.assert_called_once()
 
+
+# ------------------------------------------------------------------
+# Fix 1: Notification-Type Dedup
+# ------------------------------------------------------------------
+
+
+class TestNotificationTypeDedup:
+    """Suppress consecutive SAME-type non-urgent notifications.
+
+    The gate in ``_evaluate_floor`` persists ``LastNotificationType``
+    ("open"/"close"). A non-urgent notification whose type equals the
+    previously-sent type is suppressed even if the time cooldown elapsed.
+    Urgent alerts bypass dedup. The opposite type is never deduped against
+    the current type (still subject to the time cooldown).
+
+    Technique (mirrors ``TestNotificationCooldown``): drive ``_evaluate_floor``
+    end-to-end with sensors/outdoor/aqi that yield the intended OPEN/CLOSED
+    *changed* decision, patch ``src.orchestrator.send_notification``, and assert
+    "sent" via ``mock_notify.assert_called_once()`` / "suppressed" via
+    ``mock_notify.assert_not_called()``. The persisted record is inspected via
+    ``state_mgr.update_floor_state.call_args`` (the single end-of-cycle write).
+    """
+
+    # Decision inputs that produce a non-urgent CLOSED *changed* decision:
+    # last_state OPEN + outdoor warmer than coolest indoor + good AQI.
+    _CLOSE_OUTDOOR = {"temperature_f": 78.0, "humidity": 50.0}
+    _CLOSE_SENSORS = [{"name": "sensor_up", "temperature_f": 72.0, "is_online": True}]
+    # Decision inputs that produce a non-urgent OPEN *changed* decision:
+    # last_state CLOSED + outdoor cooler than warmest indoor (>hysteresis) + good AQI.
+    _OPEN_OUTDOOR = {"temperature_f": 68.0, "humidity": 50.0}
+    _OPEN_SENSORS = [{"name": "sensor_up", "temperature_f": 74.0, "is_online": True}]
+    _GOOD_AQI = {"aqi": 30}
+
+    @staticmethod
+    def _persisted_record(state_mgr):
+        """Return the state record from the end-of-cycle update_floor_state call."""
+        state_mgr.update_floor_state.assert_called_once()
+        return state_mgr.update_floor_state.call_args.args[1]
+
+    @patch("src.orchestrator.send_notification")
+    def test_first_close_notifies_immediately(self, mock_notify):
+        """last type 'open', last time >1h ago, change → CLOSED: sends + persists 'close'.
+
+        Proves the first notification of a (differing-type) transition fires
+        once the cooldown has elapsed and the persisted type flips to 'close'.
+        """
+        engine = DecisionEngine(_base_config())
+        state_mgr = MagicMock()
+        old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        state_mgr.get_floor_state.return_value = {
+            "CurrentState": "OPEN",
+            "LastNotificationTime": old,
+            "LastNotificationType": "open",
+        }
+
+        _evaluate_floor(
+            "upstairs", ["sensor_up"], self._CLOSE_SENSORS,
+            self._CLOSE_OUTDOOR, self._GOOD_AQI, "cool", engine, state_mgr,
+        )
+
+        mock_notify.assert_called_once()
+        _, kwargs = mock_notify.call_args
+        assert kwargs["urgent"] is False
+        record = self._persisted_record(state_mgr)
+        assert record["LastNotificationType"] == "close"
+
+    @patch("src.orchestrator.send_notification")
+    def test_repeated_close_suppressed_after_cooldown(self, mock_notify):
+        """last type 'close', cooldown elapsed, change → CLOSED again: suppressed.
+
+        Dedup wins even though the time cooldown has elapsed.
+        """
+        engine = DecisionEngine(_base_config())
+        state_mgr = MagicMock()
+        old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        state_mgr.get_floor_state.return_value = {
+            "CurrentState": "OPEN",
+            "LastNotificationTime": old,
+            "LastNotificationType": "close",
+        }
+
+        _evaluate_floor(
+            "upstairs", ["sensor_up"], self._CLOSE_SENSORS,
+            self._CLOSE_OUTDOOR, self._GOOD_AQI, "cool", engine, state_mgr,
+        )
+
+        mock_notify.assert_not_called()
+        # No send → the persisted record must not carry a fresh notification type.
+        record = self._persisted_record(state_mgr)
+        assert "LastNotificationType" not in record
+
+    @patch("src.orchestrator.send_notification")
+    def test_open_after_close_not_deduped(self, mock_notify):
+        """last type 'close', cooldown elapsed, change → OPEN: sends + persists 'open'.
+
+        The opposite type is never deduped against the current type.
+        """
+        engine = DecisionEngine(_base_config())
+        state_mgr = MagicMock()
+        old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        state_mgr.get_floor_state.return_value = {
+            "CurrentState": "CLOSED",
+            "LastNotificationTime": old,
+            "LastNotificationType": "close",
+        }
+
+        _evaluate_floor(
+            "upstairs", ["sensor_up"], self._OPEN_SENSORS,
+            self._OPEN_OUTDOOR, self._GOOD_AQI, "cool", engine, state_mgr,
+        )
+
+        mock_notify.assert_called_once()
+        record = self._persisted_record(state_mgr)
+        assert record["LastNotificationType"] == "open"
+
+    @patch("src.orchestrator.send_notification")
+    def test_urgent_close_bypasses_dedup(self, mock_notify):
+        """last type 'close', urgent change → CLOSED (AQI unhealthy): sends despite same type.
+
+        Urgent notifications bypass dedup AND the time cooldown.
+        """
+        engine = DecisionEngine(_base_config())
+        state_mgr = MagicMock()
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        state_mgr.get_floor_state.return_value = {
+            "CurrentState": "OPEN",
+            "LastNotificationTime": recent,
+            "LastNotificationType": "close",
+        }
+
+        # AQI ≥ close threshold (100) on OPEN windows → urgent close.
+        urgent_aqi = {"aqi": 150}
+
+        _evaluate_floor(
+            "upstairs", ["sensor_up"], self._CLOSE_SENSORS,
+            self._CLOSE_OUTDOOR, urgent_aqi, "cool", engine, state_mgr,
+        )
+
+        mock_notify.assert_called_once()
+        _, kwargs = mock_notify.call_args
+        assert kwargs["urgent"] is True
+        record = self._persisted_record(state_mgr)
+        assert record["LastNotificationType"] == "close"
+
+    @patch("src.orchestrator.send_notification")
+    def test_open_flip_within_cooldown_still_blocked_by_cooldown(self, mock_notify):
+        """last type 'close', last time 10 min ago, flip → OPEN: blocked by cooldown.
+
+        Different type so dedup does NOT apply, but the time cooldown has not
+        elapsed → still suppressed. Proves dedup didn't accidentally force-send
+        and that cooldown still governs differing types.
+        """
+        engine = DecisionEngine(_base_config())
+        state_mgr = MagicMock()
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        state_mgr.get_floor_state.return_value = {
+            "CurrentState": "CLOSED",
+            "LastNotificationTime": recent,
+            "LastNotificationType": "close",
+        }
+
+        _evaluate_floor(
+            "upstairs", ["sensor_up"], self._OPEN_SENSORS,
+            self._OPEN_OUTDOOR, self._GOOD_AQI, "cool", engine, state_mgr,
+        )
+
+        mock_notify.assert_not_called()
+        record = self._persisted_record(state_mgr)
+        assert "LastNotificationType" not in record
+
+    @patch("src.orchestrator.send_notification")
+    def test_sent_notification_persists_type_and_time(self, mock_notify):
+        """A successful send persists BOTH LastNotificationType and LastNotificationTime."""
+        engine = DecisionEngine(_base_config())
+        state_mgr = MagicMock()
+        old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        state_mgr.get_floor_state.return_value = {
+            "CurrentState": "OPEN",
+            "LastNotificationTime": old,
+            "LastNotificationType": "open",
+        }
+
+        _evaluate_floor(
+            "upstairs", ["sensor_up"], self._CLOSE_SENSORS,
+            self._CLOSE_OUTDOOR, self._GOOD_AQI, "cool", engine, state_mgr,
+        )
+
+        mock_notify.assert_called_once()
+        record = self._persisted_record(state_mgr)
+        assert record["LastNotificationType"] == "close"
+        assert "LastNotificationTime" in record
+        # Persisted time is a fresh ISO-8601 timestamp parseable back to a datetime.
+        parsed = datetime.fromisoformat(record["LastNotificationTime"])
+        assert parsed.tzinfo is not None
+

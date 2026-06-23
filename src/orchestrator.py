@@ -509,6 +509,7 @@ def _evaluate_floor(
         previous = state_mgr.get_floor_state(floor_name)
         last_state = previous.get("CurrentState", "CLOSED")
         last_notify_time = previous.get("LastNotificationTime")
+        last_notify_type = previous.get("LastNotificationType")
         now = datetime.now(timezone.utc)
         new_state_record: dict = {}
 
@@ -599,6 +600,17 @@ def _evaluate_floor(
         })
 
         if decision.changed:
+            candidate_type = "open" if decision.new_state == "OPEN" else "close"
+
+            # Type dedup: never repeat a notification of the same type the user
+            # last received (e.g. a second "close" while windows are already
+            # shut). Urgent alerts bypass dedup. The first notification of a
+            # transition still fires instantly — only consecutive same-type
+            # repeats are suppressed.
+            duplicate_type = (
+                not decision.urgent and last_notify_type == candidate_type
+            )
+
             # Check notification cooldown (unless urgent)
             should_notify = decision.urgent  # always notify if urgent
             if not should_notify and last_notify_time:
@@ -606,6 +618,9 @@ def _evaluate_floor(
                 should_notify = elapsed >= _NOTIFICATION_COOLDOWN
             elif not should_notify:
                 should_notify = True  # first notification ever
+
+            if duplicate_type:
+                should_notify = False
 
             if should_notify:
                 action = "🪟 Open" if decision.new_state == "OPEN" else "🚪 Close"
@@ -617,7 +632,13 @@ def _evaluate_floor(
                     urgent=decision.urgent,
                 )
                 new_state_record["LastNotificationTime"] = now.isoformat()
+                new_state_record["LastNotificationType"] = candidate_type
                 logger.info("Notified: %s → %s (%s)", last_state, decision.new_state, floor_name)
+            elif duplicate_type:
+                logger.info(
+                    "State changed %s → %s (%s) but suppressed duplicate '%s' notification.",
+                    last_state, decision.new_state, floor_name, candidate_type,
+                )
             else:
                 logger.info(
                     "State changed %s → %s (%s) but cooldown active.",
@@ -692,9 +713,9 @@ def _build_floor_snapshot(
     
     # Last notification
     last_notif_time = previous_state.get("LastNotificationTime")
-    last_notif_type = None
-    if last_notif_time:
-        # Infer type from current state — this is approximate
+    last_notif_type = previous_state.get("LastNotificationType")
+    if last_notif_type is None and last_notif_time:
+        # Backward-compat: infer from current state for pre-Fix-1 snapshots.
         current_state = previous_state.get("CurrentState", "UNKNOWN")
         if current_state == "OPEN":
             last_notif_type = "open"
