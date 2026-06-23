@@ -9,11 +9,11 @@ Runs as an Azure Function on a 10-minute timer and sends push notifications via 
 Every 10 minutes, WindowBot:
 
 1. **Indoor temps** — reads your Ecobee remote sensors via the Beestat API, grouped by floor
-2. **Outdoor weather** — takes the median temperature/humidity/wind of the 3 nearest NWS stations; Open-Meteo is blended into that median as an extra peer when its reading is ≤20 min old, and acts as the sole fallback if NWS station discovery fails. The fused outdoor temperature then passes through a jitter gate (`outdoor_validator`) that suppresses small swings caused by the contributor set rotating in/out, without delaying genuine temperature moves
+2. **Outdoor weather** — takes the median temperature/humidity/wind of the 3 nearest NWS stations; Open-Meteo is blended into that median as an extra peer when its reading is ≤20 min old, and acts as the sole fallback if NWS station discovery fails. The fused outdoor temperature then passes through a jitter gate (`outdoor_validator`) that suppresses swings unsupported by the data — both small swings caused by the contributor set rotating in/out, and implausibly large single-cycle spikes (> `OUTDOOR_SPIKE_MAX_RATE_F` per cycle) that aren't corroborated, trend-aligned, or sustained — without delaying genuine temperature moves (a sustained move clears within one cycle)
 3. **Air quality** — gets the median AQI from the 3 nearest PurpleAir sensors (falls back to AirNow)
 4. **Per-floor decision** — runs the decision engine independently for each floor (upstairs, downstairs)
 5. **Quiet hours** — suppresses notifications during a configurable sleep window; sends a precool opportunity alert when quiet hours end
-6. **Notification** — sends a push notification via ntfy.sh if the recommendation changes
+6. **Notification** — sends a push notification via ntfy.sh if the recommendation changes. Repeated notifications of the same type are deduplicated — a second "close" while the windows are already shut is suppressed (the first one fires immediately; urgent AQI alerts are never deduped)
 
 ### Decision Logic
 
@@ -244,6 +244,7 @@ This runs the full Azure Functions runtime with the 10-minute timer trigger.
 | `MAX_OBSERVATION_AGE_MINUTES` | `30` | Config default; note the NWS/Open-Meteo freshness cutoff in code is 20 min |
 | `OUTDOOR_JITTER_THRESHOLD_F` | `0.5` | Outdoor-temp jumps within this band always pass through the jitter gate unchanged |
 | `OUTDOOR_JITTER_TREND_WINDOW` | `6` | Number of recent validated outdoor temps used for the trend-slope check |
+| `OUTDOOR_SPIKE_MAX_RATE_F` | `2.0` | Max plausible outdoor-temp change per cycle; a larger single-cycle jump is held unless corroborated, trend-aligned, or sustained into the next cycle |
 | `WINDOWBOT_METRICS_PATH` | `nws_freshness_metrics.jsonl` | Path for appended JSONL metrics (NWS freshness + outdoor-validation outcomes) |
 | `POLLING_INTERVAL_MINUTES` | `10` | Timer trigger interval |
 | `NOTIFICATION_COOLDOWN_HOURS` | `1` | Min hours between non-urgent notifications |
