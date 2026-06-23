@@ -186,6 +186,7 @@ def run_check() -> None:
                 prev_state=prev_outdoor_state,
                 jitter_threshold_f=config.get("outdoor_jitter_threshold_f", 0.5),
                 trend_window=config.get("outdoor_jitter_trend_window", 6),
+                spike_max_rate_f=config.get("outdoor_spike_max_rate_f", 2.0),
             )
             if _val.suppressed:
                 logger.info(

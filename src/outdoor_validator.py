@@ -23,6 +23,15 @@ movement — corroborated by a surviving sensor or consistent with the trend —
 is never delayed. The only cost is that a genuine spike coinciding with a
 full sensor rotation AND zero surviving sensors AND against-trend is deferred
 at most one cycle.
+
+Independently of set stability, a SPIKE GATE holds any jump larger than
+``spike_max_rate_f`` (a physically-implausible per-cycle rate) unless it is
+corroborated by a surviving sensor, aligned with the validated-history trend,
+or sustained — i.e. the previous RAW observation (tracked in a separate
+``OutdoorRawHistory``) was already on the same side of the last validated
+temp. This catches one-cycle spikes on a stable single-station median, which
+the ``genuine_stable_set`` path would otherwise wave through, while delaying
+genuine sustained warming by at most one cycle (``suppressed_spike``).
 """
 
 from __future__ import annotations
@@ -40,6 +49,7 @@ class OutdoorValidationResult:
     reason: str                   # one of: cold_start, within_threshold,
                                   # genuine_stable_set, genuine_corroborated,
                                   # genuine_trend_aligned, suppressed_jitter,
+                                  # suppressed_spike,
                                   # no_contributors_passthrough
     suppressed: bool              # True if a jump was held back
     state_fields: dict            # fields to persist to the __global__ state key
@@ -89,6 +99,7 @@ def validate_outdoor_temperature(
     trend_window: int = 6,
     max_history: int = 12,
     corroboration_epsilon_f: float = 0.05,
+    spike_max_rate_f: float = 2.0,
 ) -> OutdoorValidationResult:
     """Suppress availability-driven jitter in the fused outdoor temperature.
 
@@ -102,6 +113,9 @@ def validate_outdoor_temperature(
         max_history: Maximum validated temps retained in persisted history.
         corroboration_epsilon_f: Minimum own-reading move for a surviving
             sensor to count as corroborating.
+        spike_max_rate_f: Maximum physically-plausible per-cycle change. A
+            jump larger than this is held unless corroborated, trend-aligned,
+            or sustained across cycles (raw-history persistence).
 
     Returns:
         An :class:`OutdoorValidationResult` with the validated temperature, a
@@ -111,6 +125,7 @@ def validate_outdoor_temperature(
     last_temp = prev_state.get("LastOutdoorTemp")
     last_contrib_map = _parse_contributor_map(prev_state.get("LastOutdoorContributors"))
     parsed_history = _parse_history(prev_state.get("OutdoorTempHistory"))
+    raw_history = _parse_history(prev_state.get("OutdoorRawHistory"))
 
     current_map = {
         c["station_id"]: c["temperature_f"]
@@ -124,6 +139,7 @@ def validate_outdoor_temperature(
             "LastOutdoorTemp": validated,
             "LastOutdoorContributors": json.dumps(current_map),
             "OutdoorTempHistory": json.dumps((parsed_history + [validated])[-max_history:]),
+            "OutdoorRawHistory": json.dumps((raw_history + [fused_temp])[-max_history:]),
         }
         return OutdoorValidationResult(
             temperature_f=validated,
@@ -151,30 +167,65 @@ def validate_outdoor_temperature(
     last_ids = set(last_contrib_map.keys())
     set_changed = current_ids != last_ids
 
-    if not set_changed:
-        return _result(fused_temp, "genuine_stable_set", False)
-
     # Corroboration: any surviving sensor moving the same direction as delta.
+    # Corroboration requires INDEPENDENT evidence: a surviving sensor that is
+    # not the sole source of the median. A single-contributor median cannot
+    # corroborate its own jump (its own_delta is trivially equal to delta), so
+    # corroboration is only meaningful when more than one sensor contributes.
     corroborated = False
-    for sid in current_ids & last_ids:
-        own_delta = current_map[sid] - last_contrib_map[sid]
-        if (
-            own_delta
-            and _sign(own_delta) == _sign(delta)
-            and abs(own_delta) >= corroboration_epsilon_f
-        ):
-            corroborated = True
-            break
-    if corroborated:
-        return _result(fused_temp, "genuine_corroborated", False)
+    if len(current_map) > 1:
+        for sid in current_ids & last_ids:
+            own_delta = current_map[sid] - last_contrib_map[sid]
+            if (
+                own_delta
+                and _sign(own_delta) == _sign(delta)
+                and abs(own_delta) >= corroboration_epsilon_f
+            ):
+                corroborated = True
+                break
 
-    # Trend alignment: slope over the recent validated history.
+    # Validated-history trend slope.
     recent = parsed_history[-trend_window:]
     if len(recent) >= 2:
         trend = (recent[-1] - recent[0]) / (len(recent) - 1)
     else:
         trend = 0.0
-    if _sign(trend) != 0 and _sign(delta) == _sign(trend):
+    trend_aligned = _sign(trend) != 0 and _sign(delta) == _sign(trend)
+
+    # Persistence: was the PREVIOUS raw observation already on the same side of
+    # last_temp as this jump? If so the elevated reading has lasted >=2 cycles,
+    # so it is a sustained move, not a one-cycle spike.
+    prev_raw = raw_history[-1] if raw_history else last_temp
+    sustained = (
+        _sign(prev_raw - last_temp) == _sign(delta)
+        and abs(prev_raw - last_temp) > jitter_threshold_f
+    )
+
+    # SPIKE GATE: an implausibly large single-cycle jump that nothing supports
+    # is held. Applies even on a stable contributor set (the single-station
+    # case), which the genuine_stable_set path below would otherwise wave
+    # through. Genuine sustained warming is delayed at most one cycle: if the
+    # high reading persists, `sustained` (or the trend) clears it next cycle.
+    if (
+        abs(delta) > spike_max_rate_f
+        and not corroborated
+        and not trend_aligned
+        and not sustained
+    ):
+        logger.warning(
+            "Outdoor temp spike suppressed: delta=%.2f°F (> %.1f/cycle) held at "
+            "%.1f°F (raw=%.1f, prev_raw=%.1f, trend=%.3f)",
+            delta, spike_max_rate_f, last_temp, fused_temp, prev_raw, trend,
+        )
+        return _result(last_temp, "suppressed_spike", True)
+
+    if not set_changed:
+        return _result(fused_temp, "genuine_stable_set", False)
+
+    if corroborated:
+        return _result(fused_temp, "genuine_corroborated", False)
+
+    if trend_aligned:
         return _result(fused_temp, "genuine_trend_aligned", False)
 
     # All discriminators agree: this is availability-driven jitter. Hold.

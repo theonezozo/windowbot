@@ -72,6 +72,7 @@ class LocalStateManager:
             "LastOutdoorTemp": None,
             "LastOutdoorContributors": "",
             "OutdoorTempHistory": "",
+            "OutdoorRawHistory": "",
         }
 
     def update_floor_state(self, floor: str, state: dict) -> None:
@@ -228,6 +229,7 @@ class StateManager:
                 "LastOutdoorTemp": None,
                 "LastOutdoorContributors": "",
                 "OutdoorTempHistory": "",
+                "OutdoorRawHistory": "",
             }
 
     def update_floor_state(self, floor: str, state: dict) -> None:

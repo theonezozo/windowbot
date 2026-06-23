@@ -354,6 +354,13 @@ def _render_environment_section(snapshot: FloorSnapshot) -> str:
             "(a rotating sensor disagreed with the recent trend)"
             "</div>"
         )
+    elif snapshot.outdoor_validation_reason == "suppressed_spike":
+        jitter_badge = (
+            "<div class='data-freshness data-warn'>"
+            "\U0001f6df Temperature spike suppressed \u2014 held steady "
+            "(an implausible one-cycle jump, awaiting confirmation)"
+            "</div>"
+        )
 
     outdoor_html = f"""
     {outdoor_obs_age}

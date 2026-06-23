@@ -82,6 +82,7 @@ def get_config() -> dict:
         "comfort_temp_max": _env_float("COMFORT_TEMP_MAX", 72.0),
         "outdoor_jitter_threshold_f": _env_float("OUTDOOR_JITTER_THRESHOLD_F", 0.5),
         "outdoor_jitter_trend_window": _env_int("OUTDOOR_JITTER_TREND_WINDOW", 6),
+        "outdoor_spike_max_rate_f": _env_float("OUTDOOR_SPIKE_MAX_RATE_F", 2.0),
 
         # --- Polling & runtime ---
         "polling_interval_minutes": _env_int("POLLING_INTERVAL_MINUTES", 10),
