@@ -35,6 +35,7 @@ from src.diagnostic import (
 logger = logging.getLogger("windowbot")
 
 # Notification cooldown (seconds) — 1 hour between non-urgent notifications.
+# Retained for reference; transitions now notify via type-dedup (Option A).
 _NOTIFICATION_COOLDOWN = 3600
 
 # Module-level NWSClient — kept alive across run_check() cycles so its LKG
@@ -605,23 +606,19 @@ def _evaluate_floor(
 
             # Type dedup: never repeat a notification of the same type the user
             # last received (e.g. a second "close" while windows are already
-            # shut). Urgent alerts bypass dedup. The first notification of a
-            # transition still fires instantly — only consecutive same-type
-            # repeats are suppressed.
+            # shut). Urgent alerts bypass dedup.
             duplicate_type = (
                 not decision.urgent and last_notify_type == candidate_type
             )
 
-            # Check notification cooldown (unless urgent)
-            should_notify = decision.urgent  # always notify if urgent
-            if not should_notify and last_notify_time:
-                elapsed = (now - datetime.fromisoformat(last_notify_time)).total_seconds()
-                should_notify = elapsed >= _NOTIFICATION_COOLDOWN
-            elif not should_notify:
-                should_notify = True  # first notification ever
-
-            if duplicate_type:
-                should_notify = False
+            # Option A: a genuine open<->close TRANSITION always notifies, even
+            # within the legacy time cooldown. Dedup (above) handles same-type
+            # repeats, so the time cooldown is no longer needed to gate
+            # transitions — and keeping it active would silently drop a real
+            # transition (e.g. an OPEN that flipped back from a humidity CLOSE
+            # within the hour), which is bug #10. Only same-type duplicates are
+            # suppressed now.
+            should_notify = not duplicate_type
 
             if should_notify:
                 action = "🪟 Open" if decision.new_state == "OPEN" else "🚪 Close"
@@ -635,15 +632,10 @@ def _evaluate_floor(
                 new_state_record["LastNotificationTime"] = now.isoformat()
                 new_state_record["LastNotificationType"] = candidate_type
                 logger.info("Notified: %s → %s (%s)", last_state, decision.new_state, floor_name)
-            elif duplicate_type:
+            else:
                 logger.info(
                     "State changed %s → %s (%s) but suppressed duplicate '%s' notification.",
                     last_state, decision.new_state, floor_name, candidate_type,
-                )
-            else:
-                logger.info(
-                    "State changed %s → %s (%s) but cooldown active.",
-                    last_state, decision.new_state, floor_name,
                 )
 
         state_mgr.update_floor_state(floor_name, new_state_record)
