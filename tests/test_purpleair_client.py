@@ -300,3 +300,262 @@ class TestSensorFiltering:
 
         with pytest.raises(PurpleAirError, match="Network error"):
             client.find_nearby_sensors()
+
+
+# ------------------------------------------------------------------
+# HTTP Error Diagnostics
+# ------------------------------------------------------------------
+
+
+class TestHttpErrorDiagnostics:
+    """Payment/auth failures surface actionable, status-specific messages.
+
+    Regression guard: a depleted PurpleAir points balance returns HTTP 402.
+    Previously this was raised as a generic error and swallowed by the
+    orchestrator's fallback, so a genuine smoke event went ungated. The error
+    message must now name the payment problem explicitly.
+    """
+
+    @patch("src.purpleair_client.requests.get")
+    def test_payment_required_402_message(self, mock_get):
+        """HTTP 402 → PurpleAirError mentioning payment/points depletion."""
+        mock_get.return_value = MagicMock(
+            ok=False,
+            status_code=402,
+            text='{"error":"PaymentRequiredError","description":"balance is -1595 points"}',
+        )
+        client = PurpleAirClient(40.0, -74.0, api_key="k")
+
+        with pytest.raises(PurpleAirError, match="Payment Required"):
+            client.find_nearby_sensors()
+
+    @patch("src.purpleair_client.requests.get")
+    def test_402_message_is_actionable(self, mock_get):
+        """402 message includes the top-up URL and points/credits guidance."""
+        mock_get.return_value = MagicMock(
+            ok=False, status_code=402, text="{}",
+        )
+        client = PurpleAirClient(40.0, -74.0, api_key="k")
+
+        with pytest.raises(PurpleAirError) as exc_info:
+            client.find_nearby_sensors()
+
+        msg = str(exc_info.value)
+        assert "402" in msg
+        assert "points" in msg.lower() or "credits" in msg.lower()
+        assert "develop.purpleair.com" in msg
+
+    @patch("src.purpleair_client.requests.get")
+    def test_unauthorized_401_message(self, mock_get):
+        """HTTP 401 → PurpleAirError pointing at the API key."""
+        mock_get.return_value = MagicMock(
+            ok=False, status_code=401, text="Unauthorized",
+        )
+        client = PurpleAirClient(40.0, -74.0, api_key="bad")
+
+        with pytest.raises(PurpleAirError, match="PURPLEAIR_API_KEY"):
+            client.find_nearby_sensors()
+
+    @patch("src.purpleair_client.requests.get")
+    def test_unknown_status_still_raises_with_code(self, mock_get):
+        """An unmapped error status still raises with the status code included."""
+        mock_get.return_value = MagicMock(
+            ok=False, status_code=500, text="server error",
+        )
+        client = PurpleAirClient(40.0, -74.0, api_key="k")
+
+        with pytest.raises(PurpleAirError, match="500"):
+            client.find_nearby_sensors()
+
+
+# ------------------------------------------------------------------
+# Nearby-sensor ID caching (metered-cost optimization)
+# ------------------------------------------------------------------
+
+
+def _pa_response(body: dict):
+    """Build a MagicMock HTTP response returning *body* as JSON."""
+    return MagicMock(ok=True, status_code=200, json=lambda: body, text="")
+
+
+def _is_live_read(call) -> bool:
+    """True if a requests.get call used the cheap show_only live-read path."""
+    params = call.kwargs.get("params") or (call[1].get("params") if len(call) > 1 else {})
+    return "show_only" in (params or {})
+
+
+class TestSensorIdCaching:
+    """Discovery runs once, then cheap show_only live reads reuse cached IDs."""
+
+    @staticmethod
+    def _fresh_discovery_body():
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        return {
+            "fields": ["sensor_index", "pm2.5", "latitude", "longitude", "last_seen"],
+            "data": [
+                [101, 10.0, 40.001, -74.001, now_ts],
+                [102, 20.0, 40.002, -74.002, now_ts],
+                [103, 30.0, 40.003, -74.003, now_ts],
+            ],
+        }
+
+    @staticmethod
+    def _fresh_live_body():
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        return {
+            "fields": ["sensor_index", "pm2.5", "last_seen"],
+            "data": [
+                [101, 12.0, now_ts],
+                [102, 22.0, now_ts],
+                [103, 32.0, now_ts],
+            ],
+        }
+
+    @patch("src.purpleair_client.requests.get")
+    def test_discovery_once_then_cached_reads(self, mock_get):
+        """First get_aqi discovers; subsequent calls reuse cached IDs (no re-discovery)."""
+        discovery = self._fresh_discovery_body()
+        live = self._fresh_live_body()
+
+        def side_effect(url, params=None, headers=None, timeout=None):
+            if "show_only" in (params or {}):
+                return _pa_response(live)
+            return _pa_response(discovery)
+
+        mock_get.side_effect = side_effect
+
+        client = PurpleAirClient(40.0, -74.0, api_key="k")
+        r1 = client.get_aqi()  # cold start → discovery
+        r2 = client.get_aqi()  # cached → show_only
+        r3 = client.get_aqi()  # cached → show_only
+
+        discovery_calls = [c for c in mock_get.call_args_list if not _is_live_read(c)]
+        live_calls = [c for c in mock_get.call_args_list if _is_live_read(c)]
+
+        assert len(discovery_calls) == 1, "discovery should run exactly once"
+        assert len(live_calls) == 2, "later cycles use cheap show_only reads"
+
+        # First result derived from discovery data (median of [10,20,30]).
+        assert r1["pm25"] == 20.0
+        # Cached reads use the live values (median of [12,22,32]).
+        assert r2["pm25"] == 22.0
+        assert r3["pm25"] == 22.0
+
+    @patch("src.purpleair_client.requests.get")
+    def test_live_reads_request_trimmed_fields(self, mock_get):
+        """Live reads request only pm2.5,last_seen (no lat/lon); discovery keeps lat/lon."""
+        discovery = self._fresh_discovery_body()
+        live = self._fresh_live_body()
+
+        def side_effect(url, params=None, headers=None, timeout=None):
+            if "show_only" in (params or {}):
+                return _pa_response(live)
+            return _pa_response(discovery)
+
+        mock_get.side_effect = side_effect
+
+        client = PurpleAirClient(40.0, -74.0, api_key="k")
+        client.get_aqi()  # discovery
+        client.get_aqi()  # live read
+
+        live_call = next(c for c in mock_get.call_args_list if _is_live_read(c))
+        live_params = live_call.kwargs["params"]
+        assert live_params["fields"] == "pm2.5,last_seen"
+        assert "latitude" not in live_params["fields"]
+        assert "longitude" not in live_params["fields"]
+        assert live_params["show_only"]  # non-empty ID list
+
+        disc_call = next(c for c in mock_get.call_args_list if not _is_live_read(c))
+        disc_params = disc_call.kwargs["params"]
+        assert "latitude" in disc_params["fields"]
+        assert "longitude" in disc_params["fields"]
+
+    @patch("src.purpleair_client.requests.get")
+    def test_ttl_expiry_triggers_rediscovery(self, mock_get):
+        """When the cache TTL lapses, discovery re-runs."""
+        discovery = self._fresh_discovery_body()
+        live = self._fresh_live_body()
+
+        def side_effect(url, params=None, headers=None, timeout=None):
+            if "show_only" in (params or {}):
+                return _pa_response(live)
+            return _pa_response(discovery)
+
+        mock_get.side_effect = side_effect
+
+        client = PurpleAirClient(40.0, -74.0, api_key="k", sensor_cache_ttl_hours=12.0)
+        client.get_aqi()  # discovery
+        client.get_aqi()  # cached
+        assert len([c for c in mock_get.call_args_list if not _is_live_read(c)]) == 1
+
+        # Force the cache to look expired.
+        client._cache_expiry = datetime.now(timezone.utc) - timedelta(seconds=1)
+        client.get_aqi()  # should re-discover
+
+        discovery_calls = [c for c in mock_get.call_args_list if not _is_live_read(c)]
+        assert len(discovery_calls) == 2, "expired TTL forces a fresh discovery"
+
+    @patch("src.purpleair_client.requests.get")
+    def test_stale_cached_sensors_trigger_rediscovery(self, mock_get):
+        """If cached sensors return only stale readings, discovery refreshes the cache."""
+        now = datetime.now(timezone.utc)
+        stale_ts = int((now - timedelta(minutes=45)).timestamp())
+        discovery = self._fresh_discovery_body()
+        stale_live = {
+            "fields": ["sensor_index", "pm2.5", "last_seen"],
+            "data": [
+                [101, 12.0, stale_ts],
+                [102, 22.0, stale_ts],
+                [103, 32.0, stale_ts],
+            ],
+        }
+
+        def side_effect(url, params=None, headers=None, timeout=None):
+            if "show_only" in (params or {}):
+                return _pa_response(stale_live)
+            return _pa_response(discovery)
+
+        mock_get.side_effect = side_effect
+
+        client = PurpleAirClient(40.0, -74.0, api_key="k")
+        client.get_aqi()  # discovery, caches IDs
+        r = client.get_aqi()  # cached read all stale → re-discover
+
+        discovery_calls = [c for c in mock_get.call_args_list if not _is_live_read(c)]
+        assert len(discovery_calls) == 2, "stale cached sensors force re-discovery"
+        assert r["source"] == "purpleair"
+        assert r["pm25"] == 20.0  # falls back to fresh discovery data
+
+    @patch("src.purpleair_client.requests.get")
+    def test_cached_read_preserves_median_and_freshness(self, mock_get):
+        """Cached live reads keep median-of-3 and drop stale/negative sensors."""
+        now = datetime.now(timezone.utc)
+        now_ts = int(now.timestamp())
+        stale_ts = int((now - timedelta(minutes=45)).timestamp())
+        discovery = self._fresh_discovery_body()
+        # One negative, one stale, three fresh → median of the three fresh.
+        mixed_live = {
+            "fields": ["sensor_index", "pm2.5", "last_seen"],
+            "data": [
+                [101, -1.0, now_ts],     # negative → discarded
+                [102, 40.0, stale_ts],   # stale → discarded
+                [103, 30.0, now_ts],     # fresh
+            ],
+        }
+
+        def side_effect(url, params=None, headers=None, timeout=None):
+            if "show_only" in (params or {}):
+                return _pa_response(mixed_live)
+            return _pa_response(discovery)
+
+        mock_get.side_effect = side_effect
+
+        client = PurpleAirClient(40.0, -74.0, api_key="k")
+        client.get_aqi()  # discovery
+        r = client.get_aqi()  # cached read with mixed quality
+
+        # Only sensor 103 survived freshness/negative filters.
+        assert r["pm25"] == 30.0
+        assert r["sensor_count"] == 1
+
+

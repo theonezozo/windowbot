@@ -55,6 +55,32 @@ def _get_nws_client(config: dict) -> NWSClient:
     return _nws_client
 
 
+# Module-level PurpleAirClient — kept alive across run_check() cycles so its
+# discovered nearby-sensor ID cache survives between calls. Without this, the
+# client (and its cache) was rebuilt every 10-minute run, forcing an expensive
+# bounding-box discovery query on every cycle and burning PurpleAir points.
+_purpleair_client: "PurpleAirClient | None" = None
+_purpleair_client_key: tuple = ()
+
+
+def _get_purpleair_client(config: dict) -> PurpleAirClient:
+    """Return or create the PurpleAirClient singleton.
+
+    Persisting the instance persists its sensor-ID cache across cycles.
+    """
+    global _purpleair_client, _purpleair_client_key
+    lat, lon = config["user_latitude"], config["user_longitude"]
+    api_key = config.get("purpleair_api_key")
+    ttl_hours = config.get("purpleair_sensor_cache_hours", 12.0)
+    key = (lat, lon, api_key, ttl_hours)
+    if _purpleair_client is None or _purpleair_client_key != key:
+        _purpleair_client = PurpleAirClient(
+            lat, lon, api_key=api_key, sensor_cache_ttl_hours=ttl_hours,
+        )
+        _purpleair_client_key = key
+    return _purpleair_client
+
+
 def _record_validation_metric(
     now: datetime,
     raw_temp: float,
@@ -363,15 +389,18 @@ def _fetch_aqi(config: dict) -> dict:
     # Try PurpleAir first
     if config.get("purpleair_api_key"):
         try:
-            pa = PurpleAirClient(
-                config["user_latitude"], config["user_longitude"],
-                api_key=config["purpleair_api_key"],
-            )
+            pa = _get_purpleair_client(config)
             result = pa.get_aqi()
             if result and result.get("aqi") is not None:
                 return result
-        except Exception:
-            logger.warning("PurpleAir failed, falling back to AirNow.", exc_info=True)
+        except Exception as exc:
+            # Surface the real reason inline (e.g. "402: Payment Required — out of
+            # points") so a config/account problem is visible in logs instead of
+            # being masked by the silent AirNow fallback below.
+            logger.warning(
+                "PurpleAir AQI unavailable — falling back to AirNow. Reason: %s",
+                exc,
+            )
 
     # Fallback to AirNow
     if config.get("airnow_api_key"):

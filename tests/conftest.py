@@ -20,6 +20,23 @@ def _isolate_freshness_metrics(tmp_path, monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_orchestrator_singletons():
+    """Clear the orchestrator's module-level client singletons between tests.
+
+    The orchestrator keeps PurpleAirClient/NWSClient alive across run_check
+    cycles (to persist their caches). In tests that would leak a mock/instance
+    from one test into the next, so reset them before each test.
+    """
+    import src.orchestrator as orch
+
+    orch._purpleair_client = None
+    orch._purpleair_client_key = ()
+    orch._nws_client = None
+    orch._nws_client_key = ()
+    yield
+
+
 # ------------------------------------------------------------------
 # Default config
 # ------------------------------------------------------------------

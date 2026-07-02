@@ -144,7 +144,33 @@ class TestAQISourcePreference:
 
     @patch("src.orchestrator.AirNowClient")
     @patch("src.orchestrator.PurpleAirClient")
-    def test_both_fail_returns_zero(self, mock_pa_cls, mock_an_cls):
+    def test_purpleair_402_reason_surfaced_in_log(self, mock_pa_cls, mock_an_cls, caplog):
+        """PurpleAir 402 (out of points) → reason logged inline, AirNow used.
+
+        Regression guard: the payment/account failure must appear in logs so a
+        depleted PurpleAir balance is diagnosable, not silently masked by the
+        AirNow fallback.
+        """
+        from src.purpleair_client import PurpleAirError
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.side_effect = PurpleAirError(
+            "PurpleAir API error (402: Payment Required — out of points) body={}"
+        )
+        mock_pa_cls.return_value = mock_pa
+
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 55, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        config = _base_config()
+        with caplog.at_level("WARNING", logger="windowbot"):
+            result = _fetch_aqi(config)
+
+        assert result["source"] == "airnow"
+        assert "402" in caplog.text
+        assert "Payment Required" in caplog.text
+
         """Both providers fail → AQI defaults to 0."""
         mock_pa = MagicMock()
         mock_pa.get_aqi.side_effect = Exception("PA down")
@@ -173,6 +199,59 @@ class TestAQISourcePreference:
 
         assert result["source"] == "airnow"
         mock_pa_cls.assert_not_called()
+
+
+# ------------------------------------------------------------------
+# PurpleAir Client Persistence (cross-cycle caching)
+# ------------------------------------------------------------------
+
+
+class TestPurpleAirClientPersistence:
+    """The PurpleAirClient is reused across cycles so its sensor-ID cache survives."""
+
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_client_reused_across_cycles(self, mock_pa_cls, mock_an_cls):
+        """Multiple _fetch_aqi calls construct the client once, reuse it after."""
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.return_value = {"aqi": 42, "source": "purpleair"}
+        mock_pa_cls.return_value = mock_pa
+
+        config = _base_config()
+        _fetch_aqi(config)
+        _fetch_aqi(config)
+        _fetch_aqi(config)
+
+        # Constructed once; the same instance (and its cache) serves later cycles.
+        assert mock_pa_cls.call_count == 1
+        assert mock_pa.get_aqi.call_count == 3
+        mock_an_cls.assert_not_called()
+
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_cache_ttl_passed_from_config(self, mock_pa_cls):
+        """The configurable cache TTL is threaded into the client constructor."""
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.return_value = {"aqi": 10, "source": "purpleair"}
+        mock_pa_cls.return_value = mock_pa
+
+        config = _base_config(purpleair_sensor_cache_hours=6.0)
+        _fetch_aqi(config)
+
+        _, kwargs = mock_pa_cls.call_args
+        assert kwargs["sensor_cache_ttl_hours"] == 6.0
+
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_client_rebuilt_when_location_changes(self, mock_pa_cls):
+        """Changing lat/lon invalidates the singleton and rebuilds the client."""
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.return_value = {"aqi": 10, "source": "purpleair"}
+        mock_pa_cls.return_value = mock_pa
+
+        _fetch_aqi(_base_config())
+        _fetch_aqi(_base_config(user_latitude=41.0))
+
+        assert mock_pa_cls.call_count == 2
+
 
 
 # ------------------------------------------------------------------

@@ -94,6 +94,9 @@ def get_config() -> dict:
 
         # --- Air quality ---
         "aq_provider": _env("AQ_PROVIDER", "purpleair"),
+        # Hours to reuse a discovered set of nearby PurpleAir sensor IDs before
+        # re-running the (expensive, metered) bounding-box discovery query.
+        "purpleair_sensor_cache_hours": _env_float("PURPLEAIR_SENSOR_CACHE_HOURS", 12.0),
 
         # --- Feature flags ---
         "enable_humidity_gate": _env_bool("ENABLE_HUMIDITY_GATE", True),

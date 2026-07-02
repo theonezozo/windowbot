@@ -156,6 +156,17 @@ class TestGetConfigDefaults:
         assert cfg["notification_cooldown_hours"] == 1
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_purpleair_sensor_cache_hours_default(self):
+        os.environ.pop("PURPLEAIR_SENSOR_CACHE_HOURS", None)
+        cfg = get_config()
+        assert cfg["purpleair_sensor_cache_hours"] == 12.0
+
+    @patch.dict(os.environ, {"PURPLEAIR_SENSOR_CACHE_HOURS": "6"})
+    def test_purpleair_sensor_cache_hours_override(self):
+        cfg = get_config()
+        assert cfg["purpleair_sensor_cache_hours"] == 6.0
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_allowed_hvac_modes_default(self):
         os.environ.pop("ALLOWED_HVAC_MODES", None)
         cfg = get_config()
