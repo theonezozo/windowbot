@@ -255,9 +255,13 @@ def run_check() -> None:
             )
 
             if needs:
-                if "result" not in aqi_cache:
-                    aqi_cache["result"] = _fetch_aqi(config)
-                aqi_data = aqi_cache["result"]
+                # AirNow-first with the per-floor open-windows carve-out. The
+                # shared aqi_cache keeps each provider to at most one fetch per
+                # cycle while still letting the CLOSED-vs-OPEN carve-out decide
+                # per floor whether PurpleAir points get spent.
+                aqi_data = _fetch_aqi(
+                    config, last_state=last_state, aqi_cache=aqi_cache,
+                )
             else:
                 logger.info(
                     "Skipping AQI fetch for %s — %s", floor_name, skip_reason,
@@ -380,42 +384,137 @@ def _fetch_indoor_data(config: dict, state_mgr: StateManager) -> tuple[list[dict
     return sensors, hvac_mode
 
 
-def _fetch_aqi(config: dict) -> dict:
-    """Fetch AQI: PurpleAir (median of 3) → AirNow fallback.
+def _fetch_airnow(config: dict) -> dict | None:
+    """Fetch AQI from AirNow (free, EPA regulatory network).
 
-    Returns a dict compatible with DecisionEngine.decide(aqi=...) parameter.
-    Always returns a dict with at least {"aqi": <value>}.
+    Returns the AQI dict on success, or ``None`` when no API key is configured
+    or the call fails / returns no value. Never raises.
     """
-    # Try PurpleAir first
-    if config.get("purpleair_api_key"):
-        try:
-            pa = _get_purpleair_client(config)
-            result = pa.get_aqi()
-            if result and result.get("aqi") is not None:
-                return result
-        except Exception as exc:
-            # Surface the real reason inline (e.g. "402: Payment Required — out of
-            # points") so a config/account problem is visible in logs instead of
-            # being masked by the silent AirNow fallback below.
-            logger.warning(
-                "PurpleAir AQI unavailable — falling back to AirNow. Reason: %s",
-                exc,
-            )
+    if not config.get("airnow_api_key"):
+        return None
+    try:
+        airnow = AirNowClient(
+            config["airnow_api_key"], config["user_latitude"], config["user_longitude"],
+        )
+        result = airnow.get_aqi()
+        if result and result.get("aqi") is not None:
+            return result
+    except Exception:
+        logger.warning("AirNow AQI unavailable.", exc_info=True)
+    return None
 
-    # Fallback to AirNow
-    if config.get("airnow_api_key"):
-        try:
-            airnow = AirNowClient(
-                config["airnow_api_key"], config["user_latitude"], config["user_longitude"],
-            )
-            result = airnow.get_aqi()
-            if result and result.get("aqi") is not None:
-                return result
-        except Exception:
-            logger.warning("AirNow also failed.", exc_info=True)
 
-    logger.warning("No AQI data available — proceeding without AQI gate.")
-    return {"aqi": 0, "source": "none"}
+def _fetch_purpleair(config: dict) -> dict | None:
+    """Fetch AQI from PurpleAir (metered — spends account points).
+
+    Returns the AQI dict on success, or ``None`` when no API key is configured
+    or the call fails / returns no value. Never raises. Uses the module-level
+    client singleton so its cross-cycle sensor-ID cache is preserved.
+    """
+    if not config.get("purpleair_api_key"):
+        return None
+    try:
+        pa = _get_purpleair_client(config)
+        result = pa.get_aqi()
+        if result and result.get("aqi") is not None:
+            return result
+    except Exception as exc:
+        # Surface the real reason inline (e.g. "402: Payment Required — out of
+        # points") so a config/account problem is visible in logs instead of
+        # being masked by the silent AirNow fallback.
+        logger.warning("PurpleAir AQI unavailable. Reason: %s", exc)
+    return None
+
+
+def _fetch_aqi(
+    config: dict,
+    last_state: str = "OPEN",
+    aqi_cache: dict | None = None,
+) -> dict:
+    """Fetch AQI with an AirNow-first, cost-aware provider order (Option B).
+
+    PurpleAir's read API is metered (points); AirNow is free. To conserve
+    PurpleAir points we query the FREE AirNow first and only spend PurpleAir
+    points when its higher local sensitivity to smoke can actually change the
+    decision — with a safety carve-out for open windows.
+
+    Let ``OPEN_BLOCK`` = ``min_aqi_for_opening`` (~50, "≥ this blocks opening")
+    and ``URGENT`` = ``max_aqi_threshold`` (~100, "≥ this force-closes open
+    windows"). For this floor's evaluation:
+
+      * AirNow fails / no value → query PurpleAir; it becomes the reading
+        (resilience — never lose the AQI gate).
+      * AirNow ≥ URGENT → skip PurpleAir; AirNow already triggers the urgent
+        force-close.
+      * AirNow in [OPEN_BLOCK, URGENT):
+          - windows CLOSED → skip PurpleAir (opening is already blocked; the
+            precise value can't change the decision).
+          - windows OPEN → query PurpleAir (a real local reading ≥ URGENT must
+            be caught to force-close); fall back to AirNow if PurpleAir fails.
+      * AirNow < OPEN_BLOCK (clean) → query PurpleAir (AirNow may lag a local
+        smoke event); fall back to AirNow's clean value if PurpleAir fails.
+
+    When PurpleAir is queried and succeeds, its reading wins (higher-sensitivity
+    source). When it is queried but fails, we fall back to the AirNow value —
+    never ending with no reading if AirNow gave one.
+
+    Args:
+        config: application config.
+        last_state: this floor's current window state ("OPEN" / "CLOSED").
+        aqi_cache: per-cycle cache so each provider is queried at most once and
+            the readings are reused across floors within the same cycle.
+
+    Returns:
+        A dict compatible with ``DecisionEngine.decide(aqi=...)`` — always at
+        least ``{"aqi": <value>, "source": <provider>}``. The ``source`` label
+        reflects which provider actually produced the returned value.
+    """
+    if aqi_cache is None:
+        aqi_cache = {}
+
+    open_block = int(config.get("min_aqi_for_opening", 50))
+    urgent = int(config.get("max_aqi_threshold", 100))
+
+    # --- AirNow first (free); fetched at most once per cycle. ---
+    if "airnow" not in aqi_cache:
+        aqi_cache["airnow"] = _fetch_airnow(config)
+    airnow = aqi_cache["airnow"]
+
+    def _purpleair() -> dict | None:
+        # PurpleAir fetched at most once per cycle, reused across floors.
+        if "purpleair" not in aqi_cache:
+            aqi_cache["purpleair"] = _fetch_purpleair(config)
+        return aqi_cache["purpleair"]
+
+    # AirNow failed / gave no value → PurpleAir becomes the reading (resilience).
+    if airnow is None or airnow.get("aqi") is None:
+        pa = _purpleair()
+        if pa is not None:
+            return pa
+        logger.warning("No AQI data available — proceeding without AQI gate.")
+        return {"aqi": 0, "source": "none"}
+
+    airnow_aqi = airnow["aqi"]
+
+    # AirNow already at the urgent force-close threshold → no need for PurpleAir.
+    if airnow_aqi >= urgent:
+        return airnow
+
+    # AirNow in the block-opening band [OPEN_BLOCK, URGENT).
+    if airnow_aqi >= open_block:
+        if last_state == "OPEN":
+            # Windows open: a real local reading ≥ URGENT must be caught to
+            # force-close, so spend the PurpleAir points here.
+            pa = _purpleair()
+            return pa if pa is not None else airnow
+        # Windows closed: opening is already blocked — the precise value can't
+        # change the decision, so keep AirNow's free reading.
+        return airnow
+
+    # AirNow says clean (< OPEN_BLOCK): AirNow may be lagging a local smoke
+    # event, so confirm with PurpleAir's higher-sensitivity reading.
+    pa = _purpleair()
+    return pa if pa is not None else airnow
 
 
 def _log_coolest_sensor(

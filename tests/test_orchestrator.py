@@ -102,56 +102,130 @@ class TestAuthFailure:
 
 
 # ------------------------------------------------------------------
-# AQI Source Preference
+# AQI Source Preference — AirNow-first with open-windows carve-out (Option B)
 # ------------------------------------------------------------------
 
 
 class TestAQISourcePreference:
-    """PurpleAir first, AirNow fallback."""
+    """AirNow-first, cost-aware ordering.
 
+    PurpleAir's read API is metered; AirNow is free. Query AirNow first and
+    only spend PurpleAir points when its higher local sensitivity can change
+    the decision — always querying it when windows are OPEN or AirNow is clean,
+    skipping it when AirNow already blocks/force-closes and the value can't
+    change the outcome. See _fetch_aqi Option B docstring.
+    """
+
+    # --- (a) AirNow already urgent → PurpleAir NOT called -----------------
     @patch("src.orchestrator.AirNowClient")
     @patch("src.orchestrator.PurpleAirClient")
-    def test_purpleair_used_when_available(self, mock_pa_cls, mock_an_cls):
-        """PurpleAir succeeds → AirNow not called."""
-        mock_pa = MagicMock()
-        mock_pa.get_aqi.return_value = {"aqi": 42, "source": "purpleair", "sensor_count": 3}
-        mock_pa_cls.return_value = mock_pa
-
-        config = _base_config()
-        result = _fetch_aqi(config)
-
-        assert result["aqi"] == 42
-        assert result["source"] == "purpleair"
-        mock_an_cls.assert_not_called()
-
-    @patch("src.orchestrator.AirNowClient")
-    @patch("src.orchestrator.PurpleAirClient")
-    def test_airnow_fallback_on_purpleair_failure(self, mock_pa_cls, mock_an_cls):
-        """PurpleAir raises → AirNow used as fallback."""
-        mock_pa = MagicMock()
-        mock_pa.get_aqi.side_effect = Exception("PurpleAir down")
-        mock_pa_cls.return_value = mock_pa
-
+    def test_airnow_urgent_skips_purpleair(self, mock_pa_cls, mock_an_cls):
+        """AirNow ≥ URGENT (100) → AirNow force-closes; PurpleAir not queried."""
         mock_an = MagicMock()
-        mock_an.get_aqi.return_value = {"aqi": 55, "source": "airnow"}
+        mock_an.get_aqi.return_value = {"aqi": 155, "source": "airnow"}
         mock_an_cls.return_value = mock_an
 
         config = _base_config()
-        result = _fetch_aqi(config)
+        # Even with windows OPEN, an already-urgent AirNow needs no PurpleAir.
+        result = _fetch_aqi(config, last_state="OPEN")
 
-        assert result["aqi"] == 55
+        assert result["aqi"] == 155
         assert result["source"] == "airnow"
+        mock_pa_cls.assert_not_called()
 
+    # --- (b) AirNow block-band + windows CLOSED → PurpleAir NOT called -----
     @patch("src.orchestrator.AirNowClient")
     @patch("src.orchestrator.PurpleAirClient")
-    def test_purpleair_402_reason_surfaced_in_log(self, mock_pa_cls, mock_an_cls, caplog):
-        """PurpleAir 402 (out of points) → reason logged inline, AirNow used.
+    def test_airnow_blockband_closed_skips_purpleair(self, mock_pa_cls, mock_an_cls):
+        """AirNow in [50, 100) + windows CLOSED → opening already blocked; no PurpleAir."""
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 72, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        config = _base_config()
+        result = _fetch_aqi(config, last_state="CLOSED")
+
+        assert result["aqi"] == 72
+        assert result["source"] == "airnow"
+        mock_pa_cls.assert_not_called()
+
+    # --- (c) AirNow block-band + windows OPEN → PurpleAir IS called --------
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_airnow_blockband_open_queries_purpleair_urgent(self, mock_pa_cls, mock_an_cls):
+        """AirNow in [50, 100) + windows OPEN → PurpleAir queried; a local ≥100 drives urgent close."""
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 72, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.return_value = {"aqi": 168, "source": "purpleair", "sensor_count": 3}
+        mock_pa_cls.return_value = mock_pa
+
+        config = _base_config()
+        result = _fetch_aqi(config, last_state="OPEN")
+
+        # PurpleAir's higher-sensitivity reading wins and exceeds URGENT.
+        assert result["aqi"] == 168
+        assert result["source"] == "purpleair"
+        mock_pa.get_aqi.assert_called_once()
+
+    # --- (d) AirNow clean → PurpleAir IS called (catches lagging smoke) ----
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_airnow_clean_queries_purpleair(self, mock_pa_cls, mock_an_cls):
+        """AirNow < 50 → PurpleAir queried since AirNow may lag a local smoke event."""
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 20, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.return_value = {"aqi": 130, "source": "purpleair", "sensor_count": 3}
+        mock_pa_cls.return_value = mock_pa
+
+        config = _base_config()
+        # Clean-AirNow branch queries PurpleAir regardless of window state.
+        result = _fetch_aqi(config, last_state="CLOSED")
+
+        assert result["aqi"] == 130
+        assert result["source"] == "purpleair"
+        mock_pa.get_aqi.assert_called_once()
+
+    # --- (e) AirNow fails → PurpleAir called as resilience fallback --------
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_airnow_fails_purpleair_resilience(self, mock_pa_cls, mock_an_cls):
+        """AirNow fails → PurpleAir becomes the reading (never lose the AQI gate)."""
+        mock_an = MagicMock()
+        mock_an.get_aqi.side_effect = Exception("AirNow down")
+        mock_an_cls.return_value = mock_an
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.return_value = {"aqi": 45, "source": "purpleair", "sensor_count": 3}
+        mock_pa_cls.return_value = mock_pa
+
+        config = _base_config()
+        result = _fetch_aqi(config, last_state="CLOSED")
+
+        assert result["aqi"] == 45
+        assert result["source"] == "purpleair"
+        mock_pa.get_aqi.assert_called_once()
+
+    # --- (f) PurpleAir queried but fails (402) → fall back to AirNow -------
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_purpleair_402_falls_back_to_airnow(self, mock_pa_cls, mock_an_cls, caplog):
+        """PurpleAir 402 (out of points) → fall back to AirNow value, reason logged, no crash.
 
         Regression guard: the payment/account failure must appear in logs so a
-        depleted PurpleAir balance is diagnosable, not silently masked by the
-        AirNow fallback.
+        depleted PurpleAir balance is diagnosable, not silently masked.
         """
         from src.purpleair_client import PurpleAirError
+
+        # AirNow clean → PurpleAir gets queried; then it 402s.
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 30, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
 
         mock_pa = MagicMock()
         mock_pa.get_aqi.side_effect = PurpleAirError(
@@ -159,46 +233,87 @@ class TestAQISourcePreference:
         )
         mock_pa_cls.return_value = mock_pa
 
-        mock_an = MagicMock()
-        mock_an.get_aqi.return_value = {"aqi": 55, "source": "airnow"}
-        mock_an_cls.return_value = mock_an
-
         config = _base_config()
         with caplog.at_level("WARNING", logger="windowbot"):
-            result = _fetch_aqi(config)
+            result = _fetch_aqi(config, last_state="OPEN")
 
+        assert result["aqi"] == 30
         assert result["source"] == "airnow"
         assert "402" in caplog.text
         assert "Payment Required" in caplog.text
 
-        """Both providers fail → AQI defaults to 0."""
-        mock_pa = MagicMock()
-        mock_pa.get_aqi.side_effect = Exception("PA down")
-        mock_pa_cls.return_value = mock_pa
+    def test_both_providers_fail_returns_zero(self):
+        """Both providers fail → AQI defaults to {"aqi": 0, "source": "none"}."""
+        with patch("src.orchestrator.AirNowClient") as mock_an_cls, \
+                patch("src.orchestrator.PurpleAirClient") as mock_pa_cls:
+            mock_an = MagicMock()
+            mock_an.get_aqi.side_effect = Exception("AN down")
+            mock_an_cls.return_value = mock_an
 
-        mock_an = MagicMock()
-        mock_an.get_aqi.side_effect = Exception("AN down")
-        mock_an_cls.return_value = mock_an
+            mock_pa = MagicMock()
+            mock_pa.get_aqi.side_effect = Exception("PA down")
+            mock_pa_cls.return_value = mock_pa
 
-        config = _base_config()
-        result = _fetch_aqi(config)
+            config = _base_config()
+            result = _fetch_aqi(config, last_state="OPEN")
 
         assert result["aqi"] == 0
         assert result["source"] == "none"
 
     @patch("src.orchestrator.AirNowClient")
     @patch("src.orchestrator.PurpleAirClient")
-    def test_no_purpleair_key_skips_to_airnow(self, mock_pa_cls, mock_an_cls):
-        """No PurpleAir API key → skips PurpleAir, goes to AirNow."""
+    def test_no_airnow_key_goes_straight_to_purpleair(self, mock_pa_cls, mock_an_cls):
+        """No AirNow API key → AirNow treated as failed; PurpleAir is the reading."""
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.return_value = {"aqi": 42, "source": "purpleair", "sensor_count": 3}
+        mock_pa_cls.return_value = mock_pa
+
+        config = _base_config(airnow_api_key="")
+        result = _fetch_aqi(config, last_state="CLOSED")
+
+        assert result["source"] == "purpleair"
+        mock_an_cls.assert_not_called()
+
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_no_purpleair_key_uses_airnow(self, mock_pa_cls, mock_an_cls):
+        """No PurpleAir API key → AirNow value used even when PurpleAir would be queried."""
         mock_an = MagicMock()
         mock_an.get_aqi.return_value = {"aqi": 30, "source": "airnow"}
         mock_an_cls.return_value = mock_an
 
+        # AirNow clean would normally query PurpleAir, but no key → skip it.
         config = _base_config(purpleair_api_key="")
-        result = _fetch_aqi(config)
+        result = _fetch_aqi(config, last_state="OPEN")
 
+        assert result["aqi"] == 30
         assert result["source"] == "airnow"
         mock_pa_cls.assert_not_called()
+
+    # --- (g) once-per-cycle: shared cache keeps each provider to one call --
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_shared_cache_one_call_per_provider(self, mock_pa_cls, mock_an_cls):
+        """Two floors sharing an aqi_cache → AirNow and PurpleAir each queried once."""
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 30, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.return_value = {"aqi": 44, "source": "purpleair", "sensor_count": 3}
+        mock_pa_cls.return_value = mock_pa
+
+        config = _base_config()
+        cache: dict = {}
+        # Simulate two floors in one cycle (both clean-AirNow → both want PurpleAir).
+        r1 = _fetch_aqi(config, last_state="OPEN", aqi_cache=cache)
+        r2 = _fetch_aqi(config, last_state="CLOSED", aqi_cache=cache)
+
+        assert r1["source"] == "purpleair"
+        assert r2["source"] == "purpleair"
+        # Providers constructed and queried at most once despite two floors.
+        mock_an.get_aqi.assert_called_once()
+        mock_pa.get_aqi.assert_called_once()
 
 
 # ------------------------------------------------------------------
@@ -217,6 +332,11 @@ class TestPurpleAirClientPersistence:
         mock_pa.get_aqi.return_value = {"aqi": 42, "source": "purpleair"}
         mock_pa_cls.return_value = mock_pa
 
+        # Clean AirNow each cycle → PurpleAir always queried (confirm no smoke).
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 10, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
         config = _base_config()
         _fetch_aqi(config)
         _fetch_aqi(config)
@@ -225,14 +345,18 @@ class TestPurpleAirClientPersistence:
         # Constructed once; the same instance (and its cache) serves later cycles.
         assert mock_pa_cls.call_count == 1
         assert mock_pa.get_aqi.call_count == 3
-        mock_an_cls.assert_not_called()
 
+    @patch("src.orchestrator.AirNowClient")
     @patch("src.orchestrator.PurpleAirClient")
-    def test_cache_ttl_passed_from_config(self, mock_pa_cls):
+    def test_cache_ttl_passed_from_config(self, mock_pa_cls, mock_an_cls):
         """The configurable cache TTL is threaded into the client constructor."""
         mock_pa = MagicMock()
         mock_pa.get_aqi.return_value = {"aqi": 10, "source": "purpleair"}
         mock_pa_cls.return_value = mock_pa
+
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 10, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
 
         config = _base_config(purpleair_sensor_cache_hours=6.0)
         _fetch_aqi(config)
@@ -240,12 +364,17 @@ class TestPurpleAirClientPersistence:
         _, kwargs = mock_pa_cls.call_args
         assert kwargs["sensor_cache_ttl_hours"] == 6.0
 
+    @patch("src.orchestrator.AirNowClient")
     @patch("src.orchestrator.PurpleAirClient")
-    def test_client_rebuilt_when_location_changes(self, mock_pa_cls):
+    def test_client_rebuilt_when_location_changes(self, mock_pa_cls, mock_an_cls):
         """Changing lat/lon invalidates the singleton and rebuilds the client."""
         mock_pa = MagicMock()
         mock_pa.get_aqi.return_value = {"aqi": 10, "source": "purpleair"}
         mock_pa_cls.return_value = mock_pa
+
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 10, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
 
         _fetch_aqi(_base_config())
         _fetch_aqi(_base_config(user_latitude=41.0))
@@ -740,7 +869,8 @@ class TestConditionalAqiPolling:
 
         run_check()
 
-        mock_fetch_aqi.assert_called_once()
+        # AQI is fetched (not skipped) — once per floor under the per-floor carve-out.
+        assert mock_fetch_aqi.call_count == 2
 
     # ------------------------------------------------------------------
     # 4. AQI fetched when windows closed but temperature favors opening
@@ -769,10 +899,11 @@ class TestConditionalAqiPolling:
 
         run_check()
 
-        mock_fetch_aqi.assert_called_once()
+        # AQI is fetched (not skipped) — once per floor under the per-floor carve-out.
+        assert mock_fetch_aqi.call_count == 2
 
     # ------------------------------------------------------------------
-    # 5. AQI cached across floors in same run_check cycle
+    # 5. AQI provider readings shared across floors in same run_check cycle
     # ------------------------------------------------------------------
 
     @patch("src.orchestrator._evaluate_floor")
@@ -782,11 +913,17 @@ class TestConditionalAqiPolling:
     @patch("src.orchestrator.EcobeeClient")
     @patch("src.orchestrator.get_state_manager")
     @patch("src.orchestrator.get_config")
-    def test_aqi_cached_across_floors(
+    def test_aqi_cache_shared_across_floors(
         self, mock_config, mock_state_cls, mock_ecobee_cls,
         mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
     ):
-        """Both floors need AQI (OPEN) → _fetch_aqi called exactly once."""
+        """Both floors need AQI (OPEN) → _fetch_aqi called per floor with ONE shared cache.
+
+        Under AirNow-first the carve-out decision is per floor (it depends on
+        each floor's window state), so _fetch_aqi is invoked once per floor —
+        but they share a single aqi_cache dict so each provider is still fetched
+        at most once per cycle.
+        """
         self._setup_run_check_mocks(
             mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
             sensor_temps={"sensor_up": 74.0, "sensor_down": 74.0},
@@ -799,9 +936,13 @@ class TestConditionalAqiPolling:
 
         run_check()
 
-        # Single fetch despite two floors needing AQI
-        mock_fetch_aqi.assert_called_once()
-        # Both floors evaluated with the cached result
+        # One _fetch_aqi call per floor (the carve-out is per-floor)...
+        assert mock_fetch_aqi.call_count == 2
+        # ...but all calls thread the SAME aqi_cache dict — so providers stay
+        # capped at one fetch each per cycle.
+        caches = [c.kwargs["aqi_cache"] for c in mock_fetch_aqi.call_args_list]
+        assert caches[0] is caches[1]
+        # Both floors evaluated with the returned result
         assert mock_eval_floor.call_count == 2
         for eval_call in mock_eval_floor.call_args_list:
             assert eval_call.args[4] == aqi_result  # aqi_data positional arg
@@ -822,7 +963,12 @@ class TestConditionalAqiPolling:
         self, mock_config, mock_state_cls, mock_ecobee_cls,
         mock_nws_cls, mock_om_cls, mock_pa_cls, mock_an_cls, mock_eval_floor,
     ):
-        """PurpleAir fails when AQI IS needed → AirNow fallback used."""
+        """Windows OPEN + AirNow block-band, PurpleAir fails → AirNow fallback used.
+
+        Both floors OPEN with AirNow at 55 (block band) → the carve-out queries
+        PurpleAir; it fails → each floor falls back to AirNow's value. The shared
+        cache keeps both providers to a single call across the two floors.
+        """
         self._setup_run_check_mocks(
             mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
             sensor_temps={"sensor_up": 74.0, "sensor_down": 74.0},
@@ -836,19 +982,137 @@ class TestConditionalAqiPolling:
         mock_pa.get_aqi.side_effect = Exception("PurpleAir down")
         mock_pa_cls.return_value = mock_pa
 
-        # AirNow succeeds
+        # AirNow succeeds (block band)
         mock_an = MagicMock()
         mock_an.get_aqi.return_value = {"aqi": 55, "source": "airnow"}
         mock_an_cls.return_value = mock_an
 
         run_check()
 
-        # AirNow was used as fallback
+        # Each provider queried at most once despite two floors (shared cache).
         mock_an.get_aqi.assert_called_once()
-        # _evaluate_floor received the AirNow result
+        mock_pa.get_aqi.assert_called_once()
+        # _evaluate_floor received the AirNow fallback result for both floors
         assert mock_eval_floor.call_count == 2
         for eval_call in mock_eval_floor.call_args_list:
             assert eval_call.args[4]["source"] == "airnow"
+
+    # ------------------------------------------------------------------
+    # 6b. Per-floor carve-out: OPEN floor spends PurpleAir, CLOSED floor doesn't
+    # ------------------------------------------------------------------
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_per_floor_carveout_open_vs_closed(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_om_cls, mock_pa_cls, mock_an_cls, mock_eval_floor,
+    ):
+        """AirNow block-band (72): OPEN floor queries PurpleAir, CLOSED floor uses AirNow.
+
+        upstairs=OPEN, downstairs=CLOSED, both need AQI. AirNow returns 72 (in
+        [50, 100)). The OPEN floor must catch a real local ≥100 → PurpleAir is
+        queried once (and its value wins). The CLOSED floor is already blocked
+        from opening → it reuses AirNow's value, spending no extra points.
+        """
+        mock_config.return_value = _base_config()
+
+        # Per-floor window state via a keyed side_effect.
+        def _floor_state(key):
+            if key == "upstairs":
+                return {"CurrentState": "OPEN"}
+            if key == "downstairs":
+                return {"CurrentState": "CLOSED"}
+            return {}  # __global__ cold-starts outdoor validation
+
+        mock_state = MagicMock()
+        mock_state.get_floor_state.side_effect = _floor_state
+        mock_state_cls.return_value = mock_state
+
+        # Indoor 78°F so the CLOSED floor's non-AQI gates still favor opening
+        # (→ it genuinely needs AQI), outdoor 65°F cool enough to open.
+        mock_ecobee = MagicMock()
+        mock_ecobee.get_sensors.return_value = [
+            {"name": "sensor_up", "temperature_f": 78.0, "is_online": True},
+            {"name": "sensor_down", "temperature_f": 78.0, "is_online": True},
+        ]
+        mock_ecobee.get_hvac_mode.return_value = "cool"
+        mock_ecobee_cls.return_value = mock_ecobee
+
+        mock_nws = MagicMock()
+        mock_nws.get_outdoor_conditions.return_value = {
+            "temperature_f": 65.0, "humidity": 50.0,
+        }
+        mock_nws_cls.return_value = mock_nws
+        mock_om_cls.return_value.get_observation.side_effect = OpenMeteoError("no peer")
+
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 72, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.return_value = {"aqi": 168, "source": "purpleair", "sensor_count": 3}
+        mock_pa_cls.return_value = mock_pa
+
+        run_check()
+
+        # AirNow fetched once (shared cache); PurpleAir fetched once — only the
+        # OPEN floor triggered it, and the CLOSED floor reused the cached reading.
+        mock_an.get_aqi.assert_called_once()
+        mock_pa.get_aqi.assert_called_once()
+
+        # Map each _evaluate_floor call to its floor name → aqi source used.
+        source_by_floor = {
+            c.args[0]: c.args[4]["source"] for c in mock_eval_floor.call_args_list
+        }
+        assert source_by_floor["upstairs"] == "purpleair"   # OPEN → PurpleAir wins
+        assert source_by_floor["downstairs"] == "airnow"    # CLOSED → AirNow reused
+
+    # ------------------------------------------------------------------
+    # 6c. Once-per-cycle: two OPEN floors → each provider queried once
+    # ------------------------------------------------------------------
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_once_per_cycle_two_floors_single_provider_calls(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_om_cls, mock_pa_cls, mock_an_cls, mock_eval_floor,
+    ):
+        """Two OPEN floors, AirNow clean → AirNow and PurpleAir each called exactly once."""
+        self._setup_run_check_mocks(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
+            sensor_temps={"sensor_up": 74.0, "sensor_down": 74.0},
+            hvac_mode="cool",
+            outdoor_temp=68.0,
+            current_state="OPEN",
+        )
+
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 20, "source": "airnow"}  # clean
+        mock_an_cls.return_value = mock_an
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.return_value = {"aqi": 44, "source": "purpleair", "sensor_count": 3}
+        mock_pa_cls.return_value = mock_pa
+
+        run_check()
+
+        mock_an.get_aqi.assert_called_once()
+        mock_pa.get_aqi.assert_called_once()
+        assert mock_eval_floor.call_count == 2
+        for eval_call in mock_eval_floor.call_args_list:
+            assert eval_call.args[4]["source"] == "purpleair"
 
     # ------------------------------------------------------------------
     # 7. AQI skip reason logged
