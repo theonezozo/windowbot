@@ -384,6 +384,211 @@ class TestOutdoorFreshnessBucketRendering:
 
 
 # ------------------------------------------------------------------
+# Dual-provider AQI display (both readings when both providers checked)
+# ------------------------------------------------------------------
+
+
+class TestDualProviderAQIDisplay:
+    """When both AirNow and PurpleAir were queried in a cycle the status page
+    shows BOTH labeled readings and marks the authoritative one. When only one
+    was checked, only that one renders (never a "PurpleAir: None" line).
+    Snapshots predating ``aqi_readings`` fall back to the single-value view.
+    """
+
+    def _aqi_section(self, snap) -> str:
+        from src.status_page import _render_environment_section
+        return _render_environment_section(snap).split("Air Quality")[1]
+
+    def test_both_readings_rendered_and_authoritative_marked(self):
+        """Both providers present → both labeled; PurpleAir marked authoritative."""
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 155
+        snap.aqi_source = "purpleair"
+        snap.aqi_readings = {"airnow": 42, "purpleair": 155}
+
+        aqi = self._aqi_section(snap)
+        assert "AirNow:" in aqi
+        assert "PurpleAir:" in aqi
+        assert ">42<" in aqi
+        assert ">155" in aqi
+        # Authoritative marker sits with the PurpleAir value (the driving source).
+        assert "driving decision" in aqi
+        pa_idx = aqi.index("PurpleAir:")
+        an_idx = aqi.index("AirNow:")
+        # The badge follows the PurpleAir value, not the AirNow value.
+        assert aqi.index("driving decision") > pa_idx
+        assert aqi.index("driving decision") > an_idx
+
+    def test_both_readings_authoritative_can_be_airnow(self):
+        """When AirNow is authoritative, its value carries the driving marker."""
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 130
+        snap.aqi_source = "airnow"
+        snap.aqi_readings = {"airnow": 130, "purpleair": 44}
+
+        aqi = self._aqi_section(snap)
+        assert "AirNow:" in aqi
+        assert "PurpleAir:" in aqi
+        assert "driving decision" in aqi
+        # Badge attaches to the AirNow value.
+        assert aqi.index("driving decision") > aqi.index("AirNow:")
+        assert aqi.index("driving decision") < aqi.index("PurpleAir:")
+
+    def test_single_provider_no_none_line(self):
+        """Only AirNow checked (purpleair None) → no PurpleAir line, no 'None'."""
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 72
+        snap.aqi_source = "airnow"
+        snap.aqi_readings = {"airnow": 72, "purpleair": None}
+
+        aqi = self._aqi_section(snap)
+        assert "72" in aqi
+        assert "PurpleAir:" not in aqi
+        assert "None" not in aqi
+        assert "driving decision" not in aqi
+
+    def test_single_provider_purpleair_only(self):
+        """Only PurpleAir present (AirNow failed) → no AirNow line, no 'None'."""
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 90
+        snap.aqi_source = "purpleair"
+        snap.aqi_readings = {"airnow": None, "purpleair": 90}
+
+        aqi = self._aqi_section(snap)
+        assert "90" in aqi
+        assert "AirNow:" not in aqi
+        assert "None" not in aqi
+
+    def test_legacy_snapshot_single_value_fallback(self):
+        """No aqi_readings (old snapshot) → original single AQI + Source view."""
+        snap = _floor_snapshot("upstairs")  # aqi_readings defaults to None
+        snap.aqi_value = 25
+        snap.aqi_source = "purpleair"
+
+        aqi = self._aqi_section(snap)
+        assert "25" in aqi
+        assert "Source:" in aqi
+        assert "purpleair" in aqi
+        assert "None" not in aqi
+
+    def test_source_none_shows_per_provider_reasons(self):
+        """Both providers empty (source none) → per-provider failure reasons are
+        rendered instead of a bare "Source: none"."""
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 0
+        snap.aqi_source = "none"
+        snap.aqi_readings = {"airnow": None, "purpleair": None}
+        snap.aqi_reasons = {
+            "airnow": "no API key configured",
+            "purpleair": "402: Payment Required — out of points",
+        }
+
+        aqi = self._aqi_section(snap)
+        # Explains WHY each provider is empty.
+        assert "AirNow:" in aqi
+        assert "PurpleAir:" in aqi
+        assert "no API key configured" in aqi
+        assert "402" in aqi
+        assert "unavailable" in aqi
+        # Never the bare sentinel word on its own line.
+        assert ">none<" not in aqi
+
+    def test_source_none_missing_reasons_degrades_gracefully(self):
+        """Legacy 'none' snapshot without aqi_reasons still renders, no crash."""
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 0
+        snap.aqi_source = "none"
+        snap.aqi_readings = {"airnow": None, "purpleair": None}
+        # aqi_reasons defaults to None (pre-diagnostics snapshot).
+
+        aqi = self._aqi_section(snap)
+        assert "AirNow:" in aqi
+        assert "PurpleAir:" in aqi
+        assert "unavailable" in aqi
+
+
+# ------------------------------------------------------------------
+# AQI skip-reason display (cost-skip honesty — source == "skipped")
+# ------------------------------------------------------------------
+
+
+class TestAQISkipReasonDisplay:
+    """When a floor's AQI is intentionally not fetched (the cost-skip working
+    as designed because the floor can't open regardless), the status page shows
+    "AQI: not checked — <reason>" instead of a misleading "AQI 0, source:
+    skipped". The skip itself is correct; the page is only made honest about it.
+    """
+
+    def _aqi_section(self, snap) -> str:
+        from src.status_page import _render_environment_section
+        return _render_environment_section(snap).split("Air Quality")[1]
+
+    def test_skipped_shows_not_checked_with_reason(self):
+        """source == 'skipped' with a reason → 'not checked — <reason>'."""
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 0
+        snap.aqi_source = "skipped"
+        snap.aqi_skip_reason = "outdoor not cool enough to open (76.0°F ≥ 74.9°F)"
+
+        aqi = self._aqi_section(snap)
+        assert "not checked" in aqi
+        assert "outdoor not cool enough to open" in aqi
+        assert "76.0°F" in aqi
+
+    def test_skipped_never_renders_bare_aqi_zero(self):
+        """A skipped reading must NOT surface a misleading '0' or 'skipped'."""
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 0
+        snap.aqi_source = "skipped"
+        snap.aqi_skip_reason = "indoor already comfortable"
+
+        aqi = self._aqi_section(snap)
+        assert "indoor already comfortable" in aqi
+        # No bare "AQI 0" value line and no raw "skipped" source line.
+        assert ">0<" not in aqi
+        assert "aqi-good" not in aqi
+        assert ">skipped<" not in aqi
+
+    def test_skipped_legacy_snapshot_without_reason_degrades_gracefully(self):
+        """Legacy skipped snapshot (no aqi_skip_reason) still renders, no crash,
+        never 'None'."""
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 0
+        snap.aqi_source = "skipped"
+        # aqi_skip_reason defaults to None (pre-change snapshot).
+
+        aqi = self._aqi_section(snap)
+        assert "not checked" in aqi
+        assert "None" not in aqi
+        assert ">0<" not in aqi
+
+    def test_real_reading_display_unchanged(self):
+        """A real single-provider reading is untouched by the skip handling."""
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 25
+        snap.aqi_source = "purpleair"
+
+        aqi = self._aqi_section(snap)
+        assert "25" in aqi
+        assert "Source:" in aqi
+        assert "purpleair" in aqi
+        assert "not checked" not in aqi
+
+    def test_real_dual_reading_display_unchanged(self):
+        """Dual-provider display still works alongside the skip handling."""
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 155
+        snap.aqi_source = "purpleair"
+        snap.aqi_readings = {"airnow": 42, "purpleair": 155}
+
+        aqi = self._aqi_section(snap)
+        assert "AirNow:" in aqi
+        assert "PurpleAir:" in aqi
+        assert "driving decision" in aqi
+        assert "not checked" not in aqi
+
+
+# ------------------------------------------------------------------
 # Build-info footer (deploy-stamped version surface)
 # ------------------------------------------------------------------
 #

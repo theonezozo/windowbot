@@ -1064,3 +1064,131 @@ class TestFloorDecision:
         result = _decide(engine, indoor_temps=[74.0], outdoor_temp=68.0, aqi=30)
         assert isinstance(result.reason, str)
         assert len(result.reason) > 0
+
+
+# ==================================================================
+# needs_aqi — OPEN-window safety invariant
+# ==================================================================
+
+
+def _needs(
+    engine: DecisionEngine,
+    *,
+    indoor_temps: list[float] | None = None,
+    outdoor_temp: float = 68.0,
+    humidity: float = 50.0,
+    hvac_mode: str = "cool",
+    last_state: str = "OPEN",
+    sensor_names: list[str] | None = None,
+    floor_group: list[str] | None = None,
+) -> tuple[bool, str]:
+    """Convenience wrapper around ``engine.needs_aqi`` with sane defaults."""
+    if indoor_temps is None:
+        indoor_temps = [74.0]
+    sensors = make_sensors(indoor_temps, names=sensor_names)
+    if floor_group is None:
+        floor_group = [s["name"] for s in sensors]
+    return engine.needs_aqi(
+        floor_sensors=sensors,
+        outdoor=outdoor_conditions(outdoor_temp, humidity),
+        hvac_mode=hvac_mode,
+        last_state=last_state,
+        floor_group=floor_group,
+    )
+
+
+class TestNeedsAqiOpenSafety:
+    """The OPEN-window safety invariant for :meth:`DecisionEngine.needs_aqi`.
+
+    SAFETY RULE: if a floor's window is OPEN, ``needs_aqi`` MUST return
+    ``(True, ...)`` so an AQI reading is always fetched for the urgent
+    force-close check — regardless of HVAC mode, humidity, comfort, or outdoor
+    temperature gates. The ONLY exception is a globally-disabled AQI gate
+    (``enable_aqi_gate=False``). These tests lock that ordering so a future
+    gate change can never silently skip AQI on an open window.
+    """
+
+    def test_open_beats_hvac_mode_off(self, engine):
+        """OPEN + HVAC off/away → still fetch (OPEN wins over HVAC gate)."""
+        needs, _ = _needs(engine, last_state="OPEN", hvac_mode="off")
+        assert needs is True
+
+    def test_open_beats_hvac_mode_heat(self, engine):
+        """OPEN + HVAC 'heat' (not allowed) → still fetch."""
+        needs, _ = _needs(engine, last_state="OPEN", hvac_mode="heat")
+        assert needs is True
+
+    def test_open_beats_high_humidity(self, engine):
+        """OPEN + outdoor humidity 95% (> 80% max) → still fetch."""
+        needs, _ = _needs(engine, last_state="OPEN", humidity=95.0)
+        assert needs is True
+
+    def test_open_beats_indoor_comfortable(self, engine):
+        """OPEN + indoor 70°F (≤ 72°F comfort max) → still fetch."""
+        needs, _ = _needs(engine, last_state="OPEN", indoor_temps=[70.0])
+        assert needs is True
+
+    def test_open_beats_outdoor_not_cool(self, engine):
+        """OPEN + outdoor warmer than indoor (opening not favored) → still fetch."""
+        needs, _ = _needs(
+            engine, last_state="OPEN", indoor_temps=[74.0], outdoor_temp=80.0
+        )
+        assert needs is True
+
+    def test_open_beats_all_gates_combined(self, engine):
+        """OPEN + every suppressing condition at once → still fetch."""
+        needs, reason = _needs(
+            engine,
+            last_state="OPEN",
+            hvac_mode="off",
+            humidity=95.0,
+            indoor_temps=[70.0],
+            outdoor_temp=85.0,
+        )
+        assert needs is True
+        assert "open" in reason.lower()
+
+    @pytest.mark.parametrize("raw_state", ["open", " OPEN ", "Open", "oPeN\n"])
+    def test_open_detected_regardless_of_case_or_whitespace(self, engine, raw_state):
+        """Non-canonical OPEN records (case/whitespace) must still fetch AQI.
+
+        Regression guard: a mis-cased "open" must NOT be coerced to CLOSED and
+        skip the safety fetch. Uses a comfortable indoor temp so the CLOSED
+        branch would otherwise SKIP — proving OPEN normalisation is what wins.
+        """
+        needs, _ = _needs(engine, last_state=raw_state, indoor_temps=[70.0])
+        assert needs is True
+
+    def test_disabled_gate_skips_even_when_open(self, default_config):
+        """enable_aqi_gate=False → skip AQI even for an OPEN window (global off)."""
+        eng = DecisionEngine({**default_config, "enable_aqi_gate": False})
+        needs, reason = _needs(eng, last_state="OPEN")
+        assert needs is False
+        assert "disabled" in reason.lower()
+
+    # -- CLOSED-branch alignment (sanity: skip only when opening is blocked) --
+
+    def test_closed_and_comfortable_skips(self, engine):
+        """CLOSED + indoor comfortable (≤72°F) → skip (opening blocked)."""
+        needs, _ = _needs(engine, last_state="CLOSED", indoor_temps=[70.0])
+        assert needs is False
+
+    def test_closed_and_outdoor_not_cool_skips(self, engine):
+        """CLOSED + outdoor not cool enough to open → skip."""
+        needs, _ = _needs(
+            engine, last_state="CLOSED", indoor_temps=[74.0], outdoor_temp=80.0
+        )
+        assert needs is False
+
+    def test_closed_but_temp_favors_opening_fetches(self, engine):
+        """CLOSED + warm indoor + cool outdoor → fetch to confirm safe."""
+        needs, _ = _needs(
+            engine, last_state="CLOSED", indoor_temps=[78.0], outdoor_temp=65.0
+        )
+        assert needs is True
+
+    def test_unknown_state_treated_as_closed(self, engine):
+        """UNKNOWN/initial state normalises to CLOSED (safe default)."""
+        # Comfortable indoor → CLOSED branch skips; proves UNKNOWN != OPEN.
+        needs, _ = _needs(engine, last_state="UNKNOWN", indoor_temps=[70.0])
+        assert needs is False

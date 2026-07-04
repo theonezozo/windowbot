@@ -81,6 +81,23 @@ class FloorSnapshot:
     timestamp: str
     outdoor_observation_time: str | None = None
     aqi_observation_time: str | None = None
+    # Per-provider AQI readings captured during the AirNow-first gate. Shape:
+    # ``{"airnow": <int|None>, "purpleair": <int|None>}`` — a provider is None
+    # when it wasn't queried this cycle or failed. Display-only: ``aqi_value``
+    # / ``aqi_source`` remain the authoritative value that drove the decision.
+    aqi_readings: dict | None = None
+    # Per-provider failure reasons when a provider produced no reading this
+    # cycle. Shape: ``{"airnow": <reason>, "purpleair": <reason>}`` (only
+    # failing providers appear). Display-only: lets the status page explain a
+    # "source: none" (missing key / 402 / no stations) instead of a bare
+    # sentinel. Never affects the authoritative aqi/source.
+    aqi_reasons: dict | None = None
+    # Human-readable reason the AQI fetch was skipped this cycle (source ==
+    # "skipped"): e.g. "outdoor not cool enough to open (76.0°F ≥ 74.9°F)",
+    # "indoor already comfortable", "HVAC not in cooling mode". Display-only so
+    # the status page can show "not checked — <reason>" instead of a misleading
+    # "AQI 0". None for legacy snapshots and any non-skipped cycle.
+    aqi_skip_reason: str | None = None
     # Newest contributor timestamp + total contributor count for the outdoor
     # median pool. Lets the status page render a range ("Xm–Ym ago") when
     # contributors span ages; ``outdoor_observation_time`` remains the oldest
@@ -112,6 +129,12 @@ class FloorSnapshot:
         obj.setdefault("outdoor_newest_observation_time", None)
         obj.setdefault("outdoor_contributor_count", None)
         obj.setdefault("outdoor_validation_reason", None)
+        # Tolerate snapshots written before dual-provider AQI readings existed.
+        obj.setdefault("aqi_readings", None)
+        # Tolerate snapshots written before per-provider failure reasons existed.
+        obj.setdefault("aqi_reasons", None)
+        # Tolerate snapshots written before the AQI skip reason existed.
+        obj.setdefault("aqi_skip_reason", None)
         return cls(**obj)
 
 

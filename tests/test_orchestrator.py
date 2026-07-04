@@ -317,6 +317,240 @@ class TestAQISourcePreference:
 
 
 # ------------------------------------------------------------------
+# AQI dual readings — carry BOTH providers' values for status-page display
+# ------------------------------------------------------------------
+
+
+class TestAQIDualReadings:
+    """``_fetch_aqi`` attaches a display-only ``readings`` dict carrying each
+    provider's AQI for the cycle. It never changes the authoritative
+    ``aqi``/``source`` that drive the decision — it only records what BOTH
+    providers reported (or None when a provider wasn't queried / failed).
+    """
+
+    # --- both checked: AirNow clean → PurpleAir queried, PurpleAir wins ----
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_both_checked_carries_both_readings(self, mock_pa_cls, mock_an_cls):
+        """AirNow < 50 queries PurpleAir → readings holds BOTH values; the
+        authoritative value stays PurpleAir (unchanged decision)."""
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 42, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.return_value = {"aqi": 155, "source": "purpleair", "sensor_count": 3}
+        mock_pa_cls.return_value = mock_pa
+
+        result = _fetch_aqi(_base_config(), last_state="CLOSED")
+
+        # Authoritative value is unchanged: PurpleAir won.
+        assert result["aqi"] == 155
+        assert result["source"] == "purpleair"
+        # Both readings preserved for display.
+        assert result["readings"] == {"airnow": 42, "purpleair": 155}
+
+    # --- both checked (block-band + OPEN): PurpleAir wins, both carried -----
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_both_checked_blockband_open(self, mock_pa_cls, mock_an_cls):
+        """AirNow in [50,100) + windows OPEN → PurpleAir queried; both carried."""
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 72, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.return_value = {"aqi": 168, "source": "purpleair", "sensor_count": 3}
+        mock_pa_cls.return_value = mock_pa
+
+        result = _fetch_aqi(_base_config(), last_state="OPEN")
+
+        assert result["source"] == "purpleair"
+        assert result["readings"] == {"airnow": 72, "purpleair": 168}
+
+    # --- AirNow-only: urgent short-circuit → PurpleAir NOT queried ---------
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_airnow_only_urgent_shortcircuit(self, mock_pa_cls, mock_an_cls):
+        """AirNow ≥ 100 skips PurpleAir → readings shows airnow value, purpleair None."""
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 155, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        result = _fetch_aqi(_base_config(), last_state="OPEN")
+
+        assert result["aqi"] == 155
+        assert result["source"] == "airnow"
+        assert result["readings"] == {"airnow": 155, "purpleair": None}
+        mock_pa_cls.assert_not_called()
+
+    # --- AirNow-only: block-band + CLOSED → PurpleAir NOT queried ----------
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_airnow_only_blockband_closed(self, mock_pa_cls, mock_an_cls):
+        """AirNow in [50,100) + windows CLOSED skips PurpleAir → purpleair None."""
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 72, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        result = _fetch_aqi(_base_config(), last_state="CLOSED")
+
+        assert result["readings"] == {"airnow": 72, "purpleair": None}
+        mock_pa_cls.assert_not_called()
+
+    # --- PurpleAir queried but fails → fall back, purpleair reading None ---
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_purpleair_failed_fallback_readings(self, mock_pa_cls, mock_an_cls):
+        """AirNow clean queries PurpleAir; PurpleAir fails → fall back to AirNow.
+        readings carries the AirNow value with purpleair None (queried, failed)."""
+        from src.purpleair_client import PurpleAirError
+
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 30, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.side_effect = PurpleAirError("402: Payment Required — out of points")
+        mock_pa_cls.return_value = mock_pa
+
+        result = _fetch_aqi(_base_config(), last_state="OPEN")
+
+        assert result["aqi"] == 30
+        assert result["source"] == "airnow"
+        assert result["readings"] == {"airnow": 30, "purpleair": None}
+
+    # --- both providers fail → readings both None, no crash ---------------
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_both_fail_readings_both_none(self, mock_pa_cls, mock_an_cls):
+        """Both providers fail → readings is {airnow: None, purpleair: None}."""
+        mock_an = MagicMock()
+        mock_an.get_aqi.side_effect = Exception("AN down")
+        mock_an_cls.return_value = mock_an
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.side_effect = Exception("PA down")
+        mock_pa_cls.return_value = mock_pa
+
+        result = _fetch_aqi(_base_config(), last_state="OPEN")
+
+        assert result["source"] == "none"
+        assert result["readings"] == {"airnow": None, "purpleair": None}
+
+    # --- AirNow reading is not lost when PurpleAir wins (regression) -------
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_airnow_reading_survives_purpleair_win(self, mock_pa_cls, mock_an_cls):
+        """Regression: before this change the PurpleAir dict replaced AirNow's
+        entirely, losing AirNow's value. readings must still expose AirNow."""
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 18, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.return_value = {"aqi": 140, "source": "purpleair", "sensor_count": 3}
+        mock_pa_cls.return_value = mock_pa
+
+        result = _fetch_aqi(_base_config(), last_state="CLOSED")
+
+        assert result["readings"]["airnow"] == 18
+        assert result["readings"]["purpleair"] == 140
+
+
+# ------------------------------------------------------------------
+# AQI failure reasons — explain a "source: none" instead of a bare sentinel
+# ------------------------------------------------------------------
+
+
+class TestAQIFailureReasons:
+    """When a provider produces no reading, ``_fetch_aqi`` records WHY in a
+    display-only ``aqi_reasons`` dict so the status page / logs can distinguish
+    a config/account gap (missing key, 402 out-of-points, no stations) from a
+    silent breakage. Never affects the authoritative aqi/source.
+    """
+
+    # --- Regression guard: a valid AirNow reading must NOT collapse to none --
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_airnow_value_not_collapsed_to_none(self, mock_pa_cls, mock_an_cls):
+        """AirNow returns a valid AQI and PurpleAir is NOT queried (urgent
+        short-circuit) → source is "airnow" with that value, NEVER "none".
+
+        This is the exact regression the "AQI 0, source: none" symptom would
+        represent if the AirNow-first refactor dropped a good AirNow reading.
+        """
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 155, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        result = _fetch_aqi(_base_config(), last_state="OPEN")
+
+        assert result["source"] == "airnow"
+        assert result["aqi"] == 155
+        assert result["source"] != "none"
+        # No failure reasons attached when AirNow succeeded and PA wasn't needed.
+        assert "aqi_reasons" not in result
+        mock_pa_cls.assert_not_called()
+
+    # --- Both fail → reasons captured for BOTH providers ------------------
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_both_fail_captures_reasons(self, mock_pa_cls, mock_an_cls):
+        """Both providers raise → source "none" AND aqi_reasons explains each."""
+        mock_an = MagicMock()
+        mock_an.get_aqi.side_effect = Exception("AirNow API error (403): Invalid API_KEY")
+        mock_an_cls.return_value = mock_an
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.side_effect = Exception("402: Payment Required — out of points")
+        mock_pa_cls.return_value = mock_pa
+
+        result = _fetch_aqi(_base_config(), last_state="OPEN")
+
+        assert result["source"] == "none"
+        assert result["aqi"] == 0
+        reasons = result["aqi_reasons"]
+        assert "403" in reasons["airnow"]
+        assert "402" in reasons["purpleair"]
+
+    # --- Missing keys → reasons say so, not a bare sentinel ---------------
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_missing_keys_report_no_key(self, mock_pa_cls, mock_an_cls):
+        """No AirNow key + no PurpleAir key → source none, reasons name the gap."""
+        config = _base_config(airnow_api_key="", purpleair_api_key="")
+        result = _fetch_aqi(config, last_state="OPEN")
+
+        assert result["source"] == "none"
+        assert result["aqi_reasons"]["airnow"] == "no API key configured"
+        assert result["aqi_reasons"]["purpleair"] == "no API key configured"
+        # Clients never even constructed when the key is absent.
+        mock_an_cls.assert_not_called()
+        mock_pa_cls.assert_not_called()
+
+    # --- Partial failure surfaces in reasons even when a reading survives --
+    @patch("src.orchestrator.AirNowClient")
+    @patch("src.orchestrator.PurpleAirClient")
+    def test_purpleair_402_reason_present_with_airnow_reading(self, mock_pa_cls, mock_an_cls):
+        """AirNow succeeds but PurpleAir 402s → reading stands, PA reason recorded."""
+        mock_an = MagicMock()
+        mock_an.get_aqi.return_value = {"aqi": 30, "source": "airnow"}
+        mock_an_cls.return_value = mock_an
+
+        mock_pa = MagicMock()
+        mock_pa.get_aqi.side_effect = Exception("402: Payment Required — out of points")
+        mock_pa_cls.return_value = mock_pa
+
+        result = _fetch_aqi(_base_config(), last_state="OPEN")
+
+        assert result["source"] == "airnow"
+        assert result["aqi"] == 30
+        assert "402" in result["aqi_reasons"]["purpleair"]
+        assert "airnow" not in result["aqi_reasons"]
+
+
+# ------------------------------------------------------------------
 # PurpleAir Client Persistence (cross-cycle caching)
 # ------------------------------------------------------------------
 
@@ -815,6 +1049,44 @@ class TestConditionalAqiPolling:
         mock_fetch_aqi.assert_not_called()
 
     # ------------------------------------------------------------------
+    # 1b. Skipped aqi_data carries the human-readable skip_reason
+    # ------------------------------------------------------------------
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_skipped_aqi_data_carries_skip_reason(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
+    ):
+        """When a floor skips AQI, the aqi_data handed downstream carries the
+        human-readable skip_reason so the status page can show WHY (not a bare
+        'AQI 0, source: skipped')."""
+        self._setup_run_check_mocks(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
+            sensor_temps={"sensor_up": 70.0, "sensor_down": 70.0},
+            hvac_mode="cool",
+            outdoor_temp=65.0,
+            current_state="CLOSED",
+        )
+
+        run_check()
+
+        # AQI was skipped (fetch never called), and the aqi_data passed to
+        # _evaluate_floor reflects the skip with a populated reason.
+        mock_fetch_aqi.assert_not_called()
+        assert mock_eval_floor.call_args is not None
+        aqi_data = mock_eval_floor.call_args[0][4]
+        assert aqi_data["source"] == "skipped"
+        assert aqi_data["aqi"] == 0
+        assert isinstance(aqi_data.get("skip_reason"), str)
+        assert aqi_data["skip_reason"]  # non-empty
+
+    # ------------------------------------------------------------------
     # 2. AQI skipped when HVAC mode not in allowed list
     # ------------------------------------------------------------------
 
@@ -871,6 +1143,80 @@ class TestConditionalAqiPolling:
 
         # AQI is fetched (not skipped) — once per floor under the per-floor carve-out.
         assert mock_fetch_aqi.call_count == 2
+
+    # ------------------------------------------------------------------
+    # 3b. OPEN floor must NEVER receive the "skipped" sentinel
+    # ------------------------------------------------------------------
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_open_floor_never_gets_skipped_sentinel(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
+    ):
+        """OPEN + comfortable indoor (≤72°F) → real fetch, never source:skipped.
+
+        Comfortable indoor would make the CLOSED branch SKIP; proving the OPEN
+        safety rule wins over the comfort gate at the orchestrator level.
+        """
+        self._setup_run_check_mocks(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
+            sensor_temps={"sensor_up": 70.0, "sensor_down": 70.0},
+            hvac_mode="cool",
+            outdoor_temp=68.0,
+            current_state="OPEN",
+        )
+        mock_fetch_aqi.return_value = {"aqi": 42, "source": "airnow"}
+
+        run_check()
+
+        # Every floor was fetched, and _evaluate_floor never saw the sentinel.
+        assert mock_fetch_aqi.call_count == 2
+        for call in mock_eval_floor.call_args_list:
+            aqi_arg = call.args[4]  # aqi_data is the 5th positional arg
+            assert aqi_arg.get("source") != "skipped"
+
+    # ------------------------------------------------------------------
+    # 3c. Non-canonical OPEN state ("open") still fetches (normalisation)
+    # ------------------------------------------------------------------
+
+    @patch("src.orchestrator._evaluate_floor")
+    @patch("src.orchestrator._fetch_aqi")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator.NWSClient")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_lowercase_open_state_still_fetches_aqi(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
+    ):
+        """A stored 'open' (lowercase) state must NOT skip the AQI safety fetch.
+
+        Regression for the casing/format hardening: with comfortable indoor
+        temps the CLOSED branch would skip, so a fetch here proves 'open' is
+        normalised to OPEN before the safety check.
+        """
+        self._setup_run_check_mocks(
+            mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
+            sensor_temps={"sensor_up": 70.0, "sensor_down": 70.0},
+            hvac_mode="cool",
+            outdoor_temp=68.0,
+            current_state="open",
+        )
+        mock_fetch_aqi.return_value = {"aqi": 42, "source": "airnow"}
+
+        run_check()
+
+        assert mock_fetch_aqi.call_count == 2
+        for call in mock_eval_floor.call_args_list:
+            aqi_arg = call.args[4]
+            assert aqi_arg.get("source") != "skipped"
 
     # ------------------------------------------------------------------
     # 4. AQI fetched when windows closed but temperature favors opening
@@ -1165,7 +1511,9 @@ class TestConditionalAqiPolling:
         self, mock_config, mock_state_cls, mock_ecobee_cls,
         mock_nws_cls, mock_om_cls, mock_fetch_aqi, mock_eval_floor,
     ):
-        """When AQI is skipped, _evaluate_floor receives {"aqi": 0, "source": "skipped"}."""
+        """When AQI is skipped, _evaluate_floor receives the skip sentinel
+        ({"aqi": 0, "source": "skipped"}) now enriched with a human-readable
+        skip_reason for the status page."""
         self._setup_run_check_mocks(
             mock_config, mock_state_cls, mock_ecobee_cls, mock_nws_cls, mock_om_cls,
             sensor_temps={"sensor_up": 70.0, "sensor_down": 70.0},
@@ -1179,7 +1527,9 @@ class TestConditionalAqiPolling:
         mock_fetch_aqi.assert_not_called()
         for eval_call in mock_eval_floor.call_args_list:
             aqi_arg = eval_call.args[4]
-            assert aqi_arg == {"aqi": 0, "source": "skipped"}
+            assert aqi_arg["aqi"] == 0
+            assert aqi_arg["source"] == "skipped"
+            assert isinstance(aqi_arg.get("skip_reason"), str) and aqi_arg["skip_reason"]
 
 
 # ------------------------------------------------------------------

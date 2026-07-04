@@ -310,6 +310,122 @@ def _render_html(
     )
 
 
+_AQI_PROVIDER_LABELS = {
+    "airnow": "AirNow",
+    "purpleair": "PurpleAir",
+}
+
+
+def _aqi_value_class(value: int) -> str:
+    """AQI colour bucket used by the status page: good < 50, moderate < 100."""
+    return "good" if value < 50 else ("moderate" if value < 100 else "unhealthy")
+
+
+def _render_aqi_block(snapshot: FloorSnapshot, aqi_class: str, aqi_obs_age: str) -> str:
+    """Render the Air Quality metrics.
+
+    When both AirNow and PurpleAir were queried this cycle
+    (``snapshot.aqi_readings`` holds two non-None values) both are shown, each
+    labeled, and the authoritative provider (``snapshot.aqi_source`` — the value
+    that drove the open/close decision) is marked "driving decision". When only
+    one provider was checked, only that one is rendered — never a
+    "PurpleAir: None" line. Snapshots predating the dual-reading field
+    (``aqi_readings is None``) fall back to the original single AQI + Source view.
+
+    When NEITHER provider produced a reading this cycle (``aqi_source ==
+    "none"``), the per-provider failure reasons in ``snapshot.aqi_reasons`` are
+    rendered ("AirNow: no stations in range", "PurpleAir: 402 out of points")
+    so a config/account gap is visible instead of a bare "Source: none".
+
+    When AQI was intentionally NOT fetched this cycle (``aqi_source ==
+    "skipped"`` — the cost-skip working as designed because the floor couldn't
+    open regardless), the human-readable ``snapshot.aqi_skip_reason`` is shown
+    as "not checked — <reason>" so the skip reads as intentional, never as a
+    failed "AQI 0" reading.
+    """
+    # AQI intentionally not fetched this cycle (cost-skip). The floor couldn't
+    # open regardless (e.g. outdoor not cool enough, HVAC off, already
+    # comfortable), so the precise AQI can't change the decision. Show the
+    # reason instead of a misleading "AQI 0, source: skipped".
+    if snapshot.aqi_source == "skipped":
+        skip_reason = getattr(snapshot, "aqi_skip_reason", None) or "not needed this cycle"
+        return f"""
+    {aqi_obs_age}
+    <div class="metric">
+        <span class="label">AQI:</span>
+        <span class="value">not checked \u2014 {html.escape(str(skip_reason))}</span>
+    </div>
+    """
+
+    # No AQI this cycle — both providers empty. Explain WHY per provider so a
+    # config/account gap (missing key, 402 out-of-points, no nearby stations)
+    # is visible instead of a bare "Source: none".
+    if snapshot.aqi_source == "none":
+        reasons = (
+            snapshot.aqi_reasons if isinstance(snapshot.aqi_reasons, dict) else {}
+        )
+        rows = ""
+        for provider in ("airnow", "purpleair"):
+            label = _AQI_PROVIDER_LABELS.get(provider, provider.title())
+            reason = reasons.get(provider) or "unavailable"
+            rows += f"""
+    <div class="metric">
+        <span class="label">{html.escape(label)}:</span>
+        <span class="value aqi-unavailable">{html.escape(str(reason))}</span>
+    </div>
+    """
+        return f"""
+    {aqi_obs_age}
+    <div class="metric">
+        <span class="label">AQI:</span>
+        <span class="value">unavailable — gate skipped</span>
+    </div>
+    {rows}
+    """
+
+    readings = snapshot.aqi_readings
+    present = (
+        [(p, v) for p, v in readings.items() if v is not None]
+        if isinstance(readings, dict) else []
+    )
+
+    if len(present) >= 2:
+        rows = ""
+        for provider, value in present:
+            label = _AQI_PROVIDER_LABELS.get(provider, provider.title())
+            value_class = _aqi_value_class(value)
+            auth_badge = (
+                " <span class='aqi-authoritative'>· driving decision</span>"
+                if provider == snapshot.aqi_source else ""
+            )
+            rows += f"""
+    <div class="metric">
+        <span class="label">{html.escape(label)}:</span>
+        <span class="value aqi-{value_class}">{value}{auth_badge}</span>
+    </div>
+    """
+        return f"""
+    {aqi_obs_age}
+    {rows}
+    """
+
+    # Single provider (or legacy snapshot): show one labeled value. Prefer the
+    # authoritative value; label it by source when the source is known.
+    label = _AQI_PROVIDER_LABELS.get(snapshot.aqi_source)
+    aqi_label = f"AQI ({label})" if label else "AQI"
+    return f"""
+    {aqi_obs_age}
+    <div class="metric">
+        <span class="label">{html.escape(aqi_label)}:</span>
+        <span class="value aqi-{aqi_class}">{snapshot.aqi_value}</span>
+    </div>
+    <div class="metric">
+        <span class="label">Source:</span>
+        <span class="value">{html.escape(snapshot.aqi_source)}</span>
+    </div>
+    """
+
+
 def _render_environment_section(snapshot: FloorSnapshot) -> str:
     """Render the shared outdoor + AQI section (same data across all floors)."""
     now = datetime.now(timezone.utc)
@@ -382,7 +498,11 @@ def _render_environment_section(snapshot: FloorSnapshot) -> str:
         </div>
         """
 
-    # AQI
+    # AQI. When BOTH AirNow and PurpleAir were queried this cycle, show both
+    # readings clearly labeled and mark which one is authoritative (drove the
+    # open/close decision). When only one provider was checked, show just that
+    # one — never a "PurpleAir: None" line. Legacy snapshots (no aqi_readings)
+    # fall back to the original single AQI + Source view.
     aqi_class = "good" if snapshot.aqi_value < 50 else ("moderate" if snapshot.aqi_value < 100 else "unhealthy")
     aqi_obs_age = ""
     if snapshot.aqi_observation_time:
@@ -391,17 +511,7 @@ def _render_environment_section(snapshot: FloorSnapshot) -> str:
         age_class = "data-fresh" if obs_age_mins < 30 else ("data-warn" if obs_age_mins < 60 else "data-stale")
         aqi_obs_age = f"<div class='data-freshness {age_class}'>observed {_format_age(obs_time)} ago</div>"
 
-    aqi_html = f"""
-    {aqi_obs_age}
-    <div class="metric">
-        <span class="label">AQI:</span>
-        <span class="value aqi-{aqi_class}">{snapshot.aqi_value}</span>
-    </div>
-    <div class="metric">
-        <span class="label">Source:</span>
-        <span class="value">{html.escape(snapshot.aqi_source)}</span>
-    </div>
-    """
+    aqi_html = _render_aqi_block(snapshot, aqi_class, aqi_obs_age)
 
     return f"""
     <div class="floor-card environment-card">
@@ -990,6 +1100,12 @@ def _get_css() -> str:
         .aqi-unhealthy {
             color: #c62828;
             font-weight: 600;
+        }
+
+        .aqi-authoritative {
+            font-size: 0.8em;
+            font-weight: 600;
+            color: #555;
         }
 
         .data-freshness {

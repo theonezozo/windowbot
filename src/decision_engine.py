@@ -108,7 +108,11 @@ class DecisionEngine:
         Returns:
             A :class:`FloorDecision` describing the recommended action.
         """
-        # Normalise unknown/initial state to CLOSED (safe default).
+        # Normalise case/whitespace, then map any unknown/initial value to
+        # CLOSED (safe default). Tolerating "open"/" OPEN " keeps an
+        # actually-open window from being mis-read as CLOSED, which would apply
+        # the wrong hysteresis direction and could bypass the urgent-close path.
+        last_state = str(last_state).strip().upper()
         if last_state not in ("OPEN", "CLOSED"):
             last_state = "CLOSED"
 
@@ -184,10 +188,19 @@ class DecisionEngine:
         if not self.enable_aqi_gate:
             return False, "AQI gate disabled"
 
+        # Normalise case/whitespace BEFORE the OPEN safety check so a
+        # non-canonical record (e.g. "open", " OPEN ", a legacy/manually-edited
+        # value) is still recognised as OPEN. An open window MUST always fetch
+        # AQI for the force-close safety net; silently coercing a mis-cased
+        # "open" to CLOSED here would skip that check and leave the window open
+        # during a bad-air event.
+        last_state = str(last_state).strip().upper()
         if last_state not in ("OPEN", "CLOSED"):
             last_state = "CLOSED"
 
-        # Windows OPEN → always need AQI (urgent close safety net)
+        # Windows OPEN → always need AQI (urgent close safety net). This check
+        # runs before every suppressing gate (HVAC / humidity / comfort /
+        # temperature); only a globally-disabled AQI gate (handled above) skips.
         if last_state == "OPEN":
             return True, "windows open — need AQI for safety check"
 

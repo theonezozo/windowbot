@@ -263,21 +263,21 @@ Deploy to Azure Functions (Consumption plan — free tier):
 
 ```bash
 # Create resources (first time only)
-az group create --name rg-windowbot --location westus2
-az storage account create --name stwindowbot --resource-group rg-windowbot --sku Standard_LRS
-az functionapp create --name func-windowbot-prod \
-  --resource-group rg-windowbot \
-  --storage-account stwindowbot \
+az group create --name windowbot-rg --location westus2
+az storage account create --name windowbotstorage755 --resource-group windowbot-rg --sku Standard_LRS
+az functionapp create --name windowbot-func \
+  --resource-group windowbot-rg \
+  --storage-account windowbotstorage755 \
   --consumption-plan-location westus2 \
   --runtime python --runtime-version 3.11 \
   --functions-version 4
 
 # Deploy
-func azure functionapp publish func-windowbot-prod
+func azure functionapp publish windowbot-func
 
 # Set app settings (your API keys)
-az functionapp config appsettings set --name func-windowbot-prod \
-  --resource-group rg-windowbot \
+az functionapp config appsettings set --name windowbot-func \
+  --resource-group windowbot-rg \
   --settings BEESTAT_API_KEY=xxx PURPLEAIR_API_KEY=xxx ...
 ```
 

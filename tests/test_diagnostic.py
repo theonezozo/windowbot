@@ -315,6 +315,115 @@ class TestFloorSnapshotFreshnessFieldsBackCompat:
 
 
 # ------------------------------------------------------------------
+# FloorSnapshot back-compat + round-trip for dual-provider AQI readings
+# ------------------------------------------------------------------
+
+
+class TestFloorSnapshotAQIReadingsBackCompat:
+    """``FloorSnapshot`` gained an optional ``aqi_readings`` dict carrying each
+    provider's AQI when both were queried. Old snapshots (no field) must load
+    with ``None``; new snapshots must round-trip the dict intact.
+    """
+
+    def _payload(self) -> dict:
+        return {
+            "floor": "upstairs",
+            "decision": "OPEN",
+            "reason": "comfortable",
+            "indoor_sensors": [],
+            "outdoor_temp_f": 70.0,
+            "outdoor_source": "nws",
+            "outdoor_stations": [],
+            "outdoor_humidity": 50.0,
+            "aqi_value": 155,
+            "aqi_source": "purpleair",
+            "aqi_stations": [],
+            "gates": [],
+            "last_notification_type": None,
+            "last_notification_time": None,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "outdoor_observation_time": "2026-01-01T00:00:00+00:00",
+            "aqi_observation_time": "2026-01-01T00:00:00+00:00",
+            # Deliberately omitted: aqi_readings.
+        }
+
+    def test_old_snapshot_defaults_aqi_readings_to_none(self):
+        """Pre-existing JSON without aqi_readings → loads as None."""
+        from src.diagnostic import FloorSnapshot
+
+        snapshot = FloorSnapshot.from_json(json.dumps(self._payload()))
+        assert snapshot.aqi_readings is None
+
+    def test_round_trip_preserves_aqi_readings(self):
+        """New snapshot with both readings → round-trip preserves the dict."""
+        from src.diagnostic import FloorSnapshot
+
+        payload = self._payload()
+        payload["aqi_readings"] = {"airnow": 42, "purpleair": 155}
+
+        snapshot = FloorSnapshot.from_json(json.dumps(payload))
+        restored = FloorSnapshot.from_json(snapshot.to_json())
+
+        assert restored.aqi_readings == {"airnow": 42, "purpleair": 155}
+
+
+# ------------------------------------------------------------------
+# FloorSnapshot back-compat + round-trip for the AQI skip reason
+# ------------------------------------------------------------------
+
+
+class TestFloorSnapshotAQISkipReasonBackCompat:
+    """``FloorSnapshot`` gained an optional ``aqi_skip_reason`` string carrying
+    the human-readable reason the AQI fetch was skipped (cost-skip). Old
+    snapshots (no field) must load with ``None``; new snapshots must round-trip
+    the reason intact.
+    """
+
+    def _payload(self) -> dict:
+        return {
+            "floor": "upstairs",
+            "decision": "CLOSED",
+            "reason": "outdoor not cool enough",
+            "indoor_sensors": [],
+            "outdoor_temp_f": 76.0,
+            "outdoor_source": "nws",
+            "outdoor_stations": [],
+            "outdoor_humidity": 50.0,
+            "aqi_value": 0,
+            "aqi_source": "skipped",
+            "aqi_stations": [],
+            "gates": [],
+            "last_notification_type": None,
+            "last_notification_time": None,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "outdoor_observation_time": "2026-01-01T00:00:00+00:00",
+            "aqi_observation_time": None,
+            # Deliberately omitted: aqi_skip_reason.
+        }
+
+    def test_old_snapshot_defaults_aqi_skip_reason_to_none(self):
+        """Pre-existing JSON without aqi_skip_reason → loads as None."""
+        from src.diagnostic import FloorSnapshot
+
+        snapshot = FloorSnapshot.from_json(json.dumps(self._payload()))
+        assert snapshot.aqi_skip_reason is None
+
+    def test_round_trip_preserves_aqi_skip_reason(self):
+        """New skipped snapshot → round-trip preserves the reason string."""
+        from src.diagnostic import FloorSnapshot
+
+        payload = self._payload()
+        payload["aqi_skip_reason"] = "outdoor not cool enough to open (76.0°F ≥ 74.9°F)"
+
+        snapshot = FloorSnapshot.from_json(json.dumps(payload))
+        restored = FloorSnapshot.from_json(snapshot.to_json())
+
+        assert restored.aqi_skip_reason == (
+            "outdoor not cool enough to open (76.0°F ≥ 74.9°F)"
+        )
+
+
+# ------------------------------------------------------------------
 # SensorReading provenance + sync-age round-trip / back-compat
 # (2026-05-21 Beestat sync-prefix change)
 # ------------------------------------------------------------------
