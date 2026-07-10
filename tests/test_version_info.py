@@ -24,9 +24,11 @@ import logging
 import sys
 import types
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
+import src
 from src.version_info import (
     WORKER_STARTED_AT,
     _DEFAULTS,
@@ -34,6 +36,60 @@ from src.version_info import (
     is_dev_build,
     parse_iso_utc,
 )
+
+
+# ------------------------------------------------------------------
+# Isolation fixture — hide any on-disk deploy-stamped version file
+# ------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _hide_stamped_version_file():
+    """Guarantee these tests exercise the documented *dev-defaults* contract.
+
+    ``src/_version.py`` is a gitignored, deploy-only build artifact produced by
+    ``scripts/stamp_version.sh`` (and re-created by ``squad upgrade``). The whole
+    module contracts that this file is ABSENT during local dev: the "file
+    missing" tests expect ``from src import _version`` to raise ``ImportError``,
+    and the fake-injection tests ``monkeypatch.setitem(sys.modules, ...)`` a
+    stand-in module.
+
+    A stray stamped file on disk breaks both assumptions:
+      1. ``import src`` binds a real ``_version`` submodule *attribute* on the
+         ``src`` package, so ``from src import _version`` returns the real
+         stamped module and IGNORES the test's ``sys.modules`` fake.
+      2. The on-disk file makes ``from src import _version`` succeed, so the
+         "file missing" tests never see the expected ``ImportError``.
+
+    So for the duration of this module we move any real ``src/_version.py``
+    aside (never delete — the user's build artifact must survive verbatim) and
+    scrub the cached module + bound package attribute. try/finally restores the
+    file no matter what, even on test failure.
+    """
+    version_path = Path(__file__).resolve().parents[1] / "src" / "_version.py"
+    backup_path = version_path.with_name("_version.py.pytest-bak")
+
+    def _scrub_cached_module():
+        # Drop a stale cached import and the attribute bound on the package
+        # object so ``from src import _version`` can't resolve a real module.
+        sys.modules.pop("src._version", None)
+        if hasattr(src, "_version"):
+            delattr(src, "_version")
+
+    moved = False
+    if version_path.exists():
+        version_path.rename(backup_path)
+        moved = True
+
+    _scrub_cached_module()
+
+    try:
+        yield
+    finally:
+        # Restore the deploy artifact verbatim, then leave a clean cache state.
+        if moved:
+            backup_path.rename(version_path)
+        _scrub_cached_module()
 
 
 # ------------------------------------------------------------------
