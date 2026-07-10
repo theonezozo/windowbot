@@ -22,11 +22,11 @@ from src.airnow_client import AirNowClient, AirNowError
 
 
 def _airnow_obs(parameter, aqi, category="Moderate"):
-    """Build a single AirNow observation dict."""
+    """Build a single AirNow observation dict (new API schema)."""
     return {
-        "AQI": aqi,
-        "ParameterName": parameter,
-        "Category": {"Name": category},
+        "nowcastAQI": aqi,
+        "parameterName": parameter,
+        "AQICategoryName": category,
     }
 
 
@@ -109,10 +109,10 @@ class TestResponseParsing:
 
     @patch("src.airnow_client.requests.get")
     def test_missing_category_defaults_unknown(self, mock_get):
-        """Missing Category → 'Unknown'."""
+        """Missing AQICategoryName → 'Unknown'."""
         mock_get.return_value = MagicMock(
             ok=True,
-            json=lambda: [{"AQI": 50, "ParameterName": "PM2.5"}],
+            json=lambda: [{"nowcastAQI": 50, "parameterName": "PM2.5"}],
         )
         client = AirNowClient("key", 40.0, -74.0)
         result = client.get_aqi()
@@ -121,10 +121,10 @@ class TestResponseParsing:
 
     @patch("src.airnow_client.requests.get")
     def test_missing_parameter_defaults_unknown(self, mock_get):
-        """Missing ParameterName → 'Unknown'."""
+        """Missing parameterName → 'Unknown'."""
         mock_get.return_value = MagicMock(
             ok=True,
-            json=lambda: [{"AQI": 50, "Category": {"Name": "Good"}}],
+            json=lambda: [{"nowcastAQI": 50, "AQICategoryName": "Good"}],
         )
         client = AirNowClient("key", 40.0, -74.0)
         result = client.get_aqi()
@@ -133,7 +133,7 @@ class TestResponseParsing:
 
     @patch("src.airnow_client.requests.get")
     def test_api_params_include_key_and_location(self, mock_get):
-        """Request params include API_KEY, lat, lon, distance."""
+        """Request params include api_key, lat, lon; distance removed."""
         mock_get.return_value = MagicMock(
             ok=True,
             json=lambda: [_airnow_obs("PM2.5", 50)],
@@ -142,10 +142,38 @@ class TestResponseParsing:
         client.get_aqi()
 
         params = mock_get.call_args.kwargs.get("params") or mock_get.call_args[1].get("params", {})
-        assert params["API_KEY"] == "my_key"
+        assert params["api_key"] == "my_key"
         assert params["latitude"] == "40.123"
         assert params["longitude"] == "-74.456"
-        assert params["distance"] == "25"
+        assert "distance" not in params
+
+    @patch("src.airnow_client.requests.get")
+    def test_observation_time_from_timestamp_fields(self, mock_get):
+        """observation_time is populated when timestamp fields present, else None."""
+        obs_with_time = _airnow_obs("PM2.5", 50)
+        obs_with_time.update(
+            {
+                "dateObserved": "2026-02-01",
+                "hourObserved": "05:00",
+                "localTimeZone": "PDT",
+            }
+        )
+        mock_get.return_value = MagicMock(ok=True, json=lambda: [obs_with_time])
+        client = AirNowClient("key", 40.0, -74.0)
+        result = client.get_aqi()
+
+        assert result["observation_time"] is not None
+        obs_time = result["observation_time"]
+        assert "2026-02-01" in obs_time
+        assert "05:00" in obs_time
+        assert "PDT" in obs_time
+
+        # Absent timestamp fields → None.
+        mock_get.return_value = MagicMock(
+            ok=True, json=lambda: [_airnow_obs("PM2.5", 50)]
+        )
+        result_no_time = client.get_aqi()
+        assert result_no_time["observation_time"] is None
 
 
 # ------------------------------------------------------------------

@@ -3,7 +3,7 @@
 Provides a fallback AQI source using the EPA's AirNow Current
 Observations endpoint when PurpleAir data is unavailable.
 
-Reference: https://docs.airnowapi.org/CurrentObservationsByLatLon/docs
+Reference: https://docs.airnowapi.org/ObservationsByZipCodeLatLon/docs
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import requests
 
 logger = logging.getLogger("windowbot.airnow")
 
-AIRNOW_API_BASE = "https://www.airnowapi.org/aq/observation/latLong/current/"
+AIRNOW_API_BASE = "https://www.airnowapi.org/aq/observation/current/ziplatLong"
 _REQUEST_TIMEOUT = 15
 
 
@@ -39,8 +39,9 @@ class AirNowClient:
     def get_aqi(self) -> dict:
         """Fetch the current AQI for the configured location.
 
-        Uses the AirNow \"Current Observation by Lat/Lon\" endpoint which
-        searches within a 25-mile radius.
+        Uses the AirNow \"Current Observations by Zip Code or Lat/Long\"
+        endpoint. The lookup boundary is controlled server-side by the
+        reporting agency, so no client-side distance parameter is sent.
 
         Returns:
             Dict with:
@@ -48,6 +49,8 @@ class AirNowClient:
             - ``source`` (str): Always ``\"airnow\"``.
             - ``category`` (str): EPA category name (e.g. \"Good\", \"Moderate\").
             - ``parameter`` (str): Dominant pollutant (e.g. \"PM2.5\", \"O3\").
+            - ``observation_time`` (str | None): Human-readable observation
+              timestamp when the API exposes it, else ``None``.
 
         Raises:
             AirNowError: If the API call fails or returns no data.
@@ -56,8 +59,7 @@ class AirNowClient:
             "format": "application/json",
             "latitude": str(self._lat),
             "longitude": str(self._lon),
-            "distance": "25",
-            "API_KEY": self._api_key,
+            "api_key": self._api_key,
         }
 
         try:
@@ -78,11 +80,25 @@ class AirNowClient:
 
         # AirNow may return multiple pollutants (PM2.5, O3, etc.).
         # Pick the one with the highest (worst) AQI.
-        worst = max(observations, key=lambda o: o.get("AQI", 0))
+        worst = max(observations, key=lambda o: o.get("nowcastAQI", 0))
 
-        aqi = int(worst.get("AQI", 0))
-        category = worst.get("Category", {}).get("Name", "Unknown")
-        parameter = worst.get("ParameterName", "Unknown")
+        aqi = int(worst.get("nowcastAQI", 0))
+        category = worst.get("AQICategoryName", "Unknown")
+        parameter = worst.get("parameterName", "Unknown")
+
+        # The new endpoint exposes the observation timestamp as separate
+        # date/hour/time-zone fields; assemble a human-readable string.
+        date_observed = worst.get("dateObserved")
+        if date_observed:
+            hour_observed = worst.get("hourObserved")
+            local_tz = worst.get("localTimeZone")
+            observation_time = " ".join(
+                str(part).strip()
+                for part in (date_observed, hour_observed, local_tz)
+                if part is not None and str(part).strip()
+            )
+        else:
+            observation_time = None
 
         logger.info("AirNow AQI: %d (%s) — dominant pollutant: %s.", aqi, category, parameter)
 
@@ -91,5 +107,5 @@ class AirNowClient:
             "source": "airnow",
             "category": category,
             "parameter": parameter,
-            "observation_time": None,  # AirNow API doesn't expose observation timestamps
+            "observation_time": observation_time,
         }
