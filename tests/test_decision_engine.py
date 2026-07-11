@@ -60,10 +60,13 @@ def _decide(
 
 
 class TestTemperatureLogic:
-    """Temperature comparison.
+    """Temperature comparison with 1°F SYMMETRIC hysteresis.
 
-    Open side (CLOSED→OPEN) uses 1°F hysteresis. Close side (OPEN→CLOSED) has
-    NO hysteresis — the window closes as soon as outdoor > coolest indoor.
+    Open side (CLOSED→OPEN) requires outdoor < warmest − 1°F. Close side
+    (OPEN→CLOSED) requires outdoor > coolest + 1°F. The symmetric close-side
+    deadband is the intended design (architecture decision #1); an earlier
+    bare ``> coolest`` close (zero close hysteresis) was a bug and has been
+    realigned to the spec.
     """
 
     def test_open_when_outdoor_cooler_than_warmest_minus_1(self, engine):
@@ -85,7 +88,7 @@ class TestTemperatureLogic:
         assert result.changed is False
 
     def test_close_when_outdoor_warmer_than_coolest(self, engine):
-        """OPEN, coolest 70°F, outdoor 72°F → 72 > 70 → CLOSE."""
+        """OPEN, coolest 70°F, outdoor 72°F → 72 > 70+1 → CLOSE."""
         result = _decide(
             engine,
             indoor_temps=[70.0],
@@ -97,10 +100,10 @@ class TestTemperatureLogic:
         assert result.changed is True
 
     def test_stay_open_when_outdoor_equals_coolest(self, engine):
-        """OPEN, coolest 70°F, outdoor 70°F → 70 > 70 is False → stay OPEN.
+        """OPEN, coolest 70°F, outdoor 70°F → 70 > 70+1 is False → stay OPEN.
 
-        Close uses a strict ``>`` comparison, so outdoor exactly equal to the
-        coolest indoor keeps the window OPEN.
+        Close uses a strict ``> coolest + hysteresis_close`` comparison, so
+        outdoor equal to the coolest indoor keeps the window OPEN.
         """
         result = _decide(
             engine,
@@ -112,11 +115,13 @@ class TestTemperatureLogic:
         assert result.new_state == "OPEN"
         assert result.changed is False
 
-    def test_close_when_outdoor_just_above_coolest_no_hysteresis(self, engine):
-        """OPEN, coolest 70°F, outdoor 71°F → 71 > 70 → CLOSE (no close hysteresis).
+    def test_stay_open_when_outdoor_within_close_hysteresis(self, engine):
+        """OPEN, coolest 70°F, outdoor 71°F → 71 > 70+1 is False → stay OPEN.
 
-        Previously this stayed OPEN (close threshold was coolest+1=71, needing
-        strictly >71). The close now fires the moment outdoor exceeds coolest.
+        Symmetric close hysteresis: a margin of exactly 1°F is inside the
+        deadband, so the window holds OPEN. Under the old (buggy) zero-close-
+        hysteresis code this incorrectly closed the moment outdoor exceeded
+        coolest.
         """
         result = _decide(
             engine,
@@ -125,8 +130,8 @@ class TestTemperatureLogic:
             aqi=30,
             last_state="OPEN",
         )
-        assert result.new_state == "CLOSED"
-        assert result.changed is True
+        assert result.new_state == "OPEN"
+        assert result.changed is False
 
     def test_hysteresis_prevents_oscillation(self, engine):
         """Just barely crossed open threshold, then bounced back."""
@@ -135,7 +140,7 @@ class TestTemperatureLogic:
         assert r1.new_state == "OPEN"
 
         # Now outdoor warms to 73.5 — coolest indoor is 74, close fires only
-        # when outdoor > 74. 73.5 < 74 → stay open.
+        # when outdoor > 74 + 1 = 75. 73.5 < 75 → stay open.
         r2 = _decide(
             engine,
             indoor_temps=[74.0],
@@ -166,18 +171,19 @@ class TestTemperatureLogic:
     @pytest.mark.parametrize(
         "outdoor, expected_state",
         [
-            (70.0, "OPEN"),     # equal to coolest → stay open (strict >)
-            (70.01, "CLOSED"),  # just above coolest → CLOSE (no hysteresis)
-            (70.5, "CLOSED"),   # above coolest → CLOSE
-            (71.0, "CLOSED"),   # above coolest → CLOSE (was OPEN under old +1)
+            (70.0, "OPEN"),     # margin 0 → within deadband → stay OPEN
+            (71.0, "OPEN"),     # margin exactly 1.0 → boundary, strict > → stay OPEN
+            (71.01, "CLOSED"),  # margin > 1.0 → CLOSE
+            (72.0, "CLOSED"),   # margin 2.0 → CLOSE
             (80.0, "CLOSED"),   # way above → CLOSE
         ],
     )
     def test_close_boundary_parametrized(self, engine, outdoor, expected_state):
         """Parametrized boundary tests for OPEN→CLOSED transition.
 
-        Indoor = 70°F (single sensor = coolest). No close hysteresis — the
-        window closes as soon as outdoor > 70.
+        Indoor = 70°F (single sensor = coolest). Symmetric close hysteresis:
+        close threshold = 70 + 1 = 71°F, and the window closes only when
+        outdoor > 71 (strict), so margins ≤ 1°F stay OPEN.
         """
         result = _decide(
             engine,
@@ -188,24 +194,41 @@ class TestTemperatureLogic:
         )
         assert result.new_state == expected_state
 
-    def test_close_fires_just_above_coolest_no_hysteresis(self, engine):
-        """OPEN, coolest 72°F, outdoor 72.5°F → 72.5 > 72 → CLOSE.
+    def test_close_fires_when_margin_exceeds_close_hysteresis(self, engine):
+        """OPEN, coolest 72°F, outdoor 73.5°F → 73.5 > 72+1 → CLOSE.
 
-        Focused guard on the new boundary: a window that is OPEN closes as
-        soon as outdoor exceeds the coolest indoor temp, with NO close-side
-        hysteresis. Under the old +1°F close offset this stayed OPEN (72.5 <
-        73). Pinned with a literal half-degree to fail if any close
-        hysteresis is reintroduced.
+        Focused guard on the symmetric close boundary: the window closes only
+        once outdoor exceeds coolest by MORE than the 1°F close hysteresis.
+        Pinned with a literal 1.5°F margin to fail if the close-side deadband
+        is ever removed (the old bug) or widened.
         """
         result = _decide(
             engine,
             indoor_temps=[72.0],
-            outdoor_temp=72.5,
+            outdoor_temp=73.5,
             aqi=30,
             last_state="OPEN",
         )
         assert result.new_state == "CLOSED"
         assert result.changed is True
+
+    def test_morning_flap_within_close_hysteresis_stays_open(self, engine):
+        """Regression: outdoor 71.6 vs coolest 71.2 (margin 0.4) → STAY OPEN.
+
+        Reproduces this morning's flap. Close threshold = 71.2 + 1.0 = 72.2;
+        71.6 < 72.2 so the window holds OPEN. Before R2 wired up the close
+        hysteresis, this sub-degree margin closed the window and immediately
+        re-opened on the next dip — the oscillation we're fixing.
+        """
+        result = _decide(
+            engine,
+            indoor_temps=[71.2],
+            outdoor_temp=71.6,
+            aqi=30,
+            last_state="OPEN",
+        )
+        assert result.new_state == "OPEN"
+        assert result.changed is False
 
     def test_very_large_differential_opens(self, engine):
         """outdoor 50°F, indoor 80°F → OPEN."""
@@ -226,7 +249,7 @@ class TestTemperatureLogic:
         assert result.changed is False
 
     def test_indoor_outdoor_equal_stays_open(self, engine):
-        """OPEN, indoor=outdoor=74°F → 74 > 74 is False → stay OPEN (strict >)."""
+        """OPEN, indoor=outdoor=74°F → 74 > 74+1 is False → stay OPEN."""
         result = _decide(
             engine,
             indoor_temps=[74.0],
@@ -398,22 +421,21 @@ class TestAQILogic:
 
 
 class TestHumidityGate:
-    """Outdoor humidity > 80% blocks opening and triggers close."""
+    """State-aware humidity gate with anti-flap deadband.
 
-    def test_high_humidity_blocks_opening(self, engine):
-        """Humidity 85% → stay CLOSED even if temp favours opening."""
-        result = _decide(
-            engine,
-            indoor_temps=[74.0],
-            outdoor_temp=68.0,
-            aqi=30,
-            humidity=85.0,
-        )
-        assert result.new_state == "CLOSED"
-        assert result.changed is False
+    Defaults: max_humidity=80, humidity_deadband=5 → humidity_reopen=75.
 
-    def test_high_humidity_closes_open_windows(self, engine):
-        """Humidity 85% when OPEN → CLOSE."""
+    - OPEN:  >80 → CLOSE; 75–80 → HOLD OPEN (deadband); <75 → gate clears.
+    - CLOSED: >75 (> reopen) → stay CLOSED; ≤75 → gate clears.
+    Boundary intent: at exactly 75%, OPEN holds / CLOSED clears; at exactly
+    80%, both hold (no close, no open). The KEY anti-flap change is that a
+    CLOSED window will NOT re-open at 79%.
+    """
+
+    # -- OPEN branch ------------------------------------------------
+
+    def test_open_high_humidity_closes_open_windows(self, engine):
+        """OPEN + humidity 85% (>80) → CLOSE (changed)."""
         result = _decide(
             engine,
             indoor_temps=[74.0],
@@ -424,32 +446,41 @@ class TestHumidityGate:
         )
         assert result.new_state == "CLOSED"
         assert result.changed is True
+        assert "too high" in result.reason.lower()
 
-    def test_humidity_exactly_80_allows(self, engine):
-        """Humidity exactly 80% → allowed (gate is strictly >80)."""
+    def test_open_in_band_holds_open(self, engine):
+        """OPEN + humidity 78% (75–80 deadband) → HOLD OPEN (changed=False)."""
         result = _decide(
             engine,
             indoor_temps=[74.0],
             outdoor_temp=68.0,
             aqi=30,
-            humidity=80.0,
+            humidity=78.0,
+            last_state="OPEN",
         )
         assert result.new_state == "OPEN"
-        assert result.changed is True
+        assert result.changed is False
+        assert "deadband" in result.reason.lower()
 
-    def test_humidity_79_allows(self, engine):
-        """Humidity 79% → allowed."""
-        result = _decide(
-            engine,
-            indoor_temps=[74.0],
-            outdoor_temp=68.0,
-            aqi=30,
-            humidity=79.0,
-        )
-        assert result.new_state == "OPEN"
-        assert result.changed is True
+    def test_open_below_reopen_clears_gate(self, engine):
+        """OPEN + humidity 74% (<75 reopen) → gate returns None (falls through)."""
+        assert engine._check_humidity(DEFAULT_FLOOR, 74.0, "OPEN") is None
 
-    def test_humidity_close_is_not_urgent(self, engine):
+    def test_open_at_80_holds_open(self, engine):
+        """OPEN + humidity exactly 80% → hold OPEN (80 > 80 is False)."""
+        decision = engine._check_humidity(DEFAULT_FLOOR, 80.0, "OPEN")
+        assert decision is not None
+        assert decision.new_state == "OPEN"
+        assert decision.changed is False
+
+    def test_open_at_75_holds_open(self, engine):
+        """OPEN + humidity exactly 75% → hold OPEN (75 ≥ 75 reopen)."""
+        decision = engine._check_humidity(DEFAULT_FLOOR, 75.0, "OPEN")
+        assert decision is not None
+        assert decision.new_state == "OPEN"
+        assert decision.changed is False
+
+    def test_open_humidity_close_is_not_urgent(self, engine):
         """Humidity-triggered close is NOT urgent."""
         result = _decide(
             engine,
@@ -460,6 +491,77 @@ class TestHumidityGate:
             last_state="OPEN",
         )
         assert result.urgent is False
+
+    # -- CLOSED branch ----------------------------------------------
+
+    def test_closed_anti_flap_stays_closed_at_79(self, engine):
+        """CLOSED + humidity 79% (>75 reopen) → stay CLOSED (changed=False).
+
+        Anti-flap regression: previously 79 < 80 max cleared the gate and the
+        window could re-open; now it holds closed until humidity drops to the
+        re-open threshold.
+        """
+        result = _decide(
+            engine,
+            indoor_temps=[74.0],
+            outdoor_temp=68.0,
+            aqi=30,
+            humidity=79.0,
+            last_state="CLOSED",
+        )
+        assert result.new_state == "CLOSED"
+        assert result.changed is False
+        assert "still elevated" in result.reason.lower()
+
+    def test_closed_stays_closed_above_max(self, engine):
+        """CLOSED + humidity 81% → stay CLOSED (changed=False), elevated reason."""
+        result = _decide(
+            engine,
+            indoor_temps=[74.0],
+            outdoor_temp=68.0,
+            aqi=30,
+            humidity=81.0,
+            last_state="CLOSED",
+        )
+        assert result.new_state == "CLOSED"
+        assert result.changed is False
+        assert "re-open threshold" in result.reason
+
+    def test_closed_at_80_stays_closed(self, engine):
+        """CLOSED + humidity exactly 80% → stay CLOSED (80 > 75 reopen)."""
+        decision = engine._check_humidity(DEFAULT_FLOOR, 80.0, "CLOSED")
+        assert decision is not None
+        assert decision.new_state == "CLOSED"
+        assert decision.changed is False
+
+    def test_closed_at_75_clears_gate(self, engine):
+        """CLOSED + humidity exactly 75% → gate clears (75 > 75 reopen is False)."""
+        assert engine._check_humidity(DEFAULT_FLOOR, 75.0, "CLOSED") is None
+
+    def test_closed_below_reopen_clears_and_opens(self, engine):
+        """CLOSED + humidity 74% (≤75) → gate clears; temp/AQI then open."""
+        result = _decide(
+            engine,
+            indoor_temps=[74.0],
+            outdoor_temp=68.0,
+            aqi=30,
+            humidity=74.0,
+            last_state="CLOSED",
+        )
+        assert result.new_state == "OPEN"
+        assert result.changed is True
+
+    def test_closed_high_humidity_blocks_opening(self, engine):
+        """CLOSED + humidity 85% → stay CLOSED even if temp favours opening."""
+        result = _decide(
+            engine,
+            indoor_temps=[74.0],
+            outdoor_temp=68.0,
+            aqi=30,
+            humidity=85.0,
+        )
+        assert result.new_state == "CLOSED"
+        assert result.changed is False
 
 
 # ==================================================================
@@ -691,8 +793,8 @@ class TestEdgeCases:
 
         Indoor 74, open threshold 73. Outdoor oscillates 72.8 ↔ 73.2.
         When CLOSED: 72.8 < 73 → OPEN. Then 73.2 — coolest is 74, close fires
-        only when outdoor > 74. 73.2 < 74 → stays OPEN. Open hysteresis still
-        prevents the immediate reopen flip-flop.
+        only when outdoor > 74 + 1 = 75. 73.2 < 75 → stays OPEN. Symmetric
+        hysteresis prevents the immediate reopen flip-flop.
         """
         r1 = _decide(engine, indoor_temps=[74.0], outdoor_temp=72.8, aqi=30)
         assert r1.new_state == "OPEN"
@@ -1179,6 +1281,24 @@ class TestNeedsAqiOpenSafety:
             engine, last_state="CLOSED", indoor_temps=[74.0], outdoor_temp=80.0
         )
         assert needs is False
+
+    def test_closed_humidity_above_reopen_skips(self, engine):
+        """CLOSED + humidity 78% (> 75 reopen) → skip even if temp favors opening.
+
+        Mirrors R1: the CLOSED humidity mirror now uses ``> humidity_reopen``
+        (75), not ``> max_humidity`` (80). Warm indoor + cool outdoor would
+        otherwise fetch, so this proves the deadband short-circuits first.
+        Previously 78 < 80 continued and AQI would have been fetched.
+        """
+        needs, reason = _needs(
+            engine,
+            last_state="CLOSED",
+            indoor_temps=[78.0],
+            outdoor_temp=65.0,
+            humidity=78.0,
+        )
+        assert needs is False
+        assert "humidity too high" in reason.lower()
 
     def test_closed_but_temp_favors_opening_fetches(self, engine):
         """CLOSED + warm indoor + cool outdoor → fetch to confirm safe."""

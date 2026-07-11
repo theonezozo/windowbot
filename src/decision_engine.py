@@ -68,6 +68,11 @@ class DecisionEngine:
         self.hysteresis_open: float = float(config.get("hysteresis_open_diff", 1.0))
         self.hysteresis_close: float = float(config.get("hysteresis_close_diff", 1.0))
         self.max_humidity: int = int(config.get("max_outdoor_humidity", 80))
+        self.humidity_deadband: float = float(config.get("humidity_deadband", 5))
+        # Re-open/clear threshold: a CLOSED window won't re-open until humidity
+        # drops meaningfully below max (anti-flap deadband), and an OPEN window
+        # holds through the in-between band instead of flapping closed.
+        self.humidity_reopen = self.max_humidity - self.humidity_deadband
         self.aqi_close_threshold: int = int(config.get("max_aqi_threshold", 100))
         self.aqi_open_threshold: int = int(config.get("min_aqi_for_opening", 50))
         self.allowed_hvac_modes: list[str] = list(
@@ -211,7 +216,9 @@ class DecisionEngine:
 
         outdoor_humidity: float | None = outdoor.get("humidity")
         if self.enable_humidity_gate and outdoor_humidity is not None:
-            if outdoor_humidity > self.max_humidity:
+            # Mirror _check_humidity's CLOSED branch: still too humid to open
+            # while humidity remains above the re-open threshold (deadband).
+            if outdoor_humidity > self.humidity_reopen:
                 return False, f"outdoor humidity too high ({outdoor_humidity:.0f}%)"
 
         try:
@@ -287,13 +294,21 @@ class DecisionEngine:
     def _check_humidity(
         self, floor: str, outdoor_humidity: float, last_state: str
     ) -> FloorDecision | None:
-        """Gate 3 — outdoor humidity check.
+        """Gate 3 — outdoor humidity check with anti-flap deadband.
 
-        Returns a FloorDecision if humidity blocks window changes,
+        Uses an asymmetric deadband so a window that just closed near the
+        threshold doesn't immediately re-open when humidity dithers:
+
+        - Close when humidity exceeds ``max_humidity``.
+        - Only treat humidity as *clear* (allow re-open) once it drops below
+          ``humidity_reopen`` (= ``max_humidity - humidity_deadband``).
+        - In the in-between band, hold the current state.
+
+        Returns a FloorDecision if humidity blocks/holds window changes,
         or ``None`` to continue.
         """
-        if outdoor_humidity > self.max_humidity:
-            if last_state == "OPEN":
+        if last_state == "OPEN":
+            if outdoor_humidity > self.max_humidity:
                 return FloorDecision(
                     floor=floor,
                     new_state="CLOSED",
@@ -301,10 +316,29 @@ class DecisionEngine:
                     urgent=False,
                     changed=True,
                 )
+            if outdoor_humidity >= self.humidity_reopen:
+                # In-between band while OPEN — hold to avoid flapping.
+                return self._keep(
+                    floor,
+                    "OPEN",
+                    (
+                        f"Humidity in deadband ({outdoor_humidity:.0f}%, "
+                        f"holding open above {self.humidity_reopen:.0f}% re-open threshold)"
+                    ),
+                )
+            # Below the re-open threshold — humidity clear, continue chain.
+            return None
+
+        # last_state == "CLOSED": stay closed until humidity drops below the
+        # re-open threshold (not merely below max) — the key anti-flap change.
+        if outdoor_humidity > self.humidity_reopen:
             return FloorDecision(
                 floor=floor,
                 new_state="CLOSED",
-                reason=f"Humidity prevents opening ({outdoor_humidity:.0f}%)",
+                reason=(
+                    f"Humidity still elevated ({outdoor_humidity:.0f}% ≥ "
+                    f"{self.humidity_reopen:.0f}% re-open threshold)"
+                ),
                 urgent=False,
                 changed=False,
             )
@@ -326,7 +360,7 @@ class DecisionEngine:
         """Apply temperature comparison with open-side-only hysteresis.
 
         - CLOSED → OPEN: outdoor < warmest − hysteresis_open **and** AQI < 50
-        - OPEN → CLOSED: outdoor > coolest (no close hysteresis)
+        - OPEN → CLOSED: outdoor > coolest + hysteresis_close
         """
         if last_state == "CLOSED":
             open_threshold = warmest - self.hysteresis_open
@@ -354,13 +388,13 @@ class DecisionEngine:
             )
 
         # last_state == "OPEN"
-        if outdoor_temp > coolest:
+        if outdoor_temp > coolest + self.hysteresis_close:
             return FloorDecision(
                 floor=floor,
                 new_state="CLOSED",
                 reason=(
                     f"Outdoor ({outdoor_temp:.1f}°F) warmer than coolest indoor "
-                    f"({coolest:.1f}°F)"
+                    f"({coolest:.1f}°F) by >{self.hysteresis_close:.1f}°F"
                 ),
                 urgent=False,
                 changed=True,
@@ -371,7 +405,7 @@ class DecisionEngine:
             new_state="OPEN",
             reason=(
                 f"Still beneficial (outdoor {outdoor_temp:.1f}°F "
-                f"<= coolest indoor {coolest:.1f}°F)"
+                f"<= coolest indoor {coolest:.1f}°F + {self.hysteresis_close:.1f}°F)"
             ),
             urgent=False,
             changed=False,

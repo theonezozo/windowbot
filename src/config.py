@@ -77,6 +77,7 @@ def get_config() -> dict:
         "hysteresis_open_diff": _env_float("HYSTERESIS_OPEN_DIFF", 1.0),
         "hysteresis_close_diff": _env_float("HYSTERESIS_CLOSE_DIFF", 1.0),
         "max_outdoor_humidity": _env_int("MAX_OUTDOOR_HUMIDITY", 80),
+        "humidity_deadband": _env_int("MAX_OUTDOOR_HUMIDITY_DEADBAND", 5),
         "max_aqi_threshold": _env_int("MAX_AQI_THRESHOLD", 100),
         "min_aqi_for_opening": _env_int("MIN_AQI_FOR_OPENING", 50),
         "comfort_temp_max": _env_float("COMFORT_TEMP_MAX", 72.0),

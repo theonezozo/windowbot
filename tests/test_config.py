@@ -150,6 +150,17 @@ class TestGetConfigDefaults:
         assert cfg["max_outdoor_humidity"] == 80
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_humidity_deadband_default_is_5(self):
+        os.environ.pop("MAX_OUTDOOR_HUMIDITY_DEADBAND", None)
+        cfg = get_config()
+        assert cfg["humidity_deadband"] == 5
+
+    @patch.dict(os.environ, {"MAX_OUTDOOR_HUMIDITY_DEADBAND": "10"})
+    def test_humidity_deadband_override_honored(self):
+        cfg = get_config()
+        assert cfg["humidity_deadband"] == 10
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_notification_cooldown_default(self):
         os.environ.pop("NOTIFICATION_COOLDOWN_HOURS", None)
         cfg = get_config()
