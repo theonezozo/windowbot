@@ -1262,3 +1262,383 @@ class TestStatusPageTimezoneDisplay:
         body = resp.get_body().decode()
         # Sanity: the page actually rendered, not just a stub.
         assert "WindowBot Status" in body
+
+
+# ==================================================================
+# Session 2026-07-12 — Regression + coverage for Gregory's status-page
+# LocalStateManager 500 fix (src/status_page.py) plus the a286636
+# outdoor/AQI new-field renderer shape.
+#
+# Checklist (Gregory):
+#   1. Regression — LocalStateManager / NotImplementedError → 200 with
+#      "local state mode", for BOTH JSON and HTML.
+#   2. get_snapshot_table raising NotImplementedError (and the
+#      getattr(..., None) arm) → graceful 200, never 500.
+#   3. New-field rendering — outdoor range label + jitter/spike badge
+#      render end-to-end through render_status_page.
+#   4. Omitted new fields (legacy snapshot) → from_json defaults them,
+#      render returns 200, no range label, no badge, no crash.
+#   5. AQI block branches at the status-page level: skipped, dual,
+#      single, none, and legacy single-value — each renders at 200.
+# ==================================================================
+
+
+def _wire_state_and_snap(mock_get_state, mock_snap_mgr_cls, floor):
+    """Wire a table-backed state manager + snapshot manager returning ``floor``.
+
+    Mirrors the pattern used by TestRenderStatusPageJsonHistory /
+    TestStatusPageTimezoneDisplay so the full ``render_status_page`` path is
+    exercised hermetically (no Azurite, no network).
+    """
+    state_mgr = MagicMock()
+    state_mgr.get_snapshot_table.return_value = MagicMock()
+    mock_get_state.return_value = state_mgr
+
+    snap_mgr = MagicMock()
+    snap_mgr.get_all_floor_snapshots.return_value = [floor]
+    snap_mgr.get_global_snapshot.return_value = _global_snapshot()
+    snap_mgr.get_temperature_history.return_value = []
+    mock_snap_mgr_cls.return_value = snap_mgr
+    return snap_mgr
+
+
+# ------------------------------------------------------------------
+# Checklist #1 — LocalStateManager regression (would have caught the 500)
+# ------------------------------------------------------------------
+
+
+class TestLocalStateManagerRenders200:
+    """The regression that would have caught Gregory's bug.
+
+    Before the fix, ``render_status_page`` returned HTTP **500** whenever
+    ``get_state_manager()`` returned (or fell back to) a ``LocalStateManager``.
+    The guard ``if not hasattr(state_mgr, 'get_snapshot_table')`` was dead code:
+    ``LocalStateManager`` DEFINES ``get_snapshot_table`` (it raises
+    ``NotImplementedError``), so ``hasattr`` was always True, the guard was
+    skipped, the call raised, and the exception escaped to the outer handler
+    → 500.
+
+    The fix uses ``getattr(..., None)`` and wraps the call in
+    ``try/except NotImplementedError``, returning ``_no_data_response`` at HTTP
+    200. These tests use a REAL ``LocalStateManager`` (so the ``hasattr`` trap is
+    genuinely reproduced) and pin 200 + "local state mode" for both formats.
+    A regression back to 500 fails here.
+    """
+
+    @patch("src.status_page.get_state_manager")
+    def test_local_state_manager_html_returns_200_local_state_mode(self, mock_get_state):
+        from src.state import LocalStateManager
+
+        # Real LocalStateManager: its get_snapshot_table exists AND raises,
+        # exactly the shape that defeated the old hasattr guard.
+        mock_get_state.return_value = LocalStateManager()
+
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200, "LocalStateManager must render 200, not the pre-fix 500."
+        assert resp.mimetype == "text/html"
+        assert "local state mode" in resp.get_body().decode()
+
+    @patch("src.status_page.get_state_manager")
+    def test_local_state_manager_json_returns_200_local_state_mode(self, mock_get_state):
+        from src.state import LocalStateManager
+
+        mock_get_state.return_value = LocalStateManager()
+
+        resp = render_status_page(_make_request(params={"format": "json"}))
+
+        assert resp.status_code == 200, "LocalStateManager (JSON) must render 200, not the pre-fix 500."
+        assert resp.mimetype == "application/json"
+        payload = json.loads(resp.get_body().decode())
+        assert "local state mode" in payload["error"]
+
+
+# ------------------------------------------------------------------
+# Checklist #2 — get_snapshot_table unavailable → graceful 200
+# ------------------------------------------------------------------
+
+
+class TestSnapshotTableUnavailableGraceful:
+    """Both arms of Gregory's guard degrade to a friendly 200, never a 500:
+
+    - ``get_snapshot_table()`` raises ``NotImplementedError``
+      (the local-fallback shape), and
+    - ``get_snapshot_table`` is absent entirely (``getattr(..., None) is None``).
+    """
+
+    @patch("src.status_page.get_state_manager")
+    def test_get_snapshot_table_raises_not_implemented_html_returns_200(self, mock_get_state):
+        state_mgr = MagicMock()
+        state_mgr.get_snapshot_table.side_effect = NotImplementedError(
+            "Snapshot table requires Azure Table Storage."
+        )
+        mock_get_state.return_value = state_mgr
+
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200, "NotImplementedError from get_snapshot_table must not escape to a 500."
+        assert "local state mode" in resp.get_body().decode()
+
+    @patch("src.status_page.get_state_manager")
+    def test_get_snapshot_table_raises_not_implemented_json_returns_200(self, mock_get_state):
+        state_mgr = MagicMock()
+        state_mgr.get_snapshot_table.side_effect = NotImplementedError()
+        mock_get_state.return_value = state_mgr
+
+        resp = render_status_page(_make_request(params={"format": "json"}))
+
+        assert resp.status_code == 200
+        payload = json.loads(resp.get_body().decode())
+        assert "local state mode" in payload["error"]
+
+    @patch("src.status_page.get_state_manager")
+    def test_state_manager_without_get_snapshot_table_returns_200(self, mock_get_state):
+        # spec=[] → no attributes, so getattr(mgr, "get_snapshot_table", None)
+        # is None and the guard's other arm fires.
+        state_mgr = MagicMock(spec=[])
+        mock_get_state.return_value = state_mgr
+
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        assert "local state mode" in resp.get_body().decode()
+
+
+# ------------------------------------------------------------------
+# Checklist #3 — a286636 new-field rendering (range label + suppression badge)
+# ------------------------------------------------------------------
+
+
+class TestNewFieldRenderingAtStatusPage:
+    """The a286636 snapshot shape renders end-to-end through
+    ``render_status_page``: the outdoor range label
+    ("observed Xmin\u2013Ymin ago (N readings)") and the jitter/spike
+    suppression badge. Label/badge strings are matched against the current
+    ``src/status_page.py`` renderer output.
+    """
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_range_label_renders_when_contributors_span_ages(self, mock_get_state, mock_snap_mgr_cls):
+        now = datetime.now(timezone.utc)
+        snap = _floor_snapshot("upstairs")
+        # Oldest 25 min, newest 3 min, 3 contributors → range format fires.
+        snap.outdoor_observation_time = (now - timedelta(minutes=25)).isoformat()
+        snap.outdoor_newest_observation_time = (now - timedelta(minutes=3)).isoformat()
+        snap.outdoor_contributor_count = 3
+
+        _wire_state_and_snap(mock_get_state, mock_snap_mgr_cls, snap)
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        body = resp.get_body().decode()
+        # Exact renderer output — U+2013 en-dash, pluralized "readings".
+        assert "observed 25min\u20133min ago (3 readings)" in body
+
+    @pytest.mark.parametrize(
+        "reason, badge_text",
+        [
+            ("suppressed_jitter", "Sensor swing suppressed"),
+            ("suppressed_spike", "Temperature spike suppressed"),
+        ],
+    )
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_suppression_badge_renders(
+        self, mock_get_state, mock_snap_mgr_cls, reason, badge_text
+    ):
+        snap = _floor_snapshot("upstairs")
+        snap.outdoor_validation_reason = reason
+
+        _wire_state_and_snap(mock_get_state, mock_snap_mgr_cls, snap)
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        body = resp.get_body().decode()
+        # 🛟 lifebuoy glyph + the exact held-steady copy from the renderer.
+        assert "\U0001f6df" in body
+        assert badge_text in body
+        assert "held steady" in body
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_no_suppression_badge_when_reason_absent(self, mock_get_state, mock_snap_mgr_cls):
+        # Normal operation: outdoor_validation_reason is None → no badge glyph.
+        snap = _floor_snapshot("upstairs")
+        snap.outdoor_validation_reason = None
+
+        _wire_state_and_snap(mock_get_state, mock_snap_mgr_cls, snap)
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        assert "\U0001f6df" not in resp.get_body().decode()
+
+
+# ------------------------------------------------------------------
+# Checklist #4 — legacy snapshot omits every a286636 field
+# ------------------------------------------------------------------
+
+
+class TestLegacySnapshotOmittedNewFields:
+    """A legacy snapshot JSON missing every a286636 field is tolerated by
+    ``FloorSnapshot.from_json`` (all new fields default to None) and renders at
+    200 with NO range label and NO suppression badge — no crash.
+    """
+
+    def _legacy_json(self) -> str:
+        # Deliberately omits: outdoor_observation_time, aqi_observation_time,
+        # outdoor_newest_observation_time, outdoor_contributor_count,
+        # outdoor_validation_reason, aqi_readings, aqi_reasons, aqi_skip_reason.
+        return json.dumps(
+            {
+                "floor": "upstairs",
+                "decision": "CLOSED",
+                "reason": "test",
+                "indoor_sensors": [
+                    {"name": "s1", "temperature_f": 70.0, "is_online": True}
+                ],
+                "outdoor_temp_f": 65.0,
+                "outdoor_source": "nws",
+                "outdoor_stations": [],
+                "outdoor_humidity": 50.0,
+                "aqi_value": 25,
+                "aqi_source": "purpleair",
+                "aqi_stations": [],
+                "gates": [],
+                "last_notification_type": None,
+                "last_notification_time": None,
+                "timestamp": "2026-05-19T14:30:00+00:00",
+            }
+        )
+
+    def test_from_json_defaults_all_new_fields_to_none(self):
+        snap = FloorSnapshot.from_json(self._legacy_json())
+        assert snap.outdoor_observation_time is None
+        assert snap.outdoor_newest_observation_time is None
+        assert snap.outdoor_contributor_count is None
+        assert snap.outdoor_validation_reason is None
+        assert snap.aqi_observation_time is None
+        assert snap.aqi_readings is None
+        assert snap.aqi_reasons is None
+        assert snap.aqi_skip_reason is None
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_legacy_snapshot_renders_200_without_range_or_badge(self, mock_get_state, mock_snap_mgr_cls):
+        snap = FloorSnapshot.from_json(self._legacy_json())
+
+        _wire_state_and_snap(mock_get_state, mock_snap_mgr_cls, snap)
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        body = resp.get_body().decode()
+        # No range label (no contributor spread) and no suppression badge.
+        assert "readings)" not in body
+        assert "\U0001f6df" not in body
+        # Sanity: the page still rendered the single legacy AQI value.
+        assert "WindowBot Status" in body
+
+
+# ------------------------------------------------------------------
+# Checklist #5 — AQI block branches at the status-page level
+# ------------------------------------------------------------------
+
+
+class TestAQIBranchesAtStatusPage:
+    """Every AQI branch renders at 200 through the full ``render_status_page``
+    HTML path: skipped, dual-provider, single-provider, source-none, and
+    legacy single-value. Branch-marker strings are matched against the current
+    ``src/status_page.py`` renderer output.
+    """
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_aqi_skip_reason_renders_not_checked(self, mock_get_state, mock_snap_mgr_cls):
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 0
+        snap.aqi_source = "skipped"
+        snap.aqi_skip_reason = "outdoor not cool enough to open (76.0°F ≥ 74.9°F)"
+
+        _wire_state_and_snap(mock_get_state, mock_snap_mgr_cls, snap)
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        body = resp.get_body().decode()
+        assert "not checked" in body
+        assert "outdoor not cool enough to open" in body
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_aqi_dual_provider_renders_both_and_authoritative(self, mock_get_state, mock_snap_mgr_cls):
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 155
+        snap.aqi_source = "purpleair"
+        snap.aqi_readings = {"airnow": 42, "purpleair": 155}
+
+        _wire_state_and_snap(mock_get_state, mock_snap_mgr_cls, snap)
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        body = resp.get_body().decode()
+        assert "AirNow:" in body
+        assert "PurpleAir:" in body
+        assert "driving decision" in body
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_aqi_single_provider_renders_without_none_line(self, mock_get_state, mock_snap_mgr_cls):
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 72
+        snap.aqi_source = "airnow"
+        snap.aqi_readings = {"airnow": 72, "purpleair": None}
+
+        _wire_state_and_snap(mock_get_state, mock_snap_mgr_cls, snap)
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        # Only the AQI-value region of the page must be free of a "None" line;
+        # assert on the environment section to avoid unrelated page chrome.
+        from src.status_page import _render_environment_section
+
+        aqi_section = _render_environment_section(snap).split("Air Quality")[1]
+        assert "72" in aqi_section
+        assert "PurpleAir:" not in aqi_section
+        assert "None" not in aqi_section
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_aqi_source_none_renders_per_provider_reasons(self, mock_get_state, mock_snap_mgr_cls):
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 0
+        snap.aqi_source = "none"
+        snap.aqi_readings = {"airnow": None, "purpleair": None}
+        snap.aqi_reasons = {
+            "airnow": "no API key configured",
+            "purpleair": "402: Payment Required — out of points",
+        }
+
+        _wire_state_and_snap(mock_get_state, mock_snap_mgr_cls, snap)
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        body = resp.get_body().decode()
+        assert "unavailable" in body
+        assert "no API key configured" in body
+        assert "402" in body
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_aqi_absent_renders_legacy_single_value(self, mock_get_state, mock_snap_mgr_cls):
+        # No aqi_readings / aqi_skip_reason → legacy single AQI + Source view.
+        snap = _floor_snapshot("upstairs")
+        snap.aqi_value = 25
+        snap.aqi_source = "purpleair"
+
+        _wire_state_and_snap(mock_get_state, mock_snap_mgr_cls, snap)
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        body = resp.get_body().decode()
+        assert "Source:" in body
+        assert "purpleair" in body
+        assert "not checked" not in body

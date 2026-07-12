@@ -70,15 +70,26 @@ def render_status_page(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         state_mgr = get_state_manager()
-        
-        # Check if snapshot table is available
-        if not hasattr(state_mgr, 'get_snapshot_table'):
+
+        # Check if snapshot table is available. The snapshot table only exists
+        # in Azure Table Storage mode; when the app is running on (or has fallen
+        # back to) local file state, ``get_snapshot_table`` is either absent or
+        # raises ``NotImplementedError``. Both cases mean "no diagnostic data
+        # source" and must render the friendly message — never a 500.
+        get_snapshot_table = getattr(state_mgr, "get_snapshot_table", None)
+        if get_snapshot_table is None:
             return _no_data_response(
                 "Status page requires Azure Table Storage (not available in local state mode).",
                 is_json=wants_json
             )
-        
-        snapshot_table = state_mgr.get_snapshot_table()
+
+        try:
+            snapshot_table = get_snapshot_table()
+        except NotImplementedError:
+            return _no_data_response(
+                "Status page requires Azure Table Storage (not available in local state mode).",
+                is_json=wants_json
+            )
         mgr = SnapshotManager(snapshot_table)
         
         # Fetch snapshots
