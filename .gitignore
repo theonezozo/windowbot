@@ -30,6 +30,7 @@ src/_version.py
 # Local dev state
 .local_state.json
 nws_freshness_metrics.jsonl
+outdoor_contributors.jsonl
 
 # Azure Functions
 local.settings.json

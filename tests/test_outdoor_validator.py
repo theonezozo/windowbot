@@ -75,7 +75,7 @@ def test_false_upward_spike_on_sensor_rotation_is_suppressed():
 
     # Assert
     assert result.suppressed is True
-    assert result.reason == "suppressed_jitter"
+    assert result.reason == "held_uncorroborated_churn"
     assert result.temperature_f == 68.8
     assert result.state_fields["LastOutdoorTemp"] == 68.8
     assert json.loads(result.state_fields["LastOutdoorContributors"]) == {
@@ -99,7 +99,7 @@ def test_false_downward_dip_on_rotation_against_warming_trend_is_suppressed():
 
     # Assert
     assert result.suppressed is True
-    assert result.reason == "suppressed_jitter"
+    assert result.reason == "held_uncorroborated_churn"
     assert result.temperature_f == 67.2
 
 
@@ -123,12 +123,18 @@ def test_same_set_large_move_passes():
 
     # Assert
     assert result.suppressed is False
-    assert result.reason == "genuine_stable_set"
+    assert result.reason == "confident_stable_set"
     assert result.temperature_f == 69.2
 
 
 def test_corroborated_warming_passes_despite_rotation():
-    """Surviving sensor moved same direction by >= epsilon → corroborated pass."""
+    """Surviving sensor moved same direction by >= epsilon → corroborated pass.
+
+    With the corroboration bar set to 1 (``min_corroborating_sources=1``) a
+    single surviving sensor moving the same direction as the median jump is
+    enough independent backing to authorize the churn-coincident move, so it
+    passes as ``confident_corroborated`` on the first poll (no lag).
+    """
     # Arrange
     prev = _prev_state(
         last_temp=68.0,
@@ -138,16 +144,25 @@ def test_corroborated_warming_passes_despite_rotation():
     contributors = _contributors({"KAAA": 68.9, "KCCC": 68.8})
 
     # Act
-    result = validate_outdoor_temperature(68.85, contributors, prev)
+    result = validate_outdoor_temperature(
+        68.85, contributors, prev, min_corroborating_sources=1
+    )
 
     # Assert
     assert result.suppressed is False
-    assert result.reason == "genuine_corroborated"
+    assert result.reason == "confident_corroborated"
     assert result.temperature_f == pytest.approx(68.85)
 
 
-def test_trend_aligned_jump_passes():
-    """Jump aligned with the validated-history trend slope → passes."""
+def test_trend_aligned_churn_jump_is_held():
+    """Trend alone no longer authorizes a churn-coincident jump → HELD.
+
+    A jump aligned with the validated-history trend used to pass
+    (``genuine_trend_aligned``). Under the confidence gate, trend is NOT a
+    pass authorizer: on a contributor-set rotation with no surviving
+    corroborator, the move is held at the last confident value as
+    ``held_uncorroborated_churn`` (signal-trust, not a close-side margin).
+    """
     # Arrange
     prev = _prev_state(
         last_temp=67.5,
@@ -160,9 +175,9 @@ def test_trend_aligned_jump_passes():
     result = validate_outdoor_temperature(68.7, contributors, prev)
 
     # Assert
-    assert result.suppressed is False
-    assert result.reason == "genuine_trend_aligned"
-    assert result.temperature_f == pytest.approx(68.7)
+    assert result.suppressed is True
+    assert result.reason == "held_uncorroborated_churn"
+    assert result.temperature_f == pytest.approx(67.5)
 
 
 # ==================================================================
@@ -403,7 +418,7 @@ def test_sustained_high_reading_passes_next_cycle():
     # Assert
     assert result.suppressed is False
     assert result.temperature_f == pytest.approx(75.1)
-    assert result.reason in ("genuine_stable_set", "genuine_trend_aligned")
+    assert result.reason == "confident_stable_set"
 
 
 def test_spike_reverts_no_false_value():
@@ -436,8 +451,9 @@ def test_large_jump_corroborated_passes():
     """A large jump confirmed by a surviving sensor passes immediately.
 
     The set changes (KBBB out, KCCC in) but KAAA survives and rose +2.5°F,
-    independently corroborating the +2.5°F median jump, so the spike gate is
-    skipped and the move passes as genuine_corroborated.
+    independently corroborating the +2.5°F median jump. The spike gate is
+    skipped (survivor corroboration) and, with the corroboration bar at 1, the
+    confidence gate passes it as ``confident_corroborated``.
     """
     # Arrange
     prev = _prev_state_raw(
@@ -449,41 +465,43 @@ def test_large_jump_corroborated_passes():
     contributors = _contributors({"KAAA": 72.5, "KCCC": 72.5})
 
     # Act
-    result = validate_outdoor_temperature(72.5, contributors, prev)
+    result = validate_outdoor_temperature(
+        72.5, contributors, prev, min_corroborating_sources=1
+    )
 
     # Assert
     assert result.suppressed is False
-    assert result.reason == "genuine_corroborated"
+    assert result.reason == "confident_corroborated"
     assert result.temperature_f == pytest.approx(72.5)
 
 
-def test_large_jump_trend_aligned_passes():
-    """A large jump consistent with a rising trend passes without a hold.
+def test_large_jump_trend_aligned_churn_is_held():
+    """A trend-aligned jump coincident with churn is HELD, not passed.
 
-    A single station on a steadily warming history ([66, 67.5, 69, 70]) jumps
-    +2.5°F. REAL MODULE BEHAVIOR: the contributor set is unchanged, so the
-    module returns `genuine_stable_set` (the unchanged-set path returns BEFORE
-    the trend check). Either way the spike gate does not hold it: the move is
-    both trend-aligned and (single-station) self-corroborated. The key
-    guarantees are that it is not suppressed and the validated temp is 72.5°F.
+    A rising validated history ([66, 67.5, 69, 70]) plus a +2.5°F jump used to
+    pass on trend alignment. Here the contributor set ALSO rotates (KBBB out,
+    KCCC in) and no surviving sensor moves, so there is no independent
+    corroboration. Trend alignment lets the move past the spike gate, but the
+    confidence gate holds it at the last confident value
+    (``held_uncorroborated_churn``) — trend alone no longer authorizes a
+    churn-coincident move.
     """
     # Arrange
     prev = _prev_state_raw(
         last_temp=70.0,
-        contributors={"KAAA": 70.0},
+        contributors={"KAAA": 70.0, "KBBB": 70.0},
         history=[66.0, 67.5, 69.0, 70.0],
         raw_history=[66.0, 67.5, 69.0, 70.0],
     )
-    contributors = _contributors({"KAAA": 72.5})
+    contributors = _contributors({"KAAA": 70.0, "KCCC": 72.5})
 
     # Act
     result = validate_outdoor_temperature(72.5, contributors, prev)
 
     # Assert
-    assert result.suppressed is False
-    assert result.temperature_f == pytest.approx(72.5)
-    # Unchanged set returns genuine_stable_set before the trend branch is reached.
-    assert result.reason == "genuine_stable_set"
+    assert result.suppressed is True
+    assert result.reason == "held_uncorroborated_churn"
+    assert result.temperature_f == pytest.approx(70.0)
 
 
 def test_jump_just_under_max_rate_passes_stable_set():
@@ -507,7 +525,7 @@ def test_jump_just_under_max_rate_passes_stable_set():
 
     # Assert
     assert result.suppressed is False
-    assert result.reason == "genuine_stable_set"
+    assert result.reason == "confident_stable_set"
     assert result.temperature_f == pytest.approx(71.9)
 
 
@@ -624,3 +642,616 @@ def test_full_rotation_custom_max_rate_catches_smaller_spike():
     assert result.reason == "suppressed_spike"
     assert result.suppressed is True
     assert result.temperature_f == pytest.approx(70.0)
+
+
+# ==================================================================
+# F. CONFIDENCE GATE (signal-trust layer — symmetric, NOT a close deadband)
+# ==================================================================
+#
+# A supra-threshold move relative to the LAST CONFIDENT value is trusted only
+# when independently backed (stable contributor set, OR >= N corroborating
+# fresh sources incl. Open-Meteo); otherwise the last confident value is HELD.
+# This suppresses station-rotation artifacts while letting a genuine,
+# corroborated warm-up through on the FIRST poll (so the bare decision-engine
+# close ` > coolest ` fires immediately). The decision-engine close is
+# unchanged; all of this happens upstream in the validator.
+
+
+def _contrib_entry(station_id, temp_f, *, source_type="nws_station", is_cached=False):
+    """Build one rich contributor_log entry as the orchestrator would."""
+    return {
+        "station_id": station_id,
+        "source_type": source_type,
+        "temp_f": temp_f,
+        "is_cached": is_cached,
+    }
+
+
+def _clog_payload(
+    *,
+    contributors,
+    real_station_count,
+    openmeteo_present=False,
+    used_cache_fallback=False,
+    stickiness_active=False,
+):
+    """Build the Phase-2 contributor_log payload the confidence gate reads."""
+    return {
+        "contributors": contributors,
+        "real_station_count": real_station_count,
+        "openmeteo_present": openmeteo_present,
+        "used_cache_fallback": used_cache_fallback,
+        "stickiness_active": stickiness_active,
+    }
+
+
+def _prev_state_conf(
+    *,
+    last_temp,
+    last_confident=None,
+    contributors=None,
+    history=None,
+    raw_history=None,
+    hold_count=0,
+    real_station_count=None,
+):
+    """Build a ``__global__`` state dict including the confidence-gate fields."""
+    st = {
+        "LastOutdoorTemp": last_temp,
+        "LastOutdoorContributors": (
+            json.dumps(contributors) if contributors is not None else ""
+        ),
+        "OutdoorTempHistory": json.dumps(history) if history is not None else "",
+        "OutdoorRawHistory": (
+            json.dumps(raw_history) if raw_history is not None else ""
+        ),
+        "ConfidentHoldCount": hold_count,
+    }
+    if last_confident is not None:
+        st["LastConfidentOutdoorTemp"] = last_confident
+    if real_station_count is not None:
+        st["LastRealStationCount"] = real_station_count
+    return st
+
+
+def test_rotation_artifact_uncorroborated_is_held():
+    """This morning's artifact: rotation churn + no corroboration → HELD.
+
+    A station rotates (KBBB out, KCCC in) and the median snaps 69.7 → 71.6,
+    but the surviving station (KAAA) did not move and no peer agrees. The
+    confidence gate holds the last confident value (69.7) and emits it, so a
+    spurious close is suppressed.
+    """
+    # Arrange
+    prev = _prev_state_conf(
+        last_temp=69.7,
+        last_confident=69.7,
+        contributors={"KAAA": 69.7, "KBBB": 69.7},
+        history=[69.7, 69.7, 69.7],
+        raw_history=[69.7, 69.7, 69.7],
+        real_station_count=2,
+    )
+    contributors = _contributors({"KAAA": 69.7, "KCCC": 71.6})
+    clog = _clog_payload(
+        contributors=[
+            _contrib_entry("KAAA", 69.7),
+            _contrib_entry("KCCC", 71.6),
+        ],
+        real_station_count=2,
+    )
+
+    # Act
+    result = validate_outdoor_temperature(71.6, contributors, prev, contributor_log=clog)
+
+    # Assert
+    assert result.reason == "held_uncorroborated_churn"
+    assert result.suppressed is True
+    assert result.confident is False
+    assert result.temperature_f == pytest.approx(69.7)  # emits last confident
+    assert result.state_fields["LastConfidentOutdoorTemp"] == pytest.approx(69.7)
+    assert result.state_fields["ConfidentHoldCount"] == 1
+
+
+def test_genuine_corroborated_warmup_passes_first_poll():
+    """Genuine warm-up: churn + C>=2 (surviving sensor + Open-Meteo) → passes.
+
+    Even though the contributor set rotates, a surviving station (KAAA +2.0)
+    AND the Open-Meteo peer (+2.2) both confirm the rise, so the +2.0 move is
+    trusted on the FIRST poll as ``confident_corroborated`` — no lag, so the
+    bare decision-engine close can fire this cycle.
+    """
+    # Arrange
+    prev = _prev_state_conf(
+        last_temp=69.0,
+        last_confident=69.0,
+        contributors={"KAAA": 69.0, "KBBB": 69.0, "OPENMETEO": 69.0},
+        history=[69.0, 69.0, 69.0],
+        raw_history=[69.0, 69.0, 69.0],
+        real_station_count=2,
+    )
+    contributors = _contributors({"KAAA": 71.0, "KCCC": 71.0, "OPENMETEO": 71.2})
+    clog = _clog_payload(
+        contributors=[
+            _contrib_entry("KAAA", 71.0),
+            _contrib_entry("KCCC", 71.0),
+            _contrib_entry("OPENMETEO", 71.2, source_type="openmeteo"),
+        ],
+        real_station_count=2,
+        openmeteo_present=True,
+    )
+
+    # Act
+    result = validate_outdoor_temperature(71.0, contributors, prev, contributor_log=clog)
+
+    # Assert
+    assert result.reason == "confident_corroborated"
+    assert result.suppressed is False
+    assert result.confident is True
+    assert result.temperature_f == pytest.approx(71.0)  # emits the fused value
+
+
+def test_confident_stable_set_no_churn_passes():
+    """No churn (identical set, no stickiness, no station drop) → trusted move.
+
+    A supra-threshold move on a stable contributor set is genuine by
+    construction, so it passes as ``confident_stable_set`` without needing
+    corroboration.
+    """
+    # Arrange
+    prev = _prev_state_conf(
+        last_temp=69.0,
+        last_confident=69.0,
+        contributors={"KAAA": 69.0, "KBBB": 69.0},
+        history=[69.0, 69.0, 69.0],
+        raw_history=[69.0, 69.0, 69.0],
+        real_station_count=2,
+    )
+    contributors = _contributors({"KAAA": 71.0, "KBBB": 71.0})
+    clog = _clog_payload(
+        contributors=[
+            _contrib_entry("KAAA", 71.0),
+            _contrib_entry("KBBB", 71.0),
+        ],
+        real_station_count=2,
+    )
+
+    # Act
+    result = validate_outdoor_temperature(71.0, contributors, prev, contributor_log=clog)
+
+    # Assert
+    assert result.reason == "confident_stable_set"
+    assert result.suppressed is False
+    assert result.confident is True
+    assert result.temperature_f == pytest.approx(71.0)
+
+
+def test_cache_fallback_move_is_held():
+    """A move sourced from an LKG cache fallback is not trusted → HELD.
+
+    ``used_cache_fallback`` (or any single ``is_cached`` contributor) marks a
+    cache-driven cycle: the confidence gate refuses to move off the last
+    confident value on cached data (``held_cache_only``).
+    """
+    # Arrange
+    prev = _prev_state_conf(
+        last_temp=69.0,
+        last_confident=69.0,
+        contributors={"KAAA": 69.0, "KBBB": 69.0},
+        history=[69.0, 69.0, 69.0],
+        raw_history=[69.0, 69.0, 69.0],
+        real_station_count=2,
+    )
+    contributors = _contributors({"KAAA": 70.5, "KCCC": 70.5})
+    clog = _clog_payload(
+        contributors=[
+            _contrib_entry("KAAA", 70.5),
+            _contrib_entry("KCCC", 70.5, is_cached=True),
+        ],
+        real_station_count=2,
+        used_cache_fallback=True,
+    )
+
+    # Act
+    result = validate_outdoor_temperature(70.5, contributors, prev, contributor_log=clog)
+
+    # Assert
+    assert result.reason == "held_cache_only"
+    assert result.suppressed is True
+    assert result.confident is False
+    assert result.temperature_f == pytest.approx(69.0)
+
+
+def test_wide_spread_uncorroborated_move_is_held():
+    """Churn + uncorroborated + wide contributor spread (>3°F) → HELD.
+
+    When the surviving station disagrees so badly that the contributor spread
+    exceeds ``confidence_max_spread_f`` (3.0°F) and nothing corroborates, the
+    move is untrustworthy and held as ``held_wide_spread``.
+    """
+    # Arrange
+    prev = _prev_state_conf(
+        last_temp=70.0,
+        last_confident=70.0,
+        contributors={"KAAA": 70.0, "KBBB": 70.0},
+        history=[70.0, 70.0, 70.0],
+        raw_history=[70.0, 70.0, 70.0],
+        real_station_count=2,
+    )
+    contributors = _contributors({"KAAA": 70.0, "KCCC": 74.5})  # spread 4.5°F
+    clog = _clog_payload(
+        contributors=[
+            _contrib_entry("KAAA", 70.0),
+            _contrib_entry("KCCC", 74.5),
+        ],
+        real_station_count=2,
+    )
+
+    # Act
+    result = validate_outdoor_temperature(71.5, contributors, prev, contributor_log=clog)
+
+    # Assert
+    assert result.reason == "held_wide_spread"
+    assert result.suppressed is True
+    assert result.confident is False
+    assert result.temperature_f == pytest.approx(70.0)
+
+
+def test_openmeteo_only_corroboration_passes():
+    """Survivors flat but Open-Meteo agrees + low bar → confident_openmeteo_agree.
+
+    No surviving real sensor moves, but the Open-Meteo peer confirms the rise.
+    With ``min_corroborating_sources=1`` the peer alone authorizes the move,
+    and because ``survivor_c == 0`` the reason is the OM-specific
+    ``confident_openmeteo_agree``.
+    """
+    # Arrange
+    prev = _prev_state_conf(
+        last_temp=69.0,
+        last_confident=69.0,
+        contributors={"KAAA": 69.0, "OPENMETEO": 69.0},
+        history=[69.0, 69.0, 69.0],
+        raw_history=[69.0, 69.0, 69.0],
+        real_station_count=1,
+    )
+    contributors = _contributors({"KAAA": 69.0, "KCCC": 70.5, "OPENMETEO": 70.8})
+    clog = _clog_payload(
+        contributors=[
+            _contrib_entry("KAAA", 69.0),
+            _contrib_entry("KCCC", 70.5),
+            _contrib_entry("OPENMETEO", 70.8, source_type="openmeteo"),
+        ],
+        real_station_count=2,
+        openmeteo_present=True,
+    )
+
+    # Act
+    result = validate_outdoor_temperature(
+        70.5, contributors, prev, contributor_log=clog, min_corroborating_sources=1
+    )
+
+    # Assert
+    assert result.reason == "confident_openmeteo_agree"
+    assert result.suppressed is False
+    assert result.confident is True
+    assert result.temperature_f == pytest.approx(70.5)
+
+
+def test_confidence_hold_safety_valve_releases_at_max_cycles():
+    """A hold never lasts forever: at ``confidence_hold_max_cycles`` it releases.
+
+    With one hold already recorded (``ConfidentHoldCount=1``) and the default
+    max of 2 cycles, a second would-be hold instead RELEASES: the move is
+    accepted as ``hold_expired_accept``, the value becomes confident, and the
+    hold counter resets to 0.
+    """
+    # Arrange
+    prev = _prev_state_conf(
+        last_temp=69.7,
+        last_confident=69.7,
+        contributors={"KAAA": 69.7, "KCCC": 71.6},
+        history=[69.7, 69.7, 69.7],
+        raw_history=[69.7, 69.7, 69.7],
+        hold_count=1,
+        real_station_count=2,
+    )
+    contributors = _contributors({"KAAA": 69.7, "KDDD": 71.6})
+    clog = _clog_payload(
+        contributors=[
+            _contrib_entry("KAAA", 69.7),
+            _contrib_entry("KDDD", 71.6),
+        ],
+        real_station_count=2,
+    )
+
+    # Act
+    result = validate_outdoor_temperature(71.6, contributors, prev, contributor_log=clog)
+
+    # Assert
+    assert result.reason == "hold_expired_accept"
+    assert result.suppressed is False
+    assert result.confident is True
+    assert result.temperature_f == pytest.approx(71.6)
+    assert result.state_fields["ConfidentHoldCount"] == 0
+
+
+def test_uncorroborated_downward_churn_is_also_held():
+    """Symmetry: a churn-driven uncorroborated DOWNWARD move is held too.
+
+    The confidence gate is direction-symmetric (signal-trust, NOT a close-only
+    margin). A rotation that drops the median 70.0 → 68.5 with no corroborating
+    survivor is held exactly like the upward case.
+    """
+    # Arrange
+    prev = _prev_state_conf(
+        last_temp=70.0,
+        last_confident=70.0,
+        contributors={"KAAA": 70.0, "KBBB": 70.0},
+        history=[70.0, 70.0, 70.0],
+        raw_history=[70.0, 70.0, 70.0],
+        real_station_count=2,
+    )
+    contributors = _contributors({"KAAA": 70.0, "KCCC": 68.0})
+    clog = _clog_payload(
+        contributors=[
+            _contrib_entry("KAAA", 70.0),
+            _contrib_entry("KCCC", 68.0),
+        ],
+        real_station_count=2,
+    )
+
+    # Act
+    result = validate_outdoor_temperature(68.5, contributors, prev, contributor_log=clog)
+
+    # Assert
+    assert result.reason == "held_uncorroborated_churn"
+    assert result.suppressed is True
+    assert result.confident is False
+    assert result.temperature_f == pytest.approx(70.0)
+
+
+def test_confidence_disabled_emits_fused_legacy():
+    """``confidence_enabled=False`` → legacy pass-through (``disabled_legacy``).
+
+    With the confidence gate bypassed, a churn-coincident uncorroborated move
+    that would otherwise be held is emitted unchanged and marked confident.
+    """
+    # Arrange
+    prev = _prev_state_conf(
+        last_temp=69.0,
+        last_confident=69.0,
+        contributors={"KAAA": 69.0, "KBBB": 69.0},
+        history=[69.0, 69.0, 69.0],
+        raw_history=[69.0, 69.0, 69.0],
+        real_station_count=2,
+    )
+    contributors = _contributors({"KAAA": 69.0, "KCCC": 71.0})
+    clog = _clog_payload(
+        contributors=[
+            _contrib_entry("KAAA", 69.0),
+            _contrib_entry("KCCC", 71.0),
+        ],
+        real_station_count=2,
+    )
+
+    # Act
+    result = validate_outdoor_temperature(
+        71.0, contributors, prev, contributor_log=clog, confidence_enabled=False
+    )
+
+    # Assert
+    assert result.reason == "disabled_legacy"
+    assert result.suppressed is False
+    assert result.confident is True
+    assert result.temperature_f == pytest.approx(71.0)
+
+
+def test_confidence_disabled_still_suppresses_spike():
+    """Even with the confidence gate off, the spike gate still fires first.
+
+    ``confidence_enabled=False`` bypasses only the confidence gate; the
+    upstream spike gate (and within_threshold band) remain active. A full
+    rotation +2.3°F spike with no survivor is still held as ``suppressed_spike``.
+    """
+    # Arrange
+    prev = _prev_state_conf(
+        last_temp=72.7,
+        last_confident=72.7,
+        contributors={"KAAA": 72.7, "KBBB": 72.7},
+        history=[72.7, 72.7, 72.7],
+        raw_history=[72.7, 72.7, 72.7],
+        real_station_count=2,
+    )
+    contributors = _contributors({"KCCC": 75.0, "KDDD": 75.0})
+    clog = _clog_payload(
+        contributors=[
+            _contrib_entry("KCCC", 75.0),
+            _contrib_entry("KDDD", 75.0),
+        ],
+        real_station_count=2,
+    )
+
+    # Act
+    result = validate_outdoor_temperature(
+        75.0, contributors, prev, contributor_log=clog, confidence_enabled=False
+    )
+
+    # Assert
+    assert result.reason == "suppressed_spike"
+    assert result.suppressed is True
+    assert result.confident is False
+    assert result.temperature_f == pytest.approx(72.7)
+
+
+# ==================================================================
+# G. STATE ROUND-TRIP (confidence-gate persisted fields)
+# ==================================================================
+
+
+def test_confidence_state_round_trips_hold_then_release():
+    """LastConfidentOutdoorTemp / ConfidentHoldCount / LastRealStationCount
+    persist and re-read across cycles: a hold increments the counter, and the
+    safety-valve release resets it.
+
+    Cycle 1 feeds its persisted ``state_fields`` straight back in as the prior
+    state for cycle 2 (exactly as the orchestrator persists to ``__global__``),
+    proving the fields survive a round trip.
+    """
+    # --- Cycle 1: churn + uncorroborated → HELD, counter increments 0 → 1 ---
+    prev1 = _prev_state_conf(
+        last_temp=69.7,
+        last_confident=69.7,
+        contributors={"KAAA": 69.7, "KBBB": 69.7},
+        history=[69.7, 69.7, 69.7],
+        raw_history=[69.7, 69.7, 69.7],
+        hold_count=0,
+        real_station_count=2,
+    )
+    contributors1 = _contributors({"KAAA": 69.7, "KCCC": 71.6})
+    clog1 = _clog_payload(
+        contributors=[_contrib_entry("KAAA", 69.7), _contrib_entry("KCCC", 71.6)],
+        real_station_count=2,
+    )
+
+    r1 = validate_outdoor_temperature(71.6, contributors1, prev1, contributor_log=clog1)
+
+    assert r1.reason == "held_uncorroborated_churn"
+    assert r1.suppressed is True
+    assert r1.state_fields["ConfidentHoldCount"] == 1
+    assert r1.state_fields["LastConfidentOutdoorTemp"] == pytest.approx(69.7)
+    assert r1.state_fields["LastRealStationCount"] == 2
+
+    # --- Cycle 2: re-read persisted state; another churn → safety-valve release
+    prev2 = r1.state_fields  # round-trip the persisted __global__ fields verbatim
+    contributors2 = _contributors({"KAAA": 69.7, "KDDD": 71.6})  # set changes again
+    clog2 = _clog_payload(
+        contributors=[_contrib_entry("KAAA", 69.7), _contrib_entry("KDDD", 71.6)],
+        real_station_count=2,
+    )
+
+    r2 = validate_outdoor_temperature(71.6, contributors2, prev2, contributor_log=clog2)
+
+    # The persisted hold_count (1) was read back; +1 hits the 2-cycle max → release.
+    assert r2.reason == "hold_expired_accept"
+    assert r2.suppressed is False
+    assert r2.confident is True
+    assert r2.temperature_f == pytest.approx(71.6)
+    assert r2.state_fields["ConfidentHoldCount"] == 0  # emit resets the counter
+    assert r2.state_fields["LastConfidentOutdoorTemp"] == pytest.approx(71.6)
+
+
+# ==================================================================
+# H. INTEGRATION — validator + bare decision-engine close (this morning's flap)
+# ==================================================================
+
+
+def _mini_engine():
+    """Minimal DecisionEngine config exercising the bare close path."""
+    from src.decision_engine import DecisionEngine
+
+    return DecisionEngine(
+        {
+            "hysteresis_open_diff": 1.0,
+            "hysteresis_close_diff": 1.0,  # ignored by the reverted bare close
+            "max_outdoor_humidity": 80,
+            "max_aqi_threshold": 100,
+            "min_aqi_for_opening": 50,
+            "allowed_hvac_modes": ["cool", "heatCool", "auto"],
+        }
+    )
+
+
+def test_morning_artifact_replay_stays_open_no_flap():
+    """Replay this morning's artifact: 71.6 rotation with Open-Meteo flat.
+
+    The rotation artifact pushes the raw median to 71.6, but Open-Meteo stays
+    flat and the surviving station doesn't move, so the validator HOLDS 69.7.
+    Feeding the validated 69.7 into the bare decision-engine close ( > coolest
+    of 71.2 ) keeps the window OPEN — no spurious close, no flap.
+    """
+    # Arrange — validator holds the artifact at the last confident 69.7.
+    prev = _prev_state_conf(
+        last_temp=69.7,
+        last_confident=69.7,
+        contributors={"KAAA": 69.7, "KBBB": 69.7, "OPENMETEO": 69.7},
+        history=[69.7, 69.7, 69.7],
+        raw_history=[69.7, 69.7, 69.7],
+        real_station_count=2,
+    )
+    contributors = _contributors({"KAAA": 69.7, "KCCC": 71.6, "OPENMETEO": 69.7})
+    clog = _clog_payload(
+        contributors=[
+            _contrib_entry("KAAA", 69.7),
+            _contrib_entry("KCCC", 71.6),
+            _contrib_entry("OPENMETEO", 69.7, source_type="openmeteo"),  # flat peer
+        ],
+        real_station_count=2,
+        openmeteo_present=True,
+    )
+
+    # Act — validate, then run the bare decision-engine close.
+    val = validate_outdoor_temperature(71.6, contributors, prev, contributor_log=clog)
+    engine = _mini_engine()
+    decision = engine.decide(
+        floor="upstairs",
+        floor_sensors=[{"name": "s", "temperature_f": 71.2, "is_online": True}],
+        outdoor={"temperature_f": val.temperature_f, "humidity": 50.0},
+        aqi={"aqi": 30},
+        hvac_mode="cool",
+        last_state="OPEN",
+        floor_group=["s"],
+    )
+
+    # Assert — held at 69.7 and the window stays OPEN (69.7 < 71.2, no flap).
+    assert val.suppressed is True
+    assert val.temperature_f == pytest.approx(69.7)
+    assert decision.new_state == "OPEN"
+    assert decision.changed is False
+
+
+def test_corroborated_warmup_replay_closes_first_poll():
+    """A genuinely corroborated warm-up feeds the bare close and it fires now.
+
+    When the rise is confirmed (surviving station + Open-Meteo), the validator
+    emits the fused 71.6 on the FIRST poll, so the bare close ( 71.6 > coolest
+    71.2 ) closes the window this cycle — the signal layer does not delay a
+    real move.
+    """
+    # Arrange — corroborated rise so the validator passes it through.
+    prev = _prev_state_conf(
+        last_temp=69.7,
+        last_confident=69.7,
+        contributors={"KAAA": 69.7, "KBBB": 69.7, "OPENMETEO": 69.7},
+        history=[69.7, 69.7, 69.7],
+        raw_history=[69.7, 69.7, 69.7],
+        real_station_count=2,
+    )
+    contributors = _contributors({"KAAA": 71.6, "KCCC": 71.6, "OPENMETEO": 71.8})
+    clog = _clog_payload(
+        contributors=[
+            _contrib_entry("KAAA", 71.6),
+            _contrib_entry("KCCC", 71.6),
+            _contrib_entry("OPENMETEO", 71.8, source_type="openmeteo"),
+        ],
+        real_station_count=2,
+        openmeteo_present=True,
+    )
+
+    # Act
+    val = validate_outdoor_temperature(71.6, contributors, prev, contributor_log=clog)
+    engine = _mini_engine()
+    decision = engine.decide(
+        floor="upstairs",
+        floor_sensors=[{"name": "s", "temperature_f": 71.2, "is_online": True}],
+        outdoor={"temperature_f": val.temperature_f, "humidity": 50.0},
+        aqi={"aqi": 30},
+        hvac_mode="cool",
+        last_state="OPEN",
+        floor_group=["s"],
+    )
+
+    # Assert — passed through and the bare close fires immediately.
+    assert val.suppressed is False
+    assert val.reason == "confident_corroborated"
+    assert val.temperature_f == pytest.approx(71.6)
+    assert decision.new_state == "CLOSED"
+    assert decision.changed is True

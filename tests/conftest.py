@@ -21,6 +21,20 @@ def _isolate_freshness_metrics(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_contributor_log(tmp_path, monkeypatch):
+    """Redirect the per-contributor observability log to a per-test tmp file.
+
+    Without this, any test that reaches ``_write_contributor_log`` /
+    ``NWSClient._record_contributor_log`` (e.g. a full ``run_check`` cycle)
+    would append to the repo-root outdoor_contributors.jsonl and pollute the
+    live runtime log with fixture data. Mirrors ``_isolate_freshness_metrics``.
+    """
+    monkeypatch.setenv(
+        "WINDOWBOT_CONTRIBUTORS_PATH", str(tmp_path / "test_contributors.jsonl")
+    )
+
+
+@pytest.fixture(autouse=True)
 def _reset_orchestrator_singletons():
     """Clear the orchestrator's module-level client singletons between tests.
 

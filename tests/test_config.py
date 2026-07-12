@@ -226,3 +226,89 @@ class TestGetConfigOverrides:
     def test_bool_override(self):
         cfg = get_config()
         assert cfg["enable_humidity_gate"] is False
+
+
+# ------------------------------------------------------------------
+# Outdoor source stickiness (Phase 2)
+# ------------------------------------------------------------------
+
+
+class TestOutdoorSourceStickinessConfig:
+    """``outdoor_source_stickiness`` gates the conservative median-pool
+    retention feature (env ``OUTDOOR_SOURCE_STICKINESS``, default on)."""
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_outdoor_source_stickiness_default_is_true(self):
+        os.environ.pop("OUTDOOR_SOURCE_STICKINESS", None)
+        cfg = get_config()
+        assert cfg["outdoor_source_stickiness"] is True
+
+    @pytest.mark.parametrize("value", ["false", "False", "0", "no", "No"])
+    def test_outdoor_source_stickiness_falsy_disables(self, value):
+        with patch.dict(os.environ, {"OUTDOOR_SOURCE_STICKINESS": value}):
+            cfg = get_config()
+            assert cfg["outdoor_source_stickiness"] is False
+
+    @pytest.mark.parametrize("value", ["true", "True", "TRUE", "1", "yes", "Yes"])
+    def test_outdoor_source_stickiness_truthy_enables(self, value):
+        with patch.dict(os.environ, {"OUTDOOR_SOURCE_STICKINESS": value}):
+            cfg = get_config()
+            assert cfg["outdoor_source_stickiness"] is True
+
+
+# ------------------------------------------------------------------
+# Outdoor signal-confidence gate (revert R2 + confidence gate)
+# ------------------------------------------------------------------
+
+
+class TestOutdoorConfidenceConfig:
+    """The four confidence-gate tuning keys and their env overrides.
+
+    Defaults (architecture decision #1 addendum): the gate is ON, needs 2
+    corroborating sources, holds an uncorroborated churn move whose contributor
+    spread exceeds 3.0°F, and releases a persistent hold after 2 cycles.
+    """
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_confidence_defaults(self):
+        for key in (
+            "OUTDOOR_CONFIDENCE_ENABLED",
+            "OUTDOOR_MIN_CORROBORATING_SOURCES",
+            "OUTDOOR_CONFIDENCE_MAX_SPREAD_F",
+            "OUTDOOR_CONFIDENCE_HOLD_MAX_CYCLES",
+        ):
+            os.environ.pop(key, None)
+        cfg = get_config()
+        assert cfg["outdoor_confidence_enabled"] is True
+        assert cfg["outdoor_min_corroborating_sources"] == 2
+        assert cfg["outdoor_confidence_max_spread_f"] == pytest.approx(3.0)
+        assert cfg["outdoor_confidence_hold_max_cycles"] == 2
+
+    @pytest.mark.parametrize("value", ["false", "False", "0", "no", "No"])
+    def test_confidence_enabled_falsy_disables(self, value):
+        with patch.dict(os.environ, {"OUTDOOR_CONFIDENCE_ENABLED": value}):
+            cfg = get_config()
+            assert cfg["outdoor_confidence_enabled"] is False
+
+    @pytest.mark.parametrize("value", ["true", "True", "1", "yes"])
+    def test_confidence_enabled_truthy_enables(self, value):
+        with patch.dict(os.environ, {"OUTDOOR_CONFIDENCE_ENABLED": value}):
+            cfg = get_config()
+            assert cfg["outdoor_confidence_enabled"] is True
+
+    @patch.dict(os.environ, {"OUTDOOR_MIN_CORROBORATING_SOURCES": "3"})
+    def test_min_corroborating_sources_int_override(self):
+        cfg = get_config()
+        assert cfg["outdoor_min_corroborating_sources"] == 3
+        assert isinstance(cfg["outdoor_min_corroborating_sources"], int)
+
+    @patch.dict(os.environ, {"OUTDOOR_CONFIDENCE_MAX_SPREAD_F": "4.5"})
+    def test_max_spread_float_override(self):
+        cfg = get_config()
+        assert cfg["outdoor_confidence_max_spread_f"] == pytest.approx(4.5)
+
+    @patch.dict(os.environ, {"OUTDOOR_CONFIDENCE_HOLD_MAX_CYCLES": "5"})
+    def test_hold_max_cycles_int_override(self):
+        cfg = get_config()
+        assert cfg["outdoor_confidence_hold_max_cycles"] == 5
+

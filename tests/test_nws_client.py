@@ -13,13 +13,14 @@ Validates design decisions:
 
 from __future__ import annotations
 
+import json
 import statistics
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.nws_client import NWSClient, NWSError
+from src.nws_client import NWSClient, NWSError, _DEFAULT_CONTRIBUTORS_PATH
 
 
 # ------------------------------------------------------------------
@@ -575,3 +576,476 @@ class TestOutdoorFreshnessBoundary:
         assert result["newest_observation_time"] == ts3.isoformat()
         assert result["observation_time"] == ts18.isoformat()
         assert result["newest_observation_time"] != result["observation_time"]
+
+
+# ==================================================================
+# Phase 2 — per-contributor logging + source stickiness
+# ==================================================================
+
+# Fixed single-clock poll timestamp shared by the Phase 2 tests so age math is
+# deterministic (the literal CURRENT_DATETIME of this task).
+_NOW = datetime(2026, 7, 11, 13, 40, 0, tzinfo=timezone.utc)
+
+# Every documented key of a ``_fetch_batch`` attempt dict.
+_ATTEMPT_KEYS = {
+    "station_id", "source_type", "station_class", "temp_f", "obs_time",
+    "age_minutes", "distance_mi", "outcome", "excluded_reason", "is_cached",
+}
+
+
+def _istation(sid, dist, *, personal=True):
+    """Build an internal ``self._stations`` entry for _fetch_batch/get_outdoor."""
+    return {"id": sid, "name": sid, "is_personal": personal, "distance_miles": dist}
+
+
+def _iobs(sid, temp_f, *, now=_NOW, age_minutes=5, humidity=50.0, wind=5.0):
+    """Build the internal observation dict returned by _fetch_single_observation."""
+    return {
+        "station_id": sid,
+        "temperature_f": temp_f,
+        "humidity": humidity,
+        "wind_speed_mph": wind,
+        "timestamp": now - timedelta(minutes=age_minutes),
+    }
+
+
+class TestFetchBatchContract:
+    """``_fetch_batch`` returns ``(results, batch_stats, attempts)`` and emits
+    one fully-populated attempt entry per examined station (checklist #3)."""
+
+    def test_returns_three_tuple_with_all_attempt_keys(self):
+        """3-tuple; one attempt per station; all documented keys; single clock."""
+        client = NWSClient(40.0, -74.0)
+        stations = [
+            _istation("KAAA", 1.0, personal=False),
+            _istation("CW1", 2.0),
+            _istation("CW2", 3.0),
+        ]
+
+        def fetch(sid, _now):
+            client._last_skip_reason = None
+            return _iobs(sid, 70.0, age_minutes=5)
+
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            results, batch_stats, attempts = client._fetch_batch(stations, _NOW, target=3)
+
+        assert len(results) == 3
+        assert isinstance(batch_stats, dict)
+        assert batch_stats["checked"] == 3
+        assert batch_stats["fresh"] == 3
+        assert len(attempts) == 3
+        for att in attempts:
+            assert set(att.keys()) == _ATTEMPT_KEYS
+            assert att["source_type"] == "nws_station"
+            # age_minutes is measured against the single passed `now`.
+            assert att["age_minutes"] == 5.0
+            assert att["outcome"] == "included"
+            assert att["excluded_reason"] is None
+
+        by_id = {a["station_id"]: a for a in attempts}
+        assert by_id["KAAA"]["station_class"] == "official"
+        assert by_id["CW1"]["station_class"] == "personal"
+        assert by_id["KAAA"]["distance_mi"] == 1.0
+        assert by_id["CW2"]["distance_mi"] == 3.0
+
+    def test_age_minutes_uses_passed_now_not_wall_clock(self):
+        """All ages derive from the passed ``now`` — never datetime.now()."""
+        client = NWSClient(40.0, -74.0)
+        stations = [_istation("CW1", 1.0)]
+
+        def fetch(sid, _now):
+            client._last_skip_reason = None
+            return _iobs(sid, 70.0, age_minutes=12)
+
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            _results, _stats, attempts = client._fetch_batch(stations, _NOW, target=3)
+
+        assert attempts[0]["age_minutes"] == 12.0
+        assert attempts[0]["obs_time"] == (_NOW - timedelta(minutes=12)).isoformat()
+
+
+class TestFetchBatchReasonMapping:
+    """Outcome / excluded_reason mapping for every branch (checklist #4)."""
+
+    def test_fresh_reading_included_reason_none(self):
+        client = NWSClient(40.0, -74.0)
+
+        def fetch(sid, _now):
+            client._last_skip_reason = None
+            return _iobs(sid, 71.0)
+
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            _r, _s, attempts = client._fetch_batch([_istation("CW1", 1.0)], _NOW, target=3)
+        assert attempts[0]["outcome"] == "included"
+        assert attempts[0]["excluded_reason"] is None
+
+    def test_stale_reading_maps_to_stale(self):
+        client = NWSClient(40.0, -74.0)
+
+        def fetch(sid, _now):
+            client._last_skip_reason = "stale (25m ago)"
+            return None
+
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            _r, _s, attempts = client._fetch_batch([_istation("CW1", 1.0)], _NOW, target=3)
+        assert attempts[0]["outcome"] == "excluded"
+        assert attempts[0]["excluded_reason"] == "stale"
+
+    def test_api_error_maps_to_api_error(self):
+        client = NWSClient(40.0, -74.0)
+
+        def fetch(sid, _now):
+            raise NWSError("boom")
+
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            _r, _s, attempts = client._fetch_batch([_istation("CW1", 1.0)], _NOW, target=3)
+        assert attempts[0]["excluded_reason"] == "api_error"
+
+    def test_no_temperature_maps_to_no_data(self):
+        client = NWSClient(40.0, -74.0)
+
+        def fetch(sid, _now):
+            client._last_skip_reason = "no temperature"
+            return None
+
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            _r, _s, attempts = client._fetch_batch([_istation("CW1", 1.0)], _NOW, target=3)
+        assert attempts[0]["excluded_reason"] == "no_data"
+
+    def test_cache_within_window_with_fresh_present_is_unused(self):
+        """Cached reading available but a fresh one exists → not used, logged
+        ``cached_available_but_unused`` (never dilutes a fresh pool)."""
+        client = NWSClient(40.0, -74.0)
+        client._station_cache["CW2"] = _iobs("CW2", 65.0, age_minutes=30)
+
+        def fetch(sid, _now):
+            client._last_skip_reason = None
+            if sid == "KAAA":
+                return _iobs("KAAA", 70.0, age_minutes=4)
+            client._last_skip_reason = "stale (40m ago)"
+            return None
+
+        stations = [_istation("KAAA", 1.0, personal=False), _istation("CW2", 2.0)]
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            results, _s, attempts = client._fetch_batch(stations, _NOW, target=3)
+
+        assert len(results) == 1  # only the fresh KAAA
+        cw2 = next(a for a in attempts if a["station_id"] == "CW2")
+        assert cw2["is_cached"] is True
+        assert cw2["outcome"] == "excluded"
+        assert cw2["excluded_reason"] == "cached_available_but_unused"
+        assert cw2["temp_f"] == 65.0  # raw cached temp still carried
+
+    def test_cache_expired_maps_to_cache_expired(self):
+        client = NWSClient(40.0, -74.0)
+        client._station_cache["CW1"] = _iobs("CW1", 60.0, age_minutes=130)  # > 2h
+
+        def fetch(sid, _now):
+            client._last_skip_reason = "stale (130m ago)"
+            return None
+
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            _r, _s, attempts = client._fetch_batch([_istation("CW1", 1.0)], _NOW, target=3)
+        assert attempts[0]["excluded_reason"] == "cache_expired"
+        assert attempts[0]["is_cached"] is False
+
+    def test_lkg_fallback_promotes_cached_to_included(self):
+        """Zero fresh readings → cached LKG promoted to included/None."""
+        client = NWSClient(40.0, -74.0)
+        client._station_cache["CW1"] = _iobs("CW1", 63.0, age_minutes=45)
+
+        def fetch(sid, _now):
+            client._last_skip_reason = "stale (45m ago)"
+            return None
+
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            results, _s, attempts = client._fetch_batch([_istation("CW1", 1.0)], _NOW, target=3)
+
+        assert len(results) == 1
+        assert results[0]["is_cached"] is True
+        assert attempts[0]["outcome"] == "included"
+        assert attempts[0]["excluded_reason"] is None
+        assert attempts[0]["is_cached"] is True
+
+
+class TestFetchBatchPriorityIds:
+    """``priority_ids`` forces sticky stations to be attempted beyond the
+    nearest-`target`; empty/None keeps the legacy walk (checklist #5)."""
+
+    @staticmethod
+    def _five_fresh_client():
+        client = NWSClient(40.0, -74.0)
+        stations = [_istation(f"S{i}", float(i)) for i in range(1, 6)]
+
+        def fetch(sid, _now):
+            client._last_skip_reason = None
+            return _iobs(sid, 70.0)
+
+        return client, stations, fetch
+
+    def test_priority_id_attempted_beyond_target(self):
+        client, stations, fetch = self._five_fresh_client()
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            _r, _s, attempts = client._fetch_batch(
+                stations, _NOW, target=3, priority_ids={"S5"},
+            )
+        attempted = [a["station_id"] for a in attempts]
+        assert attempted == ["S1", "S2", "S3", "S5"]  # S4 skipped, S5 forced
+
+    def test_no_priority_stops_at_target(self):
+        client, stations, fetch = self._five_fresh_client()
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            _r, _s, attempts = client._fetch_batch(stations, _NOW, target=3)
+        attempted = [a["station_id"] for a in attempts]
+        assert attempted == ["S1", "S2", "S3"]  # legacy: stops once target met
+
+    def test_empty_priority_set_stops_at_target(self):
+        client, stations, fetch = self._five_fresh_client()
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            _r, _s, attempts = client._fetch_batch(
+                stations, _NOW, target=3, priority_ids=set(),
+            )
+        assert [a["station_id"] for a in attempts] == ["S1", "S2", "S3"]
+
+
+class TestSelectMedianPool:
+    """``_select_median_pool`` — legacy passthrough & cold-start (checklist
+    #10, #11)."""
+
+    def test_disabled_returns_legacy_nearest_first_pool(self):
+        """stickiness_enabled=False → selection bit-for-bit identical to input."""
+        client = NWSClient(40.0, -74.0)
+        fresh = [_iobs("A", 70.0), _iobs("B", 71.0), _iobs("C", 72.0)]
+        selected, active, sticky_id, excluded = client._select_median_pool(
+            fresh, ["A", "B"], enabled=False, target=3,
+        )
+        assert selected == fresh
+        assert active is False
+        assert sticky_id is None
+        assert excluded == set()
+
+    def test_cold_start_no_sticky_ids_passthrough_inactive(self):
+        """No prior ids (None or empty) → passthrough, stickiness inactive."""
+        client = NWSClient(40.0, -74.0)
+        fresh = [_iobs("A", 70.0), _iobs("B", 71.0)]
+        for sticky in (None, []):
+            selected, active, sticky_id, excluded = client._select_median_pool(
+                fresh, sticky, enabled=True, target=3,
+            )
+            assert selected == fresh
+            assert active is False
+            assert sticky_id is None
+            assert excluded == set()
+
+
+class TestStickinessGetOutdoorConditions:
+    """End-to-end stickiness selection + contributor_log (checklist #8, #9,
+    #12). ``_fetch_single_observation`` is mocked; no network."""
+
+    def _client_with_stations(self, stations):
+        client = NWSClient(40.0, -74.0)
+        client._stations = stations
+        return client
+
+    @staticmethod
+    def _entry(clog, sid):
+        return next(c for c in clog["contributors"] if c["station_id"] == sid)
+
+    def test_fresh_sticky_retained_over_closer_newcomer(self):
+        """Sticky sources stay in the median even when a nearer newcomer is
+        fresh; the excluded newcomer is logged with its RAW temp + the
+        ``stickiness_not_selected`` reason (checklist #8, #12)."""
+        stations = [
+            _istation("D", 1.0),   # closest newcomer
+            _istation("A", 2.0),
+            _istation("B", 3.0),
+            _istation("C", 4.0),
+        ]
+        client = self._client_with_stations(stations)
+        temps = {"A": 70.0, "B": 71.0, "C": 72.0, "D": 60.0}
+
+        def fetch(sid, _now):
+            client._last_skip_reason = None
+            return _iobs(sid, temps[sid])
+
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            result = client.get_outdoor_conditions(
+                sticky_source_ids=["A", "B", "C"], stickiness_enabled=True,
+            )
+
+        # Median is over the retained sticky pool {A,B,C} = 71, NOT the
+        # nearest-first {D,A,B} = 70 — stickiness damps the newcomer's pull.
+        assert result["temperature_f"] == 71.0
+
+        clog = result["contributor_log"]
+        assert clog["selected_source_ids"] == ["A", "B", "C"]
+        assert clog["stickiness_active"] is True
+        assert clog["sticky_source_id"] == "A"
+
+        d = self._entry(clog, "D")
+        assert d["included_in_median"] is False
+        assert d["excluded_reason"] == "stickiness_not_selected"
+        # The critical measurability property: an excluded-yet-fresh source
+        # still carries its raw reading so its accuracy stays analyzable.
+        assert d["temp_f"] == 60.0
+        for sid in ("A", "B", "C"):
+            assert self._entry(clog, sid)["included_in_median"] is True
+
+    def test_stale_sticky_drops_out_newcomer_backfills(self):
+        """A stale sticky source drops; a newcomer backfills to target
+        (checklist #9)."""
+        stations = [
+            _istation("D", 1.0),
+            _istation("A", 2.0),   # sticky, but stale this cycle
+            _istation("B", 3.0),
+            _istation("C", 4.0),
+        ]
+        client = self._client_with_stations(stations)
+        temps = {"B": 71.0, "C": 72.0, "D": 60.0}
+
+        def fetch(sid, _now):
+            client._last_skip_reason = None
+            if sid == "A":
+                client._last_skip_reason = "stale (25m ago)"
+                return None
+            return _iobs(sid, temps[sid])
+
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            result = client.get_outdoor_conditions(
+                sticky_source_ids=["A", "B", "C"], stickiness_enabled=True,
+            )
+
+        clog = result["contributor_log"]
+        assert clog["selected_source_ids"] == ["B", "C", "D"]  # A gone, D in
+        assert clog["stickiness_active"] is False  # no fresh source held back
+        assert self._entry(clog, "D")["included_in_median"] is True
+        a = self._entry(clog, "A")
+        assert a["included_in_median"] is False
+        assert a["excluded_reason"] == "stale"
+
+    def test_openmeteo_prior_id_excluded_from_nws_priority(self):
+        """A prior ``OPENMETEO`` id in ``sticky_source_ids`` is never attempted
+        as an NWS station — the peer blend is unchanged and OPENMETEO is dropped
+        from the NWS priority set (checklist #13, exclusion layer)."""
+        stations = [
+            _istation("A", 1.0),
+            _istation("B", 2.0),
+            _istation("C", 3.0),
+        ]
+        client = self._client_with_stations(stations)
+        temps = {"A": 70.0, "B": 71.0, "C": 72.0}
+        attempted: list[str] = []
+
+        def fetch(sid, _now):
+            client._last_skip_reason = None
+            attempted.append(sid)
+            return _iobs(sid, temps[sid])
+
+        with patch.object(NWSClient, "_fetch_single_observation", side_effect=fetch):
+            result = client.get_outdoor_conditions(
+                sticky_source_ids=["OPENMETEO", "A"], stickiness_enabled=True,
+            )
+
+        # OPENMETEO is never fetched as an NWS station.
+        assert "OPENMETEO" not in attempted
+        clog = result["contributor_log"]
+        assert "OPENMETEO" not in clog["selected_source_ids"]
+
+
+
+class TestRecordContributorLog:
+    """``NWSClient._record_contributor_log`` — JSONL schema, best-effort I/O,
+    and path resolution (checklist #6, #7, #2)."""
+
+    @staticmethod
+    def _sample_record():
+        return {
+            "type": "outdoor_contributors",
+            "schema_version": 1,
+            "timestamp": "2026-07-11T13:40:00+00:00",
+            "poll_id": "abcdef123456",
+            "contributors": [
+                {
+                    "station_id": "KAAA",
+                    "source_type": "nws_station",
+                    "station_class": "official",
+                    "temp_f": 70.0,
+                    "obs_time": "2026-07-11T13:35:00+00:00",
+                    "age_minutes": 5.0,
+                    "distance_mi": 1.0,
+                    "included_in_median": True,
+                    "is_cached": False,
+                    "excluded_reason": None,
+                }
+            ],
+            "median_temp_f": 70.0,
+            "real_station_count": 1,
+            "openmeteo_present": False,
+            "openmeteo_included": False,
+            "used_cache_fallback": False,
+            "is_fallback": False,
+            "source": "nws",
+            "selected_source_ids": ["KAAA"],
+            "stickiness_active": False,
+            "sticky_source_id": None,
+            "validation_reason": "cold_start",
+            "suppressed": False,
+            "raw_temp_f": 70.0,
+            "validated_temp_f": 70.0,
+        }
+
+    def test_writes_exactly_one_wellformed_json_line(self, tmp_path, monkeypatch):
+        """One JSON line carrying every top-level + contributor schema key."""
+        path = tmp_path / "contrib.jsonl"
+        monkeypatch.setenv("WINDOWBOT_CONTRIBUTORS_PATH", str(path))
+
+        NWSClient._record_contributor_log(self._sample_record())
+
+        lines = path.read_text().splitlines()
+        assert len(lines) == 1
+        parsed = json.loads(lines[0])
+
+        top_level = {
+            "type", "schema_version", "timestamp", "poll_id", "contributors",
+            "median_temp_f", "real_station_count", "openmeteo_present",
+            "openmeteo_included", "used_cache_fallback", "is_fallback", "source",
+            "selected_source_ids", "stickiness_active", "sticky_source_id",
+            "validation_reason", "suppressed", "raw_temp_f", "validated_temp_f",
+        }
+        assert top_level <= set(parsed.keys())
+
+        contrib = parsed["contributors"][0]
+        assert set(contrib.keys()) == {
+            "station_id", "source_type", "station_class", "temp_f", "obs_time",
+            "age_minutes", "distance_mi", "included_in_median", "is_cached",
+            "excluded_reason",
+        }
+
+    def test_swallows_io_error_without_raising(self, tmp_path, monkeypatch):
+        """An un-writable path (missing parent dir) must never raise."""
+        bad = tmp_path / "missing_dir" / "contrib.jsonl"
+        monkeypatch.setenv("WINDOWBOT_CONTRIBUTORS_PATH", str(bad))
+
+        # Must not raise despite the parent directory not existing.
+        NWSClient._record_contributor_log(self._sample_record())
+        assert not bad.exists()
+
+    def test_default_path_is_module_constant(self, tmp_path, monkeypatch):
+        """Unset env → writes to the default ``outdoor_contributors.jsonl``
+        (checklist #2)."""
+        assert _DEFAULT_CONTRIBUTORS_PATH == "outdoor_contributors.jsonl"
+        monkeypatch.delenv("WINDOWBOT_CONTRIBUTORS_PATH", raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        NWSClient._record_contributor_log(self._sample_record())
+        assert (tmp_path / "outdoor_contributors.jsonl").exists()
+
+    def test_env_override_path_honored(self, tmp_path, monkeypatch):
+        """``WINDOWBOT_CONTRIBUTORS_PATH`` override is honored (checklist #2)."""
+        custom = tmp_path / "custom_contributors.jsonl"
+        monkeypatch.setenv("WINDOWBOT_CONTRIBUTORS_PATH", str(custom))
+        monkeypatch.chdir(tmp_path)
+
+        NWSClient._record_contributor_log(self._sample_record())
+        assert custom.exists()
+        assert not (tmp_path / "outdoor_contributors.jsonl").exists()

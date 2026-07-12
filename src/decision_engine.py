@@ -360,7 +360,7 @@ class DecisionEngine:
         """Apply temperature comparison with open-side-only hysteresis.
 
         - CLOSED → OPEN: outdoor < warmest − hysteresis_open **and** AQI < 50
-        - OPEN → CLOSED: outdoor > coolest + hysteresis_close
+        - OPEN → CLOSED: outdoor > coolest (no close hysteresis)
         """
         if last_state == "CLOSED":
             open_threshold = warmest - self.hysteresis_open
@@ -388,13 +388,13 @@ class DecisionEngine:
             )
 
         # last_state == "OPEN"
-        if outdoor_temp > coolest + self.hysteresis_close:
+        if outdoor_temp > coolest:
             return FloorDecision(
                 floor=floor,
                 new_state="CLOSED",
                 reason=(
                     f"Outdoor ({outdoor_temp:.1f}°F) warmer than coolest indoor "
-                    f"({coolest:.1f}°F) by >{self.hysteresis_close:.1f}°F"
+                    f"({coolest:.1f}°F)"
                 ),
                 urgent=False,
                 changed=True,
@@ -405,7 +405,7 @@ class DecisionEngine:
             new_state="OPEN",
             reason=(
                 f"Still beneficial (outdoor {outdoor_temp:.1f}°F "
-                f"<= coolest indoor {coolest:.1f}°F + {self.hysteresis_close:.1f}°F)"
+                f"<= coolest indoor {coolest:.1f}°F)"
             ),
             urgent=False,
             changed=False,

@@ -55,18 +55,19 @@ def _decide(
 
 
 # ==================================================================
-# 1. Basic Temperature Logic (1°F symmetric hysteresis)
+# 1. Basic Temperature Logic (asymmetric: 1°F open, NO close hysteresis)
 # ==================================================================
 
 
 class TestTemperatureLogic:
-    """Temperature comparison with 1°F SYMMETRIC hysteresis.
+    """Temperature comparison with asymmetric hysteresis.
 
     Open side (CLOSED→OPEN) requires outdoor < warmest − 1°F. Close side
-    (OPEN→CLOSED) requires outdoor > coolest + 1°F. The symmetric close-side
-    deadband is the intended design (architecture decision #1); an earlier
-    bare ``> coolest`` close (zero close hysteresis) was a bug and has been
-    realigned to the spec.
+    (OPEN→CLOSED) has NO hysteresis — it fires as soon as outdoor > coolest
+    (bare, zero margin). This is design decision #1: the open side keeps its
+    1°F deadband, the close side has none. (An earlier close-side deadband —
+    R2 — was reverted; the morning flap is now handled at the outdoor signal
+    layer, not by holding the window open.)
     """
 
     def test_open_when_outdoor_cooler_than_warmest_minus_1(self, engine):
@@ -88,7 +89,7 @@ class TestTemperatureLogic:
         assert result.changed is False
 
     def test_close_when_outdoor_warmer_than_coolest(self, engine):
-        """OPEN, coolest 70°F, outdoor 72°F → 72 > 70+1 → CLOSE."""
+        """OPEN, coolest 70°F, outdoor 72°F → 72 > 70 → CLOSE (bare, no margin)."""
         result = _decide(
             engine,
             indoor_temps=[70.0],
@@ -100,10 +101,11 @@ class TestTemperatureLogic:
         assert result.changed is True
 
     def test_stay_open_when_outdoor_equals_coolest(self, engine):
-        """OPEN, coolest 70°F, outdoor 70°F → 70 > 70+1 is False → stay OPEN.
+        """OPEN, coolest 70°F, outdoor 70°F → 70 > 70 is False → stay OPEN.
 
-        Close uses a strict ``> coolest + hysteresis_close`` comparison, so
-        outdoor equal to the coolest indoor keeps the window OPEN.
+        Close uses a strict bare ``> coolest`` comparison (no hysteresis), so
+        outdoor exactly equal to the coolest indoor keeps the window OPEN — the
+        flip happens only once outdoor strictly exceeds coolest.
         """
         result = _decide(
             engine,
@@ -115,13 +117,12 @@ class TestTemperatureLogic:
         assert result.new_state == "OPEN"
         assert result.changed is False
 
-    def test_stay_open_when_outdoor_within_close_hysteresis(self, engine):
-        """OPEN, coolest 70°F, outdoor 71°F → 71 > 70+1 is False → stay OPEN.
+    def test_close_fires_when_outdoor_just_above_coolest(self, engine):
+        """OPEN, coolest 70°F, outdoor 71°F → 71 > 70 → CLOSE (no close hysteresis).
 
-        Symmetric close hysteresis: a margin of exactly 1°F is inside the
-        deadband, so the window holds OPEN. Under the old (buggy) zero-close-
-        hysteresis code this incorrectly closed the moment outdoor exceeded
-        coolest.
+        With the close-side deadband reverted (R2), a 1°F margin is no longer
+        held open: the window closes the moment outdoor exceeds the coolest
+        indoor temp. This is the bare ``> coolest`` behavior.
         """
         result = _decide(
             engine,
@@ -130,8 +131,8 @@ class TestTemperatureLogic:
             aqi=30,
             last_state="OPEN",
         )
-        assert result.new_state == "OPEN"
-        assert result.changed is False
+        assert result.new_state == "CLOSED"
+        assert result.changed is True
 
     def test_hysteresis_prevents_oscillation(self, engine):
         """Just barely crossed open threshold, then bounced back."""
@@ -140,7 +141,7 @@ class TestTemperatureLogic:
         assert r1.new_state == "OPEN"
 
         # Now outdoor warms to 73.5 — coolest indoor is 74, close fires only
-        # when outdoor > 74 + 1 = 75. 73.5 < 75 → stay open.
+        # when outdoor > 74 (bare, no margin). 73.5 < 74 → stay open.
         r2 = _decide(
             engine,
             indoor_temps=[74.0],
@@ -171,19 +172,20 @@ class TestTemperatureLogic:
     @pytest.mark.parametrize(
         "outdoor, expected_state",
         [
-            (70.0, "OPEN"),     # margin 0 → within deadband → stay OPEN
-            (71.0, "OPEN"),     # margin exactly 1.0 → boundary, strict > → stay OPEN
-            (71.01, "CLOSED"),  # margin > 1.0 → CLOSE
-            (72.0, "CLOSED"),   # margin 2.0 → CLOSE
+            (69.9, "OPEN"),     # below coolest → stay OPEN
+            (70.0, "OPEN"),     # exactly coolest → strict > → stay OPEN
+            (70.01, "CLOSED"),  # a hair above coolest → CLOSE
+            (71.0, "CLOSED"),   # above coolest → CLOSE
+            (72.0, "CLOSED"),   # above coolest → CLOSE
             (80.0, "CLOSED"),   # way above → CLOSE
         ],
     )
     def test_close_boundary_parametrized(self, engine, outdoor, expected_state):
         """Parametrized boundary tests for OPEN→CLOSED transition.
 
-        Indoor = 70°F (single sensor = coolest). Symmetric close hysteresis:
-        close threshold = 70 + 1 = 71°F, and the window closes only when
-        outdoor > 71 (strict), so margins ≤ 1°F stay OPEN.
+        Indoor = 70°F (single sensor = coolest). NO close hysteresis: the close
+        fires on a strict bare ``outdoor > coolest`` (70°F), so only values
+        strictly above 70°F close; 70°F and below stay OPEN.
         """
         result = _decide(
             engine,
@@ -194,41 +196,45 @@ class TestTemperatureLogic:
         )
         assert result.new_state == expected_state
 
-    def test_close_fires_when_margin_exceeds_close_hysteresis(self, engine):
-        """OPEN, coolest 72°F, outdoor 73.5°F → 73.5 > 72+1 → CLOSE.
+    def test_close_fires_when_outdoor_exceeds_coolest(self, engine):
+        """OPEN, coolest 72°F, outdoor 72.1°F → 72.1 > 72 → CLOSE (bare).
 
-        Focused guard on the symmetric close boundary: the window closes only
-        once outdoor exceeds coolest by MORE than the 1°F close hysteresis.
-        Pinned with a literal 1.5°F margin to fail if the close-side deadband
-        is ever removed (the old bug) or widened.
+        Focused guard on the bare close boundary: with R2 reverted the window
+        closes as soon as outdoor exceeds coolest by ANY margin. Pinned with a
+        sub-degree 0.1°F margin so it fails if a close-side deadband is ever
+        (re)introduced.
         """
         result = _decide(
             engine,
             indoor_temps=[72.0],
-            outdoor_temp=73.5,
+            outdoor_temp=72.1,
             aqi=30,
             last_state="OPEN",
         )
         assert result.new_state == "CLOSED"
         assert result.changed is True
 
-    def test_morning_flap_within_close_hysteresis_stays_open(self, engine):
-        """Regression: outdoor 71.6 vs coolest 71.2 (margin 0.4) → STAY OPEN.
+    @pytest.mark.parametrize("coolest", [60.0, 68.0, 70.0, 72.5, 78.0])
+    def test_close_flips_exactly_at_coolest_no_margin(self, engine, coolest):
+        """Property: for any fixed coolest, the OPEN→CLOSE flip is bare.
 
-        Reproduces this morning's flap. Close threshold = 71.2 + 1.0 = 72.2;
-        71.6 < 72.2 so the window holds OPEN. Before R2 wired up the close
-        hysteresis, this sub-degree margin closed the window and immediately
-        re-opened on the next dip — the oscillation we're fixing.
+        outdoor == coolest → stay OPEN (strict >); outdoor a hair above →
+        CLOSE. There is NO close-side margin, so the flip point is exactly
+        ``outdoor == coolest`` regardless of the coolest value.
         """
-        result = _decide(
-            engine,
-            indoor_temps=[71.2],
-            outdoor_temp=71.6,
-            aqi=30,
-            last_state="OPEN",
+        # Exactly at coolest → strict > is False → stay OPEN.
+        at = _decide(
+            engine, indoor_temps=[coolest], outdoor_temp=coolest,
+            aqi=30, last_state="OPEN",
         )
-        assert result.new_state == "OPEN"
-        assert result.changed is False
+        assert at.new_state == "OPEN"
+        # A hair above coolest → CLOSE (no deadband to absorb it).
+        above = _decide(
+            engine, indoor_temps=[coolest], outdoor_temp=coolest + 0.05,
+            aqi=30, last_state="OPEN",
+        )
+        assert above.new_state == "CLOSED"
+        assert above.changed is True
 
     def test_very_large_differential_opens(self, engine):
         """outdoor 50°F, indoor 80°F → OPEN."""
@@ -793,8 +799,8 @@ class TestEdgeCases:
 
         Indoor 74, open threshold 73. Outdoor oscillates 72.8 ↔ 73.2.
         When CLOSED: 72.8 < 73 → OPEN. Then 73.2 — coolest is 74, close fires
-        only when outdoor > 74 + 1 = 75. 73.2 < 75 → stays OPEN. Symmetric
-        hysteresis prevents the immediate reopen flip-flop.
+        only when outdoor > 74 (bare, no margin). 73.2 < 74 → stays OPEN. The
+        open-side hysteresis alone prevents the immediate reopen flip-flop.
         """
         r1 = _decide(engine, indoor_temps=[74.0], outdoor_temp=72.8, aqi=30)
         assert r1.new_state == "OPEN"

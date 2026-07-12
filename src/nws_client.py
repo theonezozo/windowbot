@@ -42,6 +42,25 @@ _MAX_STATION_DISTANCE_MILES = 10.0
 _PERSONAL_STATION_PREFIXES = ("CRS", "COOP")
 
 
+# Default path for the per-contributor JSONL log. Overridable via the
+# WINDOWBOT_CONTRIBUTORS_PATH env var, mirroring WINDOWBOT_METRICS_PATH.
+_DEFAULT_CONTRIBUTORS_PATH = "outdoor_contributors.jsonl"
+
+# Closed vocabulary for a contributor's ``excluded_reason``. Documented here so
+# the log schema stays stable and downstream analysis can enumerate causes.
+_CONTRIBUTOR_EXCLUDED_REASONS = (
+    "stale",
+    "cache_expired",
+    "api_error",
+    "no_data",
+    "openmeteo_stale",
+    "outside_radius",
+    "cached_available_but_unused",
+    "superseded_target_met",
+    "stickiness_not_selected",
+)
+
+
 class NWSError(Exception):
     """Raised on unrecoverable NWS API errors."""
 
@@ -343,7 +362,10 @@ class NWSClient:
         return station.get("distance_miles", float("inf"))
 
     def get_outdoor_conditions(
-        self, peer_observations: list[dict] | None = None
+        self, peer_observations: list[dict] | None = None,
+        *,
+        sticky_source_ids: list[str] | None = None,
+        stickiness_enabled: bool = False,
     ) -> dict:
         """Compute aggregated outdoor conditions using the MEDIAN of the
         closest weather stations, blending personal, official, and optional
@@ -360,6 +382,12 @@ class NWSClient:
                 observation dicts (e.g., from Open-Meteo) to blend into the
                 median.  Each must have ``station_id``, ``temperature_f``,
                 ``humidity``, ``wind_speed_mph``, and ``timestamp``.
+            sticky_source_ids: NWS station ids that fed the median last cycle
+                (source stickiness). Ignored unless ``stickiness_enabled``.
+            stickiness_enabled: When True, conservatively prefer retaining the
+                still-fresh ``sticky_source_ids`` over newly-appeared stations
+                to damp median-composition churn. When False the selection is
+                bit-for-bit identical to the legacy nearest-first behavior.
 
         Returns:
             Dict with keys:
@@ -369,6 +397,9 @@ class NWSClient:
             - ``station_count`` (int): Number of stations contributing.
             - ``is_fallback`` (bool): True if any official station contributed,
               or if no NWS stations contributed (peer-only).
+            - ``contributor_log`` (dict): fetch-time per-contributor detail for
+              the observability log, finalized by the orchestrator after
+              validation (see ``_record_contributor_log``).
         """
         self.discover_stations()
 
@@ -393,10 +424,27 @@ class NWSClient:
         stations_by_id = {s["id"]: s for s in self._stations}
 
         now = datetime.now(timezone.utc)
-        nws_observations, batch_stats = self._fetch_batch(nearby, now, target=3)
+        # Source stickiness only ever asks _fetch_batch to attempt extra (sticky)
+        # stations; the sticky ids exclude the Open-Meteo peer, whose blend logic
+        # is unchanged. When disabled, priority_ids is None → legacy fetch walk.
+        priority_ids: set | None = None
+        if stickiness_enabled and sticky_source_ids:
+            priority_ids = {sid for sid in sticky_source_ids if sid != "OPENMETEO"}
+        nws_observations, batch_stats, attempts = self._fetch_batch(
+            nearby, now, target=3, priority_ids=priority_ids,
+        )
+
+        # Apply conservative source stickiness over the fresh NWS pool: retain
+        # still-fresh prior contributors, only pulling in a newer station when
+        # needed to reach the target. Legacy behavior when disabled/no sticky.
+        selected_nws, stickiness_active, sticky_source_id, unselected_ids = (
+            self._select_median_pool(
+                nws_observations, sticky_source_ids, stickiness_enabled, target=3,
+            )
+        )
 
         # Blend in any fresh peer observations (e.g., Open-Meteo grid point).
-        all_observations = list(nws_observations)
+        all_observations = list(selected_nws)
         if peer_observations:
             for peer_obs in peer_observations:
                 all_observations.append(peer_obs)
@@ -410,15 +458,14 @@ class NWSClient:
 
         # is_fallback: True if any official (non-personal) NWS station contributed,
         # or if no NWS stations contributed at all (peer-only scenario).
-        peer_ids = {o.get("station_id") for o in (peer_observations or [])}
-        if not nws_observations:
+        if not selected_nws:
             is_fallback = True
         else:
             is_fallback = any(
                 not stations_by_id.get(o["station_id"], {}).get("is_personal", True)
-                for o in nws_observations
+                for o in selected_nws
             )
-        used_cache = any(o.get("is_cached", False) for o in nws_observations)
+        used_cache = any(o.get("is_cached", False) for o in selected_nws)
 
         result = self._aggregate(all_observations, is_fallback, now=now)
         result["used_cache"] = used_cache
@@ -430,11 +477,154 @@ class NWSClient:
             ", some from cache" if used_cache else "",
         )
         self._record_freshness_metric(now, batch_stats, result["temperature_f"])
+
+        # Assemble the fetch-time contributor log. The orchestrator finalizes it
+        # with validation outcome + poll_id and writes one JSONL line per poll.
+        selected_ids = {o.get("station_id") for o in all_observations}
+        result["contributor_log"] = self._build_contributor_log(
+            now=now,
+            attempts=attempts,
+            peer_observations=peer_observations,
+            selected_ids=selected_ids,
+            median_temp_f=result["temperature_f"],
+            is_fallback=is_fallback,
+            used_cache_fallback=used_cache,
+            source="nws",
+            stickiness_active=stickiness_active,
+            sticky_source_id=sticky_source_id,
+        )
         return result
 
+    def _select_median_pool(
+        self,
+        fresh_obs: list[dict],
+        sticky_ids: list[str] | None,
+        enabled: bool,
+        target: int,
+    ) -> tuple[list[dict], bool, str | None, set]:
+        """Conservatively select the median pool from *fresh_obs* (nearest-first).
+
+        Returns ``(selected, stickiness_active, sticky_source_id, excluded_ids)``.
+
+        When *enabled* is False or there are no *sticky_ids*, the input pool is
+        returned unchanged (legacy behavior — the caller already capped fetches
+        at *target*). Otherwise still-fresh sticky stations are retained first
+        and only enough new stations are pulled in to reach *target*, so a
+        single newly-rotated-in station cannot by itself swing the median. Stale
+        sticky sources are simply absent from *fresh_obs* and drop out naturally.
+        """
+        if not enabled or not sticky_ids:
+            return list(fresh_obs), False, None, set()
+
+        sticky = set(sticky_ids)
+        retained = [o for o in fresh_obs if o.get("station_id") in sticky]
+        newcomers = [o for o in fresh_obs if o.get("station_id") not in sticky]
+
+        selected = list(retained)
+        for o in newcomers:
+            if len(selected) >= target:
+                break
+            selected.append(o)
+
+        selected_ids = {o.get("station_id") for o in selected}
+        excluded_ids = {o.get("station_id") for o in fresh_obs} - selected_ids
+        stickiness_active = bool(excluded_ids)
+        # Representative sticky source that was held despite a nearer fresh
+        # newcomer being available and excluded this cycle.
+        sticky_source_id = retained[0].get("station_id") if (stickiness_active and retained) else None
+        return selected, stickiness_active, sticky_source_id, excluded_ids
+
+    def _build_contributor_log(
+        self,
+        *,
+        now: datetime,
+        attempts: list[dict],
+        peer_observations: list[dict] | None,
+        selected_ids: set,
+        median_temp_f: float,
+        is_fallback: bool,
+        used_cache_fallback: bool,
+        source: str,
+        stickiness_active: bool,
+        sticky_source_id: str | None,
+    ) -> dict:
+        """Build the fetch-time contributor-log payload (no I/O).
+
+        Populates one contributor entry per attempted NWS station plus each
+        Open-Meteo peer, always carrying the raw ``temp_f``/``obs_time`` even
+        when a fresh source was NOT selected into the median (the whole point:
+        a source's accuracy stays measurable independent of selection). All
+        ages are computed against the single poll timestamp *now*.
+        """
+        contributors: list[dict] = []
+        for att in attempts:
+            sid = att["station_id"]
+            included = sid in selected_ids
+            reason = att["excluded_reason"]
+            if included:
+                reason = None
+            elif att["outcome"] == "included":
+                # Fresh (or cache-fallback) reading that stickiness did not pick.
+                reason = "stickiness_not_selected"
+            contributors.append(
+                {
+                    "station_id": sid,
+                    "source_type": att["source_type"],
+                    "station_class": att["station_class"],
+                    "temp_f": att["temp_f"],
+                    "obs_time": att["obs_time"],
+                    "age_minutes": att["age_minutes"],
+                    "distance_mi": att["distance_mi"],
+                    "included_in_median": included,
+                    "is_cached": att["is_cached"],
+                    "excluded_reason": reason,
+                }
+            )
+
+        openmeteo_present = bool(peer_observations)
+        openmeteo_included = False
+        for peer in peer_observations or []:
+            pid = peer.get("station_id", "OPENMETEO")
+            included = pid in selected_ids
+            openmeteo_included = openmeteo_included or included
+            pts = peer.get("timestamp")
+            contributors.append(
+                {
+                    "station_id": pid,
+                    "source_type": "openmeteo",
+                    "station_class": "grid",
+                    "temp_f": peer.get("temperature_f"),
+                    "obs_time": pts.isoformat() if pts is not None else None,
+                    "age_minutes": round((now - pts).total_seconds() / 60.0, 1) if pts is not None else None,
+                    "distance_mi": None,
+                    "included_in_median": included,
+                    "is_cached": False,
+                    "excluded_reason": None if included else "openmeteo_stale",
+                }
+            )
+
+        real_station_count = sum(
+            1 for c in contributors
+            if c["source_type"] == "nws_station" and c["included_in_median"]
+        )
+        return {
+            "contributors": contributors,
+            "median_temp_f": median_temp_f,
+            "real_station_count": real_station_count,
+            "openmeteo_present": openmeteo_present,
+            "openmeteo_included": openmeteo_included,
+            "used_cache_fallback": used_cache_fallback,
+            "is_fallback": is_fallback,
+            "source": source,
+            "selected_source_ids": sorted(sid for sid in selected_ids if sid is not None),
+            "stickiness_active": stickiness_active,
+            "sticky_source_id": sticky_source_id,
+        }
+
     def _fetch_batch(
-        self, stations: list[dict], now: datetime, target: int
-    ) -> list[dict]:
+        self, stations: list[dict], now: datetime, target: int,
+        priority_ids: set | None = None,
+    ) -> tuple[list[dict], dict, list[dict]]:
         """Walk *stations* in order, fetching until *target* valid readings
         are collected or the list is exhausted.
 
@@ -445,22 +635,67 @@ class NWSClient:
 
         Valid observations are stored in ``self._station_cache`` for use as
         last-known-good (LKG) fallbacks on future calls within the same run.
+
+        *priority_ids* (source stickiness): station ids that must be attempted
+        even after *target* fresh readings are collected, so their freshness is
+        known this cycle and the stickiness selector can decide whether to
+        retain them. When empty/None the walk stops at *target* exactly as
+        before (legacy behavior).
+
+        Returns a ``(results, batch_stats, attempts)`` tuple. ``attempts`` is a
+        per-station attempt list — one dict per station examined — carrying the
+        raw reading (even when not selected) for the per-contributor log::
+
+            {station_id, source_type, station_class, temp_f|None, obs_time|None,
+             age_minutes|None, distance_mi|None, outcome ("included"|"excluded"),
+             excluded_reason|None, is_cached}
+
+        The fetch-level ``outcome`` reflects only whether a usable reading was
+        obtained here; the caller applies stickiness and rewrites the final
+        ``included_in_median`` / ``excluded_reason``.
         """
+        pending_priority = set(priority_ids or ())
         results: list[dict] = []
         cached_results: list[dict] = []
+        attempts: list[dict] = []
+        # station_id -> attempt dict for cached readings, so the LKG-fallback
+        # branch below can flip them to "included" without re-deriving state.
+        cached_attempts: dict[str, dict] = {}
         checked = 0
         fresh_count = 0
         cached_available = 0
 
         for stn in stations:
-            if len(results) >= target:
+            have_enough = len(results) >= target
+            sid = stn["id"]
+            # Stop once target fresh readings exist AND every priority station
+            # has been attempted. Non-priority stations are skipped (not
+            # attempted) once we already have enough — bounding extra fetches to
+            # the sticky set only.
+            if have_enough and not pending_priority:
                 break
+            if have_enough and sid not in pending_priority:
+                continue
+            pending_priority.discard(sid)
 
             checked += 1
-            sid = stn["id"]
             stype = "personal" if stn.get("is_personal", True) else "official"
             dist = stn.get("distance_miles", float("inf"))
+            dist_mi = None if dist == float("inf") else round(dist, 1)
             dist_str = f"{dist:4.1f} mi" if dist != float("inf") else " ??? mi"
+
+            attempt = {
+                "station_id": sid,
+                "source_type": "nws_station",
+                "station_class": "personal" if stn.get("is_personal", True) else "official",
+                "temp_f": None,
+                "obs_time": None,
+                "age_minutes": None,
+                "distance_mi": dist_mi,
+                "outcome": "excluded",
+                "excluded_reason": None,
+                "is_cached": False,
+            }
 
             self._last_skip_reason = None
             api_error: NWSError | None = None
@@ -480,6 +715,13 @@ class NWSClient:
                 self._station_cache[sid] = obs
                 fresh_count += 1
                 results.append(obs)
+                attempt.update(
+                    temp_f=obs["temperature_f"],
+                    obs_time=obs["timestamp"].isoformat(),
+                    age_minutes=round(age.total_seconds() / 60.0, 1),
+                    outcome="included",
+                )
+                attempts.append(attempt)
                 continue
 
             # Station was skipped — try the LKG cache.
@@ -495,12 +737,23 @@ class NWSClient:
                     )
                     cached_available += 1
                     cached_results.append(cached_obs)
+                    attempt.update(
+                        temp_f=cached["temperature_f"],
+                        obs_time=cached["timestamp"].isoformat(),
+                        age_minutes=round(cache_age.total_seconds() / 60.0, 1),
+                        is_cached=True,
+                        excluded_reason="cached_available_but_unused",
+                    )
+                    cached_attempts[sid] = attempt
+                    attempts.append(attempt)
                     continue
                 else:
                     logger.info(
                         "  #%-2d  %-8s  (%-8s %s) → ✗ no recent data (cache expired)",
                         checked, sid, stype + ",", dist_str,
                     )
+                    attempt["excluded_reason"] = "cache_expired"
+                    attempts.append(attempt)
                     continue
 
             # No cache entry — log original rejection reason.
@@ -509,12 +762,17 @@ class NWSClient:
                     "  #%-2d  %-8s  (%-8s %s) → ✗ API error: %s",
                     checked, sid, stype + ",", dist_str, api_error,
                 )
+                attempt["excluded_reason"] = "api_error"
             else:
                 reason = self._last_skip_reason or "unknown"
                 logger.info(
                     "  #%-2d  %-8s  (%-8s %s) → ✗ %s",
                     checked, sid, stype + ",", dist_str, reason,
                 )
+                attempt["excluded_reason"] = (
+                    "stale" if reason.startswith("stale") else "no_data"
+                )
+            attempts.append(attempt)
 
         # Stale/cached readings must NEVER dilute the median when fresh readings
         # exist. Only fall back to LKG cache if zero fresh readings were found.
@@ -522,6 +780,13 @@ class NWSClient:
         if not results and cached_results:
             results = cached_results
             used_cache_fallback = True
+            # Promote the used cached readings from "unused" to included in the
+            # attempt log so the record reflects the LKG-fallback decision.
+            for cobs in cached_results:
+                catt = cached_attempts.get(cobs.get("station_id"))
+                if catt is not None:
+                    catt["outcome"] = "included"
+                    catt["excluded_reason"] = None
             logger.info(
                 "No fresh readings found; falling back to %d cached LKG reading%s.",
                 len(cached_results), "s" if len(cached_results) != 1 else "",
@@ -551,7 +816,7 @@ class NWSClient:
             "cached_available": cached_available,
             "valid": len(results),
         }
-        return results, batch_stats
+        return results, batch_stats, attempts
 
     @staticmethod
     def _aggregate(
@@ -649,3 +914,24 @@ class NWSClient:
         except Exception:
             # Never let metrics break the main flow
             logger.debug("Could not write freshness metric", exc_info=True)
+
+    @staticmethod
+    def _record_contributor_log(record: dict) -> None:
+        """Append one per-contributor observability record to a JSONL file.
+
+        Records are appended to the file specified by WINDOWBOT_CONTRIBUTORS_PATH
+        (default: outdoor_contributors.jsonl in cwd), mirroring the best-effort
+        discipline of ``_record_freshness_metric``. Never raises — a logging
+        failure must never break a poll.
+        """
+        try:
+            import json
+            import os
+            path = os.environ.get(
+                "WINDOWBOT_CONTRIBUTORS_PATH", _DEFAULT_CONTRIBUTORS_PATH
+            )
+            with open(path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception:
+            # Never let contributor logging break the main flow.
+            logger.debug("Could not write contributor log", exc_info=True)

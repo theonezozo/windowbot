@@ -112,6 +112,81 @@ def _record_validation_metric(
         logger.debug("Could not write validation metric", exc_info=True)
 
 
+def _synthesize_contributor_log(outdoor: dict, raw_temp: float) -> dict:
+    """Minimal contributor-log payload for the Open-Meteo-only fallback paths.
+
+    The NWS path builds a rich ``contributor_log`` inside ``get_outdoor_conditions``;
+    the last-resort / sole-peer fallbacks build their ``outdoor`` dict inline and
+    carry no fetch-time detail, so synthesize a single OM contributor here so
+    every poll still emits one record.
+    """
+    obs_time = outdoor.get("observation_time")
+    is_cached = bool(outdoor.get("used_cache", False))
+    contributors = [
+        {
+            "station_id": "OPENMETEO",
+            "source_type": "openmeteo",
+            "station_class": "grid",
+            "temp_f": raw_temp,
+            "obs_time": obs_time,
+            "age_minutes": None,
+            "distance_mi": None,
+            "included_in_median": True,
+            "is_cached": is_cached,
+            "excluded_reason": None,
+        }
+    ]
+    return {
+        "contributors": contributors,
+        "median_temp_f": raw_temp,
+        "real_station_count": 0,
+        "openmeteo_present": True,
+        "openmeteo_included": True,
+        "used_cache_fallback": is_cached,
+        "is_fallback": bool(outdoor.get("is_fallback", True)),
+        "source": outdoor.get("source", "openmeteo"),
+        "selected_source_ids": ["OPENMETEO"],
+        "stickiness_active": False,
+        "sticky_source_id": None,
+    }
+
+
+def _write_contributor_log(
+    outdoor: dict,
+    val: "OutdoorValidationResult",
+    raw_temp: float,
+    poll_start: datetime,
+) -> None:
+    """Finalize and write the per-contributor observability record (one per poll).
+
+    Merges the fetch-time ``contributor_log`` (or a synthesized fallback) with
+    the post-validation outcome and writes a single JSONL line via
+    ``NWSClient._record_contributor_log`` (which never raises). This wrapper
+    additionally swallows any assembly error so logging can't break a poll.
+    """
+    try:
+        import uuid
+        clog = outdoor.get("contributor_log")
+        if clog is None:
+            clog = _synthesize_contributor_log(outdoor, raw_temp)
+        record = {
+            "type": "outdoor_contributors",
+            "schema_version": 1,
+            "timestamp": poll_start.astimezone(timezone.utc).isoformat(),
+            "poll_id": uuid.uuid4().hex[:12],
+            **clog,
+            "validation_reason": val.reason,
+            "suppressed": val.suppressed,
+            "confidence_reason": val.confidence_reason,
+            "confident": val.confident,
+            "raw_temp_f": round(raw_temp, 1),
+            "validated_temp_f": round(val.temperature_f, 1),
+        }
+        NWSClient._record_contributor_log(record)
+    except Exception:
+        logger.debug("Could not assemble contributor log", exc_info=True)
+
+
 def run_check() -> None:
     """Top-level orchestration called by the timer trigger.
 
@@ -172,9 +247,23 @@ def run_check() -> None:
             logger.warning("Open-Meteo peer unavailable (unexpected %s): %s", type(exc).__name__, exc)
 
         outdoor = None
+        # Read prior global state once: reused for source stickiness (the prior
+        # cycle's median contributor ids) and for downstream jitter validation.
+        prev_outdoor_state = state_mgr.get_floor_state("__global__")
+        prior_selected_ids: list[str] = []
+        try:
+            import json as _json
+            _prior_map = _json.loads(prev_outdoor_state.get("LastOutdoorContributors") or "{}")
+            if isinstance(_prior_map, dict):
+                prior_selected_ids = [str(k) for k in _prior_map.keys()]
+        except (ValueError, TypeError):
+            prior_selected_ids = []
+        stickiness_enabled = config.get("outdoor_source_stickiness", True)
         try:
             outdoor = _get_nws_client(config).get_outdoor_conditions(
-                peer_observations=[om_obs] if om_obs else None
+                peer_observations=[om_obs] if om_obs else None,
+                sticky_source_ids=prior_selected_ids,
+                stickiness_enabled=stickiness_enabled,
             )
         except NWSError as exc:
             logger.warning("NWS failed (%s).", exc)
@@ -205,7 +294,6 @@ def run_check() -> None:
         # Suppress availability-driven jitter in the fused outdoor temperature
         # without lagging genuine movement (see outdoor_validator).
         try:
-            prev_outdoor_state = state_mgr.get_floor_state("__global__")
             _raw_outdoor_temp = outdoor["temperature_f"]
             _val = validate_outdoor_temperature(
                 fused_temp=_raw_outdoor_temp,
@@ -214,6 +302,11 @@ def run_check() -> None:
                 jitter_threshold_f=config.get("outdoor_jitter_threshold_f", 0.5),
                 trend_window=config.get("outdoor_jitter_trend_window", 6),
                 spike_max_rate_f=config.get("outdoor_spike_max_rate_f", 2.0),
+                contributor_log=outdoor.get("contributor_log"),
+                min_corroborating_sources=config.get("outdoor_min_corroborating_sources", 2),
+                confidence_max_spread_f=config.get("outdoor_confidence_max_spread_f", 3.0),
+                confidence_hold_max_cycles=config.get("outdoor_confidence_hold_max_cycles", 2),
+                confidence_enabled=config.get("outdoor_confidence_enabled", True),
             )
             if _val.suppressed:
                 logger.info(
@@ -222,10 +315,14 @@ def run_check() -> None:
                 )
             outdoor["temperature_f"] = _val.temperature_f
             outdoor["validation_reason"] = _val.reason
+            outdoor["confidence_reason"] = _val.confidence_reason
             state_mgr.update_floor_state("__global__", _val.state_fields)
             _record_validation_metric(
                 datetime.now(timezone.utc), _raw_outdoor_temp, _val
             )
+            # Per-contributor observability log: one JSONL line per poll, written
+            # AFTER validation so it carries the validated temp + suppression.
+            _write_contributor_log(outdoor, _val, _raw_outdoor_temp, poll_start)
         except Exception:
             logger.exception("Outdoor temp validation failed — using raw fused temp.")
 

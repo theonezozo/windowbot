@@ -12,15 +12,18 @@ Validates design decisions:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
 import pytest
 
 from src.orchestrator import run_check, _fetch_aqi, _evaluate_floor, _NOTIFICATION_COOLDOWN
 from src.ecobee_client import EcobeeAuthError, EcobeeApiError
-from src.nws_client import NWSError
+from src.nws_client import NWSClient, NWSError
 from src.openmeteo_client import OpenMeteoError
+from src.outdoor_validator import OutdoorValidationResult
 from src.decision_engine import DecisionEngine, FloorDecision, InsufficientDataError
 
 
@@ -2045,4 +2048,442 @@ class TestNotificationTypeDedup:
         # Persisted time is a fresh ISO-8601 timestamp parseable back to a datetime.
         parsed = datetime.fromisoformat(record["LastNotificationTime"])
         assert parsed.tzinfo is not None
+
+
+# ------------------------------------------------------------------
+# Phase 2 — per-contributor observability log (Gregory's feature)
+# ------------------------------------------------------------------
+
+
+class TestOutdoorContributorLog:
+    """``run_check`` finalizes and writes exactly one per-contributor record
+    per poll (checklist #13, #14, #15).
+
+    All tests drive ``run_check`` with **empty floor sensor lists** so the
+    per-floor loop is skipped entirely — the contributor-log write happens in
+    the outdoor-validation block *before* any floor is evaluated, so no AQI /
+    decision-engine / snapshot machinery is needed. External clients are
+    mocked; no network. ``_record_contributor_log`` (the only I/O) is patched
+    so the assembled record can be inspected in-memory.
+    """
+
+    @staticmethod
+    def _nws_outdoor(raw_temp):
+        """A realistic NWS ``get_outdoor_conditions`` return value carrying a
+        fetch-time ``contributor_log`` whose ``median_temp_f`` is the RAW
+        (pre-validation) median."""
+        return {
+            "temperature_f": raw_temp,
+            "humidity": 55.0,
+            "wind_speed_mph": 5.0,
+            "station_count": 3,
+            "is_fallback": False,
+            "used_cache": False,
+            "source": "nws",
+            "observation_time": "2026-07-11T13:35:00+00:00",
+            "contributors": [
+                {"station_id": "KAAA", "temperature_f": raw_temp},
+                {"station_id": "CW1", "temperature_f": raw_temp + 1.0},
+            ],
+            "contributor_log": {
+                "contributors": [
+                    {
+                        "station_id": "KAAA", "source_type": "nws_station",
+                        "station_class": "official", "temp_f": raw_temp,
+                        "obs_time": "2026-07-11T13:35:00+00:00", "age_minutes": 5.0,
+                        "distance_mi": 1.0, "included_in_median": True,
+                        "is_cached": False, "excluded_reason": None,
+                    },
+                ],
+                "median_temp_f": raw_temp,  # RAW median — must survive to the record
+                "real_station_count": 1,
+                "openmeteo_present": False,
+                "openmeteo_included": False,
+                "used_cache_fallback": False,
+                "is_fallback": False,
+                "source": "nws",
+                "selected_source_ids": ["KAAA"],
+                "stickiness_active": False,
+                "sticky_source_id": None,
+            },
+        }
+
+    @patch("src.orchestrator.SnapshotManager")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator._get_nws_client")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_prior_selected_ids_read_from_last_outdoor_contributors(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_get_nws, mock_om_cls, mock_snap_cls,
+    ):
+        """The prior cycle's ``LastOutdoorContributors`` (``__global__``) keys are
+        read and forwarded as ``sticky_source_ids`` with ``stickiness_enabled``
+        from config (checklist #13). OPENMETEO is filtered downstream inside
+        ``get_outdoor_conditions`` (see the NWS-client stickiness tests)."""
+        mock_config.return_value = _base_config(
+            upstairs_sensors=[], downstairs_sensors=[],
+            outdoor_source_stickiness=True,
+        )
+        mock_state = MagicMock()
+        mock_state.get_floor_state.return_value = {
+            "CurrentState": "CLOSED",
+            "LastOutdoorContributors": json.dumps(
+                {"KAAA": 70.0, "CW1": 71.0, "OPENMETEO": 72.0}
+            ),
+        }
+        mock_state_cls.return_value = mock_state
+
+        mock_ecobee = MagicMock()
+        mock_ecobee.get_sensors.return_value = []
+        mock_ecobee.get_hvac_mode.return_value = "cool"
+        mock_ecobee_cls.return_value = mock_ecobee
+
+        mock_nws = MagicMock()
+        mock_nws.get_outdoor_conditions.return_value = self._nws_outdoor(70.0)
+        mock_get_nws.return_value = mock_nws
+
+        mock_om_cls.return_value.get_observation.side_effect = OpenMeteoError("no peer")
+        mock_snap_cls.return_value = MagicMock()
+
+        run_check()
+
+        mock_nws.get_outdoor_conditions.assert_called_once()
+        kwargs = mock_nws.get_outdoor_conditions.call_args.kwargs
+        # All prior contributor ids are forwarded (OPENMETEO is dropped from the
+        # NWS priority set inside get_outdoor_conditions, not here).
+        assert set(kwargs["sticky_source_ids"]) >= {"KAAA", "CW1"}
+        assert kwargs["stickiness_enabled"] is True
+
+    @patch("src.orchestrator.SnapshotManager")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator._get_nws_client")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_stickiness_disabled_forwarded_from_config(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_get_nws, mock_om_cls, mock_snap_cls,
+    ):
+        """``outdoor_source_stickiness=False`` in config → ``stickiness_enabled``
+        forwarded as False (checklist #13)."""
+        mock_config.return_value = _base_config(
+            upstairs_sensors=[], downstairs_sensors=[],
+            outdoor_source_stickiness=False,
+        )
+        mock_state = MagicMock()
+        mock_state.get_floor_state.return_value = {"CurrentState": "CLOSED"}
+        mock_state_cls.return_value = mock_state
+
+        mock_ecobee = MagicMock()
+        mock_ecobee.get_sensors.return_value = []
+        mock_ecobee.get_hvac_mode.return_value = "cool"
+        mock_ecobee_cls.return_value = mock_ecobee
+
+        mock_nws = MagicMock()
+        mock_nws.get_outdoor_conditions.return_value = self._nws_outdoor(70.0)
+        mock_get_nws.return_value = mock_nws
+
+        mock_om_cls.return_value.get_observation.side_effect = OpenMeteoError("no peer")
+        mock_snap_cls.return_value = MagicMock()
+
+        run_check()
+
+        kwargs = mock_nws.get_outdoor_conditions.call_args.kwargs
+        assert kwargs["stickiness_enabled"] is False
+        # Cold start (no prior contributors) → empty sticky set forwarded.
+        assert kwargs["sticky_source_ids"] == []
+
+    @patch.object(NWSClient, "_record_contributor_log")
+    @patch("src.orchestrator.validate_outdoor_temperature")
+    @patch("src.orchestrator.SnapshotManager")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator._get_nws_client")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_exactly_one_record_after_validation_median_is_raw(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_get_nws, mock_om_cls, mock_snap_cls, mock_validate, mock_record,
+    ):
+        """One record per poll, written AFTER validation, carrying
+        ``validation_reason`` / ``suppressed`` / ``raw_temp_f`` /
+        ``validated_temp_f``; ``median_temp_f`` is the RAW pre-validation median
+        (checklist #14)."""
+        mock_config.return_value = _base_config(
+            upstairs_sensors=[], downstairs_sensors=[],
+        )
+        mock_state = MagicMock()
+        mock_state.get_floor_state.return_value = {"CurrentState": "CLOSED"}
+        mock_state_cls.return_value = mock_state
+
+        mock_ecobee = MagicMock()
+        mock_ecobee.get_sensors.return_value = []
+        mock_ecobee.get_hvac_mode.return_value = "cool"
+        mock_ecobee_cls.return_value = mock_ecobee
+
+        # RAW median 75.0; validation SUPPRESSES it down to 68.0 so raw and
+        # validated are distinct and median_temp_f can be proven to be the raw.
+        mock_nws = MagicMock()
+        mock_nws.get_outdoor_conditions.return_value = self._nws_outdoor(75.0)
+        mock_get_nws.return_value = mock_nws
+
+        mock_om_cls.return_value.get_observation.side_effect = OpenMeteoError("no peer")
+        mock_snap_cls.return_value = MagicMock()
+
+        mock_validate.return_value = OutdoorValidationResult(
+            temperature_f=68.0,
+            reason="suppressed_spike",
+            suppressed=True,
+            state_fields={"LastOutdoorTemp": 68.0},
+        )
+
+        run_check()
+
+        mock_record.assert_called_once()
+        record = mock_record.call_args.args[0]
+        assert record["type"] == "outdoor_contributors"
+        assert "poll_id" in record and "timestamp" in record
+        assert record["validation_reason"] == "suppressed_spike"
+        assert record["suppressed"] is True
+        assert record["raw_temp_f"] == 75.0
+        assert record["validated_temp_f"] == 68.0
+        # The record's median is the RAW (pre-validation) median, NOT 68.0.
+        assert record["median_temp_f"] == 75.0
+
+    @patch.object(NWSClient, "_record_contributor_log")
+    @patch("src.orchestrator.validate_outdoor_temperature")
+    @patch("src.orchestrator.SnapshotManager")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator._get_nws_client")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_om_only_fallback_emits_synthesized_single_contributor(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_get_nws, mock_om_cls, mock_snap_cls, mock_validate, mock_record,
+    ):
+        """NWS fails + fresh OM peer → sole-source path emits one synthesized
+        single-contributor record for OPENMETEO (checklist #15)."""
+        mock_config.return_value = _base_config(
+            upstairs_sensors=[], downstairs_sensors=[],
+        )
+        mock_state = MagicMock()
+        mock_state.get_floor_state.return_value = {"CurrentState": "CLOSED"}
+        mock_state_cls.return_value = mock_state
+
+        mock_ecobee = MagicMock()
+        mock_ecobee.get_sensors.return_value = []
+        mock_ecobee.get_hvac_mode.return_value = "cool"
+        mock_ecobee_cls.return_value = mock_ecobee
+
+        # NWS unavailable — the fresh OM peer becomes the sole outdoor source
+        # (inline dict with no fetch-time contributor_log → synthesized).
+        mock_nws = MagicMock()
+        mock_nws.get_outdoor_conditions.side_effect = NWSError("NWS down")
+        mock_get_nws.return_value = mock_nws
+
+        mock_om = MagicMock()
+        mock_om.get_observation.return_value = {
+            "station_id": "OPENMETEO",
+            "temperature_f": 66.0,
+            "humidity": 60.0,
+            "wind_speed_mph": 5.0,
+            "timestamp": datetime.now(timezone.utc),
+        }
+        mock_om_cls.return_value = mock_om
+        mock_snap_cls.return_value = MagicMock()
+
+        mock_validate.return_value = OutdoorValidationResult(
+            temperature_f=66.0,
+            reason="cold_start",
+            suppressed=False,
+            state_fields={},
+        )
+
+        run_check()
+
+        mock_record.assert_called_once()
+        record = mock_record.call_args.args[0]
+        assert record["openmeteo_present"] is True
+        assert record["real_station_count"] == 0
+        assert record["selected_source_ids"] == ["OPENMETEO"]
+        assert record["stickiness_active"] is False
+        contributors = record["contributors"]
+        assert len(contributors) == 1
+        only = contributors[0]
+        assert only["station_id"] == "OPENMETEO"
+        assert only["source_type"] == "openmeteo"
+        assert only["included_in_median"] is True
+        # Synthesized median mirrors the raw OM temperature.
+        assert record["median_temp_f"] == 66.0
+        assert record["raw_temp_f"] == 66.0
+
+
+# ------------------------------------------------------------------
+# Outdoor signal-confidence gate — orchestrator wiring
+# ------------------------------------------------------------------
+
+
+class TestOutdoorConfidenceIntegration:
+    """``run_check`` threads the confidence params + ``contributor_log`` into
+    the validator, stamps ``outdoor["confidence_reason"]``, and carries
+    ``confidence_reason`` / ``confident`` on the per-contributor record.
+
+    Same technique as ``TestOutdoorContributorLog``: empty floor sensor lists
+    so only the outdoor-validation block runs; external clients mocked; the
+    single I/O (``_record_contributor_log``) patched for in-memory inspection.
+    """
+
+    @staticmethod
+    def _nws_outdoor(raw_temp):
+        """NWS ``get_outdoor_conditions`` return value with a contributor_log."""
+        return {
+            "temperature_f": raw_temp,
+            "humidity": 55.0,
+            "wind_speed_mph": 5.0,
+            "station_count": 2,
+            "is_fallback": False,
+            "used_cache": False,
+            "source": "nws",
+            "observation_time": "2026-07-11T14:45:00+00:00",
+            "contributors": [
+                {"station_id": "KAAA", "temperature_f": raw_temp},
+                {"station_id": "KCCC", "temperature_f": raw_temp + 1.0},
+            ],
+            "contributor_log": {
+                "contributors": [
+                    {
+                        "station_id": "KAAA", "source_type": "nws_station",
+                        "station_class": "official", "temp_f": raw_temp,
+                        "obs_time": "2026-07-11T14:45:00+00:00", "age_minutes": 5.0,
+                        "distance_mi": 1.0, "included_in_median": True,
+                        "is_cached": False, "excluded_reason": None,
+                    },
+                ],
+                "median_temp_f": raw_temp,
+                "real_station_count": 2,
+                "openmeteo_present": False,
+                "openmeteo_included": False,
+                "used_cache_fallback": False,
+                "is_fallback": False,
+                "source": "nws",
+                "selected_source_ids": ["KAAA", "KCCC"],
+                "stickiness_active": False,
+                "sticky_source_id": None,
+            },
+        }
+
+    @patch.object(NWSClient, "_record_contributor_log")
+    @patch("src.orchestrator.validate_outdoor_temperature")
+    @patch("src.orchestrator.SnapshotManager")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator._get_nws_client")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_validator_receives_contributor_log_and_confidence_params(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_get_nws, mock_om_cls, mock_snap_cls, mock_validate, mock_record,
+    ):
+        """The validator call gets the fetch-time ``contributor_log`` plus the
+        four confidence params sourced from config (checklist: signal gate)."""
+        mock_config.return_value = _base_config(
+            upstairs_sensors=[], downstairs_sensors=[],
+            outdoor_min_corroborating_sources=3,
+            outdoor_confidence_max_spread_f=4.0,
+            outdoor_confidence_hold_max_cycles=5,
+            outdoor_confidence_enabled=False,
+        )
+        mock_state = MagicMock()
+        mock_state.get_floor_state.return_value = {"CurrentState": "CLOSED"}
+        mock_state_cls.return_value = mock_state
+
+        mock_ecobee = MagicMock()
+        mock_ecobee.get_sensors.return_value = []
+        mock_ecobee.get_hvac_mode.return_value = "cool"
+        mock_ecobee_cls.return_value = mock_ecobee
+
+        outdoor = self._nws_outdoor(70.0)
+        mock_nws = MagicMock()
+        mock_nws.get_outdoor_conditions.return_value = outdoor
+        mock_get_nws.return_value = mock_nws
+
+        mock_om_cls.return_value.get_observation.side_effect = OpenMeteoError("no peer")
+        mock_snap_cls.return_value = MagicMock()
+
+        mock_validate.return_value = OutdoorValidationResult(
+            temperature_f=70.0,
+            reason="within_threshold",
+            suppressed=False,
+            state_fields={},
+        )
+
+        run_check()
+
+        mock_validate.assert_called_once()
+        kwargs = mock_validate.call_args.kwargs
+        # The fetch-time contributor_log is forwarded verbatim.
+        assert kwargs["contributor_log"] is outdoor["contributor_log"]
+        # Confidence tuning params come from config.
+        assert kwargs["min_corroborating_sources"] == 3
+        assert kwargs["confidence_max_spread_f"] == pytest.approx(4.0)
+        assert kwargs["confidence_hold_max_cycles"] == 5
+        assert kwargs["confidence_enabled"] is False
+
+    @patch.object(NWSClient, "_record_contributor_log")
+    @patch("src.orchestrator.validate_outdoor_temperature")
+    @patch("src.orchestrator.SnapshotManager")
+    @patch("src.orchestrator.OpenMeteoClient")
+    @patch("src.orchestrator._get_nws_client")
+    @patch("src.orchestrator.EcobeeClient")
+    @patch("src.orchestrator.get_state_manager")
+    @patch("src.orchestrator.get_config")
+    def test_record_carries_confidence_reason_and_confident(
+        self, mock_config, mock_state_cls, mock_ecobee_cls,
+        mock_get_nws, mock_om_cls, mock_snap_cls, mock_validate, mock_record,
+    ):
+        """The per-contributor record carries ``confidence_reason`` / ``confident``
+        straight from the validation result (a HELD artifact here)."""
+        mock_config.return_value = _base_config(
+            upstairs_sensors=[], downstairs_sensors=[],
+        )
+        mock_state = MagicMock()
+        mock_state.get_floor_state.return_value = {"CurrentState": "CLOSED"}
+        mock_state_cls.return_value = mock_state
+
+        mock_ecobee = MagicMock()
+        mock_ecobee.get_sensors.return_value = []
+        mock_ecobee.get_hvac_mode.return_value = "cool"
+        mock_ecobee_cls.return_value = mock_ecobee
+
+        mock_nws = MagicMock()
+        mock_nws.get_outdoor_conditions.return_value = self._nws_outdoor(71.6)
+        mock_get_nws.return_value = mock_nws
+
+        mock_om_cls.return_value.get_observation.side_effect = OpenMeteoError("no peer")
+        mock_snap_cls.return_value = MagicMock()
+
+        # A confidence HOLD: validated back to the last confident value, with
+        # confident=False and the held reason.
+        mock_validate.return_value = OutdoorValidationResult(
+            temperature_f=69.7,
+            reason="held_uncorroborated_churn",
+            suppressed=True,
+            state_fields={"LastOutdoorTemp": 69.7},
+            confident=False,
+            confidence_reason="held_uncorroborated_churn",
+        )
+
+        run_check()
+
+        mock_record.assert_called_once()
+        record = mock_record.call_args.args[0]
+        assert record["confidence_reason"] == "held_uncorroborated_churn"
+        assert record["confident"] is False
+        assert record["suppressed"] is True
+        assert record["validated_temp_f"] == 69.7
+        assert record["raw_temp_f"] == 71.6
+
 

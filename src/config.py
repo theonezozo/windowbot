@@ -84,6 +84,21 @@ def get_config() -> dict:
         "outdoor_jitter_threshold_f": _env_float("OUTDOOR_JITTER_THRESHOLD_F", 0.5),
         "outdoor_jitter_trend_window": _env_int("OUTDOOR_JITTER_TREND_WINDOW", 6),
         "outdoor_spike_max_rate_f": _env_float("OUTDOOR_SPIKE_MAX_RATE_F", 2.0),
+        # Outdoor signal-confidence gate: believe a supra-threshold outdoor move
+        # only when independently backed (surviving-sensor corroboration or
+        # Open-Meteo agreement); otherwise HOLD the last confident value. This
+        # suppresses station-rotation artifacts while letting a genuine,
+        # corroborated warm-up through on the first poll (so the bare close
+        # fires immediately). Defaults are responsiveness-preserving.
+        "outdoor_confidence_enabled": _env_bool("OUTDOOR_CONFIDENCE_ENABLED", True),
+        "outdoor_min_corroborating_sources": _env_int("OUTDOOR_MIN_CORROBORATING_SOURCES", 2),
+        "outdoor_confidence_max_spread_f": _env_float("OUTDOOR_CONFIDENCE_MAX_SPREAD_F", 3.0),
+        "outdoor_confidence_hold_max_cycles": _env_int("OUTDOOR_CONFIDENCE_HOLD_MAX_CYCLES", 2),
+        # Conservative source stickiness: prefer retaining the prior cycle's
+        # median contributors while they stay fresh, so a single newly-rotated-in
+        # station cannot swing the median. Gated so it can be disabled for A/B
+        # comparison against the per-contributor logs. Default on.
+        "outdoor_source_stickiness": _env_bool("OUTDOOR_SOURCE_STICKINESS", True),
 
         # --- Polling & runtime ---
         "polling_interval_minutes": _env_int("POLLING_INTERVAL_MINUTES", 10),
