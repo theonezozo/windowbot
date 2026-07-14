@@ -1642,3 +1642,179 @@ class TestAQIBranchesAtStatusPage:
         assert "Source:" in body
         assert "purpleair" in body
         assert "not checked" not in body
+
+
+# ------------------------------------------------------------------
+# Regression: display-formatted timestamps must never error the page
+# (Gregory's two-layer fix — status_page._parse_ts tolerance layer)
+#
+# Root cause: AirNow's human-readable observation_time display string
+# ("2026-07-13 18:00 PDT" — local wall-clock + TZ abbreviation) was
+# persisted verbatim into the ISO-typed FloorSnapshot.aqi_observation_time
+# and later parsed with datetime.fromisoformat() → ValueError → caught by
+# the outer handler → "Error loading status" page.
+#
+# _parse_ts() routes every timestamp field through the tolerant parser and
+# returns None for non-ISO/legacy/empty input, so a single unparseable
+# stamp can never raise and 500 the whole page.
+# ------------------------------------------------------------------
+
+# The exact display string that triggered the original bug.
+_PDT_DISPLAY = "2026-07-13 18:00 PDT"
+
+# All timestamp fields _parse_ts now guards. Each entry maps a symbolic
+# field name to where it lives (floor snapshot, global snapshot, or a
+# history entry) so a single value can be injected into any of them.
+_FRAGILE_FIELDS = [
+    "aqi_observation_time",
+    "outdoor_observation_time",
+    "outdoor_newest_observation_time",
+    "timestamp",  # snapshot.timestamp
+    "last_notification_time",
+    "poll_start",  # GlobalSnapshot
+    "next_poll_eta",  # GlobalSnapshot
+    "history_timestamp",  # history entry.timestamp
+]
+
+_FLOOR_FIELDS = {
+    "aqi_observation_time",
+    "outdoor_observation_time",
+    "outdoor_newest_observation_time",
+    "timestamp",
+    "last_notification_time",
+}
+_GLOBAL_FIELDS = {"poll_start", "next_poll_eta"}
+
+
+def _wire_with_field(mock_get_state, mock_snap_mgr_cls, field: str, value):
+    """Wire the full render path with ``value`` injected into ``field``.
+
+    Mirrors ``_wire_state_and_snap`` but lets a single timestamp value be
+    placed on the floor snapshot, the global snapshot, or a history entry so
+    every fragile field can be exercised through ``render_status_page``.
+    """
+    floor = _floor_snapshot("upstairs")
+    global_snap = _global_snapshot()
+    history: list = []
+
+    if field in _FLOOR_FIELDS:
+        setattr(floor, field, value)
+    elif field in _GLOBAL_FIELDS:
+        setattr(global_snap, field, value)
+    elif field == "history_timestamp":
+        history = [_entry(value, 70.0, {"upstairs": 71.0})]
+    else:  # pragma: no cover - guard against typos in the field list
+        raise AssertionError(f"unknown fragile field: {field}")
+
+    state_mgr = MagicMock()
+    state_mgr.get_snapshot_table.return_value = MagicMock()
+    mock_get_state.return_value = state_mgr
+
+    snap_mgr = MagicMock()
+    snap_mgr.get_all_floor_snapshots.return_value = [floor]
+    snap_mgr.get_global_snapshot.return_value = global_snap
+    snap_mgr.get_temperature_history.return_value = history
+    mock_snap_mgr_cls.return_value = snap_mgr
+    return snap_mgr
+
+
+class TestDisplayTimestampNeverErrorsPage:
+    """The regression that would have caught the ``Invalid isoformat string``
+    bug, plus coverage for every other field that ``_parse_ts`` now guards.
+
+    Each test asserts HTTP 200 and that the body does NOT contain
+    "Error loading status" (the outer-handler error page), and that
+    ``render_status_page`` does not raise.
+    """
+
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_airnow_pdt_display_in_aqi_observation_time_renders_200(
+        self, mock_get_state, mock_snap_mgr_cls
+    ):
+        # The exact field + value combination that produced the original 500.
+        _wire_with_field(
+            mock_get_state, mock_snap_mgr_cls, "aqi_observation_time", _PDT_DISPLAY
+        )
+
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        body = resp.get_body().decode()
+        assert "Error loading status" not in body
+
+    @pytest.mark.parametrize("field", _FRAGILE_FIELDS)
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_pdt_display_in_each_fragile_field_renders_200(
+        self, mock_get_state, mock_snap_mgr_cls, field
+    ):
+        _wire_with_field(mock_get_state, mock_snap_mgr_cls, field, _PDT_DISPLAY)
+
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        body = resp.get_body().decode()
+        assert "Error loading status" not in body
+
+    @pytest.mark.parametrize("value", ["garbage", "", None])
+    @pytest.mark.parametrize("field", _FRAGILE_FIELDS)
+    @patch("src.status_page.SnapshotManager")
+    @patch("src.status_page.get_state_manager")
+    def test_junk_values_in_each_fragile_field_render_200(
+        self, mock_get_state, mock_snap_mgr_cls, field, value
+    ):
+        _wire_with_field(mock_get_state, mock_snap_mgr_cls, field, value)
+
+        resp = render_status_page(_make_request())
+
+        assert resp.status_code == 200
+        body = resp.get_body().decode()
+        assert "Error loading status" not in body
+
+
+class TestValidIsoFreshnessLabelUnchanged:
+    """No-regression: a valid ISO ``outdoor_observation_time`` still renders
+    the freshness / "observed ... ago" label exactly as before the fix."""
+
+    def test_valid_iso_outdoor_observation_time_renders_observed_ago_label(self):
+        from src.status_page import _render_environment_section
+
+        now = datetime.now(timezone.utc)
+        snap = _floor_snapshot("upstairs")
+        snap.outdoor_observation_time = (now - timedelta(minutes=10)).isoformat()
+        snap.outdoor_newest_observation_time = None
+        snap.aqi_observation_time = (now - timedelta(minutes=5)).isoformat()
+
+        html = _render_environment_section(snap)
+
+        # Legacy single-contributor freshness label is preserved verbatim.
+        assert "observed 10min ago" in html
+
+
+class TestParseTs:
+    """Unit tests for ``status_page._parse_ts`` — the tolerance helper."""
+
+    def test_valid_iso_returns_aware_utc_datetime(self):
+        from src.status_page import _parse_ts
+
+        dt = _parse_ts("2026-07-13T18:00:00+00:00")
+
+        assert dt is not None
+        assert dt.tzinfo is not None
+        assert dt.utcoffset() == timedelta(0)
+
+    def test_trailing_z_returns_aware_utc_datetime(self):
+        from src.status_page import _parse_ts
+
+        dt = _parse_ts("2026-07-13T18:00:00Z")
+
+        assert dt is not None
+        assert dt.tzinfo is not None
+        assert dt.utcoffset() == timedelta(0)
+
+    @pytest.mark.parametrize("value", ["garbage", _PDT_DISPLAY, "", None])
+    def test_junk_empty_and_none_return_none(self, value):
+        from src.status_page import _parse_ts
+
+        assert _parse_ts(value) is None

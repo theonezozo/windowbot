@@ -211,14 +211,15 @@ def _render_html(
     freshness_html = ""
     freshness_class = "fresh"
     if global_snapshot:
-        poll_time = _ensure_utc(datetime.fromisoformat(global_snapshot.poll_start))
-        age_minutes = (now - poll_time).total_seconds() / 60
-        if age_minutes > 20:
-            freshness_class = "stale"
-        elif age_minutes > 12:
-            freshness_class = "warning"
-        
-        freshness_html = f"""
+        poll_time = _parse_ts(global_snapshot.poll_start)
+        if poll_time is not None:
+            age_minutes = (now - poll_time).total_seconds() / 60
+            if age_minutes > 20:
+                freshness_class = "stale"
+            elif age_minutes > 12:
+                freshness_class = "warning"
+
+            freshness_html = f"""
         <div class="freshness {freshness_class}">
             <strong>Last poll:</strong> {_format_age(poll_time)} ago
             {f'<span class="freshness-warning">⚠️ Data may be stale</span>' if age_minutes > 20 else ''}
@@ -228,8 +229,12 @@ def _render_html(
     # Global header
     header_html = ""
     if global_snapshot:
-        next_poll_time = _ensure_utc(datetime.fromisoformat(global_snapshot.next_poll_eta))
-        next_poll_in = _format_age(next_poll_time, future=True)
+        next_poll_time = _parse_ts(global_snapshot.next_poll_eta)
+        next_poll_in = (
+            _format_age(next_poll_time, future=True)
+            if next_poll_time is not None
+            else "unknown"
+        )
         
         header_html = f"""
         <div class="global-info">
@@ -446,16 +451,14 @@ def _render_environment_section(snapshot: FloorSnapshot) -> str:
     # the colour matches the staleness of the pool, not its best member.
     # Thresholds match the 20-min peer cutoff (fresh < 20m, warn 20-45m, stale > 45m).
     outdoor_obs_age = ""
-    if snapshot.outdoor_observation_time:
-        obs_time = _ensure_utc(datetime.fromisoformat(snapshot.outdoor_observation_time))
+    obs_time = _parse_ts(snapshot.outdoor_observation_time)
+    if obs_time is not None:
         obs_age_mins = (now - obs_time).total_seconds() / 60
         age_class = "data-fresh" if obs_age_mins < 20 else ("data-warn" if obs_age_mins < 45 else "data-stale")
 
         newest_iso = snapshot.outdoor_newest_observation_time
         contributor_count = snapshot.outdoor_contributor_count
-        newest_time = (
-            _ensure_utc(datetime.fromisoformat(newest_iso)) if newest_iso else None
-        )
+        newest_time = _parse_ts(newest_iso)
         if (
             newest_time is not None
             and newest_iso != snapshot.outdoor_observation_time
@@ -516,8 +519,8 @@ def _render_environment_section(snapshot: FloorSnapshot) -> str:
     # fall back to the original single AQI + Source view.
     aqi_class = "good" if snapshot.aqi_value < 50 else ("moderate" if snapshot.aqi_value < 100 else "unhealthy")
     aqi_obs_age = ""
-    if snapshot.aqi_observation_time:
-        obs_time = _ensure_utc(datetime.fromisoformat(snapshot.aqi_observation_time))
+    obs_time = _parse_ts(snapshot.aqi_observation_time)
+    if obs_time is not None:
         obs_age_mins = (now - obs_time).total_seconds() / 60
         age_class = "data-fresh" if obs_age_mins < 30 else ("data-warn" if obs_age_mins < 60 else "data-stale")
         aqi_obs_age = f"<div class='data-freshness {age_class}'>observed {_format_age(obs_time)} ago</div>"
@@ -548,8 +551,8 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
     decision_class = "open" if snapshot.decision == "OPEN" else "closed"
 
     # Indoor sensors — freshness derived from poll timestamp (sensors read at poll time)
-    sensor_poll_time = _ensure_utc(datetime.fromisoformat(snapshot.timestamp))
-    sensor_age = _format_age(sensor_poll_time)
+    sensor_poll_time = _parse_ts(snapshot.timestamp)
+    sensor_age = _format_age(sensor_poll_time) if sensor_poll_time is not None else "unknown"
     indoor_html = f"<div class='data-freshness'>read {sensor_age} ago</div><ul class='sensor-list'>"
     for sensor in snapshot.indoor_sensors:
         temp_str = f"{sensor.temperature_f:.1f}°F" if sensor.temperature_f else "N/A"
@@ -590,8 +593,8 @@ def _render_floor_card(snapshot: FloorSnapshot) -> str:
 
     # Last notification
     notif_html = ""
-    if snapshot.last_notification_time:
-        notif_time = _ensure_utc(datetime.fromisoformat(snapshot.last_notification_time))
+    notif_time = _parse_ts(snapshot.last_notification_time)
+    if notif_time is not None:
         notif_age = _format_age(notif_time)
         notif_type = snapshot.last_notification_type or "unknown"
         notif_html = f"""
@@ -645,10 +648,10 @@ def _render_history_card(history: list[TemperatureHistoryEntry], tz: ZoneInfo) -
 
     rows_html = []
     for entry in history:  # already newest-first
-        try:
-            ts = datetime.fromisoformat(entry.timestamp)
+        ts = _parse_ts(entry.timestamp)
+        if ts is not None:
             time_label = _format_local_and_utc_compact(ts, tz)
-        except (TypeError, ValueError):
+        else:
             time_label = html.escape(str(entry.timestamp))
 
         outdoor_cell = (
@@ -759,6 +762,19 @@ def _ensure_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _parse_ts(value: str | None) -> datetime | None:
+    """Tolerantly parse a snapshot timestamp field into an aware UTC datetime.
+
+    Routes through :func:`parse_iso_utc` so valid ISO-8601 (including a trailing
+    ``Z``) is parsed exactly as before, then normalizes naive values to UTC.
+    Returns ``None`` for missing, empty, or non-ISO/legacy values — e.g. a
+    human-formatted ``"2026-07-13 18:00 PDT"`` — so a single unparseable
+    timestamp can never raise and error the whole status page.
+    """
+    dt = parse_iso_utc(value)
+    return _ensure_utc(dt) if dt is not None else None
 
 
 def _format_local_and_utc(dt_utc: datetime, tz: ZoneInfo) -> str:

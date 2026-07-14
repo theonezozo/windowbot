@@ -2487,3 +2487,146 @@ class TestOutdoorConfidenceIntegration:
         assert record["raw_temp_f"] == 71.6
 
 
+# ------------------------------------------------------------------
+# Observation-time normalization (Gregory's two-layer fix — writer layer)
+#
+# AirNow's Current Observations endpoint returns a human-readable
+# observation_time ("2026-07-13 18:00 PDT" — local wall-clock + a bare TZ
+# abbreviation) that datetime.fromisoformat cannot parse. The snapshot
+# *_observation_time fields are re-parsed as ISO by the status page, so
+# _normalize_observation_time converts the AirNow shape into a tz-aware ISO
+# string with a numeric offset before it is ever persisted. This is the
+# writer-side half of the fix that keeps a display string out of an
+# ISO-typed field.
+# ------------------------------------------------------------------
+
+
+class TestNormalizeObservationTime:
+    """Unit tests for ``_normalize_observation_time`` and its offset table."""
+
+    def test_airnow_pdt_maps_to_minus_07_00_offset(self):
+        from src.orchestrator import _normalize_observation_time
+
+        assert (
+            _normalize_observation_time("2026-07-13 18:00 PDT")
+            == "2026-07-13T18:00:00-07:00"
+        )
+
+    def test_airnow_edt_maps_to_minus_04_00_offset(self):
+        from src.orchestrator import _normalize_observation_time, _TZ_ABBREV_OFFSETS
+
+        # Guard against the offset table drifting: EDT is -4 by definition.
+        assert _TZ_ABBREV_OFFSETS["EDT"] == -4
+        assert (
+            _normalize_observation_time("2026-07-13 18:00 EDT")
+            == "2026-07-13T18:00:00-04:00"
+        )
+
+    def test_hour_only_time_part_is_padded(self):
+        from src.orchestrator import _normalize_observation_time
+
+        # "HH" with no minutes/seconds → padded to HH:00:00.
+        assert (
+            _normalize_observation_time("2026-07-13 18 PDT")
+            == "2026-07-13T18:00:00-07:00"
+        )
+
+    def test_hour_minute_time_part_is_padded(self):
+        from src.orchestrator import _normalize_observation_time
+
+        # "HH:MM" → padded to HH:MM:00.
+        assert (
+            _normalize_observation_time("2026-07-13 18:05 PDT")
+            == "2026-07-13T18:05:00-07:00"
+        )
+
+    def test_hour_minute_second_time_part_preserved(self):
+        from src.orchestrator import _normalize_observation_time
+
+        # "HH:MM:SS" → seconds preserved.
+        assert (
+            _normalize_observation_time("2026-07-13 18:05:42 PDT")
+            == "2026-07-13T18:05:42-07:00"
+        )
+
+    def test_already_iso_with_trailing_z_passes_through_unchanged(self):
+        from src.orchestrator import _normalize_observation_time
+
+        assert (
+            _normalize_observation_time("2026-07-13T18:00:00Z")
+            == "2026-07-13T18:00:00Z"
+        )
+
+    def test_already_iso_with_numeric_offset_passes_through_unchanged(self):
+        from src.orchestrator import _normalize_observation_time
+
+        assert (
+            _normalize_observation_time("2026-07-13T18:00:00-07:00")
+            == "2026-07-13T18:00:00-07:00"
+        )
+
+    def test_unknown_abbreviation_returns_none(self):
+        from src.orchestrator import _normalize_observation_time
+
+        assert _normalize_observation_time("2026-07-13 18:00 XYZ") is None
+
+    @pytest.mark.parametrize("value", ["garbage", "", None])
+    def test_junk_empty_and_none_return_none(self, value):
+        from src.orchestrator import _normalize_observation_time
+
+        assert _normalize_observation_time(value) is None
+
+
+class TestBuildFloorSnapshotNormalizesObservationTime:
+    """``_build_floor_snapshot`` must persist a re-parseable ISO string, never
+    the raw AirNow display string, into ``aqi_observation_time``."""
+
+    def test_airnow_display_string_round_trips_through_fromisoformat(self):
+        from src.orchestrator import _build_floor_snapshot
+
+        decision = FloorDecision(
+            floor="upstairs",
+            new_state="CLOSED",
+            reason="test",
+            urgent=False,
+            changed=False,
+        )
+        outdoor = {
+            "temperature_f": 65.0,
+            "source": "nws",
+            "humidity": 50.0,
+            "station_count": 0,
+            "observation_time": "2026-07-13 18:00 PDT",
+        }
+        aqi_data = {
+            "aqi": 25,
+            "source": "airnow",
+            "sensor_count": 0,
+            "observation_time": "2026-07-13 18:00 PDT",
+        }
+        engine = DecisionEngine(_base_config())
+        now = datetime(2026, 7, 13, 19, 20, 0, tzinfo=timezone.utc)
+
+        # Gate reconstruction is orthogonal to timestamp handling; stub it so
+        # the test stays focused on the observation-time writer.
+        with patch("src.orchestrator._evaluate_gates", return_value=[]):
+            snap = _build_floor_snapshot(
+                "upstairs",
+                ["sensor_up"],
+                [{"name": "sensor_up", "temperature_f": 70.0, "is_online": True}],
+                decision,
+                outdoor,
+                aqi_data,
+                engine,
+                {},
+                now,
+            )
+
+        # The persisted value is a string that fromisoformat CAN parse —
+        # proving the writer no longer stores AirNow's display string.
+        assert isinstance(snap.aqi_observation_time, str)
+        parsed = datetime.fromisoformat(snap.aqi_observation_time)
+        assert parsed.tzinfo is not None
+        assert snap.aqi_observation_time == "2026-07-13T18:00:00-07:00"
+
+

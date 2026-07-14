@@ -112,6 +112,63 @@ def _record_validation_metric(
         logger.debug("Could not write validation metric", exc_info=True)
 
 
+# Common US timezone abbreviations reported by AirNow's Current Observations
+# endpoint, mapped to their fixed UTC offset in hours. AirNow returns local
+# wall-clock time plus a bare abbreviation (e.g. "PDT"), which
+# ``datetime.fromisoformat`` cannot parse.
+_TZ_ABBREV_OFFSETS: dict[str, int] = {
+    "UTC": 0, "GMT": 0,
+    "EST": -5, "EDT": -4,
+    "CST": -6, "CDT": -5,
+    "MST": -7, "MDT": -6,
+    "PST": -8, "PDT": -7,
+    "AKST": -9, "AKDT": -8,
+    "HST": -10, "HDT": -9,
+}
+
+
+def _normalize_observation_time(value: str | None) -> str | None:
+    """Normalize an observation timestamp to a tz-aware ISO-8601 string, or None.
+
+    Snapshot ``*_observation_time`` fields are re-parsed as ISO by the status
+    page, so only ISO-8601 belongs here. Values that ``datetime.fromisoformat``
+    already accepts pass through unchanged. The human-readable shape AirNow
+    emits — ``"YYYY-MM-DD HH[:MM[:SS]] TZABBR"`` (e.g. ``"2026-07-13 18:00 PDT"``)
+    — is converted by mapping the trailing timezone abbreviation to a numeric
+    UTC offset. Anything unrecognized returns ``None`` so a display-formatted
+    string is never persisted into an ISO-typed field.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    # Already ISO-8601 (tolerate a trailing 'Z').
+    try:
+        datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+        return text
+    except ValueError:
+        pass
+    # AirNow "YYYY-MM-DD HH[:MM[:SS]] TZABBR" — map the abbreviation to an offset.
+    parts = text.split()
+    if len(parts) >= 3:
+        date_part, time_part, abbrev = parts[0], parts[1], parts[-1].upper()
+        offset_hours = _TZ_ABBREV_OFFSETS.get(abbrev)
+        if offset_hours is not None:
+            colons = time_part.count(":")
+            if colons == 0:
+                time_part = f"{time_part}:00:00"
+            elif colons == 1:
+                time_part = f"{time_part}:00"
+            try:
+                naive = datetime.fromisoformat(f"{date_part} {time_part}")
+            except ValueError:
+                return None
+            aware = naive.replace(tzinfo=timezone(timedelta(hours=offset_hours)))
+            return aware.isoformat()
+    return None
+
+
 def _synthesize_contributor_log(outdoor: dict, raw_temp: float) -> dict:
     """Minimal contributor-log payload for the Open-Meteo-only fallback paths.
 
@@ -1033,9 +1090,11 @@ def _build_floor_snapshot(
         last_notification_type=last_notif_type,
         last_notification_time=last_notif_time,
         timestamp=now.isoformat(),
-        outdoor_observation_time=outdoor.get("observation_time"),
-        aqi_observation_time=aqi_data.get("observation_time"),
-        outdoor_newest_observation_time=outdoor.get("newest_observation_time"),
+        outdoor_observation_time=_normalize_observation_time(outdoor.get("observation_time")),
+        aqi_observation_time=_normalize_observation_time(aqi_data.get("observation_time")),
+        outdoor_newest_observation_time=_normalize_observation_time(
+            outdoor.get("newest_observation_time")
+        ),
         outdoor_contributor_count=(
             outdoor.get("contributor_count") or outdoor.get("station_count")
         ),
