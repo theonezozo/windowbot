@@ -16,6 +16,7 @@ from src.ecobee_client import EcobeeClient, EcobeeAuthError, EcobeeApiError
 from src.beestat_client import BeestatClient, BeestatAuthError, BeestatApiError
 from src.nws_client import NWSClient, NWSError
 from src.openmeteo_client import OpenMeteoClient, OpenMeteoError
+from src.synoptic_client import SynopticClient, SynopticError
 from src.outdoor_validator import validate_outdoor_temperature, OutdoorValidationResult
 from src.purpleair_client import PurpleAirClient
 from src.airnow_client import AirNowClient
@@ -53,6 +54,97 @@ def _get_nws_client(config: dict) -> NWSClient:
         _nws_client = NWSClient(lat, lon)
         _nws_client_key = key
     return _nws_client
+
+
+def _fetch_preferred_weather_station(config: dict) -> dict | None:
+    """Fetch the configured authoritative station when credentials are available."""
+    station_id = config.get("preferred_weather_station_id")
+    api_key = config.get("synoptic_api_key")
+    if not station_id or not api_key:
+        if station_id and not api_key:
+            logger.warning(
+                "Preferred weather station %s is configured but SYNOPTIC_API_KEY is missing.",
+                station_id,
+            )
+        return None
+
+    client = SynopticClient(
+        config["user_latitude"],
+        config["user_longitude"],
+        api_key,
+    )
+    try:
+        return client.get_station_observation(
+            station_id,
+            config.get("preferred_weather_station_max_age_minutes", 15),
+        )
+    except SynopticError as exc:
+        logger.warning(
+            "Preferred weather station %s unavailable: %s. "
+            "Using the normal outdoor source blend.",
+            station_id,
+            exc,
+        )
+        return None
+
+
+def _apply_preferred_weather_station(
+    outdoor: dict | None, observation: dict
+) -> dict:
+    """Make a fresh preferred station authoritative for temperature and humidity."""
+    station_id = observation["station_id"]
+    timestamp = observation["timestamp"]
+    result = dict(outdoor or {})
+    superseded_source = result.get("source")
+
+    result.update({
+        "temperature_f": observation["temperature_f"],
+        "station_count": 1,
+        "is_fallback": False,
+        "used_cache": False,
+        "source": f"synoptic:{station_id}",
+        "observation_time": timestamp.isoformat(),
+        "newest_observation_time": timestamp.isoformat(),
+        "preferred_station_id": station_id,
+        "superseded_source": superseded_source,
+        # The anti-jitter validator is intended for a rotating station blend.
+        # An explicitly authoritative station must pass through unchanged.
+        "contributors": [],
+    })
+    if observation.get("humidity") is not None:
+        result["humidity"] = observation["humidity"]
+    if result.get("wind_speed_mph") is None:
+        result["wind_speed_mph"] = observation.get("wind_speed_mph")
+
+    contributor = {
+        "station_id": station_id,
+        "source_type": "synoptic_preferred",
+        "station_class": "preferred",
+        "temp_f": observation["temperature_f"],
+        "obs_time": timestamp.isoformat(),
+        "age_minutes": max(
+            0.0,
+            (datetime.now(timezone.utc) - timestamp).total_seconds() / 60,
+        ),
+        "distance_mi": None,
+        "included_in_median": True,
+        "is_cached": False,
+        "excluded_reason": None,
+    }
+    result["contributor_log"] = {
+        "contributors": [contributor],
+        "median_temp_f": observation["temperature_f"],
+        "real_station_count": 1,
+        "openmeteo_present": False,
+        "openmeteo_included": False,
+        "used_cache_fallback": False,
+        "is_fallback": False,
+        "source": result["source"],
+        "selected_source_ids": [station_id],
+        "stickiness_active": False,
+        "sticky_source_id": None,
+    }
+    return result
 
 
 # Module-level PurpleAirClient — kept alive across run_check() cycles so its
@@ -288,6 +380,10 @@ def run_check() -> None:
             errors.append(f"Indoor sensor API error: {exc}")
             return
 
+        # Fetch the preferred local station first. A fresh reading overrides the
+        # blended source below; that blend remains the resilience fallback.
+        preferred_observation = _fetch_preferred_weather_station(config)
+
         # Fetch outdoor conditions.
         # Open-Meteo is always attempted as a fresh peer alongside NWS —
         # if its reading is ≤20 min old it is blended into the NWS median.
@@ -338,7 +434,7 @@ def run_check() -> None:
                     "observation_time": om_obs["timestamp"].isoformat() if om_obs.get("timestamp") else None,
                 }
 
-        if outdoor is None:
+        if outdoor is None and preferred_observation is None:
             # NWS failed and no fresh OM peer — try OM without freshness check.
             try:
                 outdoor = om.get_outdoor_conditions()
@@ -347,6 +443,14 @@ def run_check() -> None:
                 logger.error("All outdoor sources failed. Open-Meteo: %s", exc)
                 errors.append(f"All outdoor sources failed: {exc}")
                 return
+
+        if preferred_observation is not None:
+            outdoor = _apply_preferred_weather_station(outdoor, preferred_observation)
+            logger.info(
+                "Preferred station %s supersedes %s outdoor temperature/humidity.",
+                preferred_observation["station_id"],
+                outdoor.get("superseded_source") or "unavailable fallback sources",
+            )
 
         # Suppress availability-driven jitter in the fused outdoor temperature
         # without lagging genuine movement (see outdoor_validator).

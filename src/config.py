@@ -61,6 +61,10 @@ def get_config() -> dict:
         "synoptic_api_key": _env("SYNOPTIC_API_KEY", ""),
         "wu_api_key": _env("WU_API_KEY", ""),
         "outdoor_provider": _env("OUTDOOR_PROVIDER", "synoptic"),
+        "preferred_weather_station_id": _env("PREFERRED_WEATHER_STATION_ID", "E7138"),
+        "preferred_weather_station_max_age_minutes": _env_int(
+            "PREFERRED_WEATHER_STATION_MAX_AGE_MINUTES", 15
+        ),
 
         # --- Location ---
         "user_latitude": _env_float("USER_LATITUDE", 0.0),

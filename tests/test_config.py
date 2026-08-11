@@ -178,6 +178,21 @@ class TestGetConfigDefaults:
         assert cfg["purpleair_sensor_cache_hours"] == 6.0
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_preferred_weather_station_defaults(self):
+        cfg = get_config()
+        assert cfg["preferred_weather_station_id"] == "E7138"
+        assert cfg["preferred_weather_station_max_age_minutes"] == 15
+
+    @patch.dict(os.environ, {
+        "PREFERRED_WEATHER_STATION_ID": "KTEST",
+        "PREFERRED_WEATHER_STATION_MAX_AGE_MINUTES": "10",
+    })
+    def test_preferred_weather_station_overrides(self):
+        cfg = get_config()
+        assert cfg["preferred_weather_station_id"] == "KTEST"
+        assert cfg["preferred_weather_station_max_age_minutes"] == 10
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_allowed_hvac_modes_default(self):
         os.environ.pop("ALLOWED_HVAC_MODES", None)
         cfg = get_config()
@@ -311,4 +326,3 @@ class TestOutdoorConfidenceConfig:
     def test_hold_max_cycles_int_override(self):
         cfg = get_config()
         assert cfg["outdoor_confidence_hold_max_cycles"] == 5
-

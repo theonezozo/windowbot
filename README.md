@@ -229,8 +229,10 @@ This runs the full Azure Functions runtime with the 10-minute timer trigger.
 | `DOWNSTAIRS_SENSORS` | — | Comma-separated sensor names for downstairs |
 | `ECOBEE_CLIENT_ID` | — | Ecobee OAuth client ID (used when `INDOOR_PROVIDER=ecobee`) |
 | `ECOBEE_REFRESH_TOKEN` | — | Ecobee OAuth refresh token (used when `INDOOR_PROVIDER=ecobee`) |
-| `OUTDOOR_PROVIDER` | `synoptic` | Present in config but **not currently consumed** — the live orchestrator always uses NWS stations + Open-Meteo |
-| `SYNOPTIC_API_KEY` | — | Synoptic/MesoWest API key — client exists but is not wired into the current orchestrator |
+| `OUTDOOR_PROVIDER` | `synoptic` | Present in config but **not currently consumed** — the normal source blend uses NWS stations + Open-Meteo, with the preferred Synoptic station overriding it when fresh |
+| `SYNOPTIC_API_KEY` | — | Synoptic/MesoWest API key; enables the preferred-station override when configured |
+| `PREFERRED_WEATHER_STATION_ID` | `E7138` | Synoptic station whose fresh temperature/humidity supersedes the blended outdoor sources; set empty to disable |
+| `PREFERRED_WEATHER_STATION_MAX_AGE_MINUTES` | `15` | Maximum age for the preferred station override (three expected 5-minute updates) |
 | `WU_API_KEY` | — | Weather Underground API key — client exists but is not wired into the current orchestrator |
 | `PURPLEAIR_API_KEY` | — | PurpleAir read API key |
 | `AIRNOW_API_KEY` | — | AirNow API key (fallback AQI source) |

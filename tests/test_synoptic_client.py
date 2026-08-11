@@ -470,6 +470,54 @@ class TestBatchObservationFetch:
             client._fetch_batch_observations(["S1"], now)
 
 
+class TestGetStationObservation:
+    """A named station is accepted only while its reading is fresh."""
+
+    @patch.object(SynopticClient, "_fetch_batch_observations")
+    def test_returns_fresh_named_station(self, mock_fetch):
+        timestamp = datetime.now(timezone.utc) - timedelta(minutes=4)
+        mock_fetch.return_value = {
+            "E7138": {
+                "station_id": "E7138",
+                "temperature_f": 64.0,
+                "humidity": 93.0,
+                "wind_speed_mph": 1.0,
+                "timestamp": timestamp,
+            }
+        }
+
+        result = SynopticClient(_LAT, _LON, _API_KEY).get_station_observation(
+            "E7138", max_age_minutes=15
+        )
+
+        assert result["temperature_f"] == 64.0
+        assert result["humidity"] == 93.0
+        mock_fetch.assert_called_once()
+        assert mock_fetch.call_args.args[0] == ["E7138"]
+
+    @patch.object(SynopticClient, "_fetch_batch_observations")
+    def test_rejects_stale_named_station(self, mock_fetch):
+        mock_fetch.return_value = {
+            "E7138": {
+                "station_id": "E7138",
+                "temperature_f": 64.0,
+                "humidity": 93.0,
+                "wind_speed_mph": 1.0,
+                "timestamp": datetime.now(timezone.utc) - timedelta(minutes=16),
+            }
+        }
+
+        with pytest.raises(SynopticError, match="stale"):
+            SynopticClient(_LAT, _LON, _API_KEY).get_station_observation(
+                "E7138", max_age_minutes=15
+            )
+
+    @patch.object(SynopticClient, "_fetch_batch_observations", return_value={})
+    def test_rejects_missing_named_station(self, mock_fetch):
+        with pytest.raises(SynopticError, match="No valid observation"):
+            SynopticClient(_LAT, _LON, _API_KEY).get_station_observation("E7138")
+
+
 # ------------------------------------------------------------------
 # _fetch_and_walk — Batch + LKG Cache Walk
 # ------------------------------------------------------------------
