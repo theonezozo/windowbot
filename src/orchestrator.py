@@ -16,7 +16,6 @@ from src.ecobee_client import EcobeeClient, EcobeeAuthError, EcobeeApiError
 from src.beestat_client import BeestatClient, BeestatAuthError, BeestatApiError
 from src.nws_client import NWSClient, NWSError
 from src.openmeteo_client import OpenMeteoClient, OpenMeteoError
-from src.synoptic_client import SynopticClient, SynopticError
 from src.outdoor_validator import validate_outdoor_temperature, OutdoorValidationResult
 from src.purpleair_client import PurpleAirClient
 from src.airnow_client import AirNowClient
@@ -57,28 +56,17 @@ def _get_nws_client(config: dict) -> NWSClient:
 
 
 def _fetch_preferred_weather_station(config: dict) -> dict | None:
-    """Fetch the configured authoritative station when credentials are available."""
+    """Fetch the configured authoritative station through the NWS API."""
     station_id = config.get("preferred_weather_station_id")
-    api_key = config.get("synoptic_api_key")
-    if not station_id or not api_key:
-        if station_id and not api_key:
-            logger.warning(
-                "Preferred weather station %s is configured but SYNOPTIC_API_KEY is missing.",
-                station_id,
-            )
+    if not station_id:
         return None
 
-    client = SynopticClient(
-        config["user_latitude"],
-        config["user_longitude"],
-        api_key,
-    )
     try:
-        return client.get_station_observation(
+        return _get_nws_client(config).get_station_observation(
             station_id,
             config.get("preferred_weather_station_max_age_minutes", 15),
         )
-    except SynopticError as exc:
+    except NWSError as exc:
         logger.warning(
             "Preferred weather station %s unavailable: %s. "
             "Using the normal outdoor source blend.",
@@ -102,7 +90,7 @@ def _apply_preferred_weather_station(
         "station_count": 1,
         "is_fallback": False,
         "used_cache": False,
-        "source": f"synoptic:{station_id}",
+        "source": f"nws:{station_id}",
         "observation_time": timestamp.isoformat(),
         "newest_observation_time": timestamp.isoformat(),
         "preferred_station_id": station_id,
@@ -118,7 +106,7 @@ def _apply_preferred_weather_station(
 
     contributor = {
         "station_id": station_id,
-        "source_type": "synoptic_preferred",
+        "source_type": "nws_preferred",
         "station_class": "preferred",
         "temp_f": observation["temperature_f"],
         "obs_time": timestamp.isoformat(),
