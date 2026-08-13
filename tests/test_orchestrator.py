@@ -19,7 +19,14 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-from src.orchestrator import run_check, _fetch_aqi, _evaluate_floor, _NOTIFICATION_COOLDOWN
+from src.orchestrator import (
+    run_check,
+    _apply_preferred_weather_station,
+    _fetch_aqi,
+    _fetch_preferred_weather_station,
+    _evaluate_floor,
+    _NOTIFICATION_COOLDOWN,
+)
 from src.ecobee_client import EcobeeAuthError, EcobeeApiError
 from src.nws_client import NWSClient, NWSError
 from src.openmeteo_client import OpenMeteoError
@@ -60,6 +67,76 @@ def _base_config(**overrides):
 # ------------------------------------------------------------------
 # Auth Failure Notification
 # ------------------------------------------------------------------
+
+
+class TestPreferredWeatherStation:
+    @patch("src.orchestrator.SynopticClient")
+    def test_fetches_configured_station_with_freshness_limit(self, mock_client_cls):
+        expected = {"station_id": "E7138", "temperature_f": 64.0}
+        mock_client_cls.return_value.get_station_observation.return_value = expected
+        config = _base_config(
+            synoptic_api_key="key",
+            preferred_weather_station_id="E7138",
+            preferred_weather_station_max_age_minutes=15,
+        )
+
+        result = _fetch_preferred_weather_station(config)
+
+        assert result is expected
+        mock_client_cls.return_value.get_station_observation.assert_called_once_with(
+            "E7138", 15
+        )
+
+    @patch("src.orchestrator.SynopticClient")
+    def test_missing_api_key_preserves_existing_sources(self, mock_client_cls):
+        config = _base_config(
+            synoptic_api_key="",
+            preferred_weather_station_id="E7138",
+        )
+
+        assert _fetch_preferred_weather_station(config) is None
+        mock_client_cls.assert_not_called()
+
+    def test_fresh_station_supersedes_temperature_and_humidity(self):
+        timestamp = datetime.now(timezone.utc) - timedelta(minutes=3)
+        baseline = {
+            "temperature_f": 70.0,
+            "humidity": 40.0,
+            "wind_speed_mph": 8.0,
+            "source": "nws",
+            "station_count": 3,
+        }
+        preferred = {
+            "station_id": "E7138",
+            "temperature_f": 64.0,
+            "humidity": 93.0,
+            "wind_speed_mph": 1.0,
+            "timestamp": timestamp,
+        }
+
+        result = _apply_preferred_weather_station(baseline, preferred)
+
+        assert result["temperature_f"] == 64.0
+        assert result["humidity"] == 93.0
+        assert result["wind_speed_mph"] == 8.0
+        assert result["source"] == "synoptic:E7138"
+        assert result["superseded_source"] == "nws"
+        assert result["contributors"] == []
+
+    def test_station_can_supply_conditions_when_other_sources_fail(self):
+        timestamp = datetime.now(timezone.utc)
+        result = _apply_preferred_weather_station(None, {
+            "station_id": "E7138",
+            "temperature_f": 64.0,
+            "humidity": 93.0,
+            "wind_speed_mph": 1.0,
+            "timestamp": timestamp,
+        })
+
+        assert result["temperature_f"] == 64.0
+        assert result["humidity"] == 93.0
+        assert result["wind_speed_mph"] == 1.0
+        assert result["is_fallback"] is False
 
 
 class TestAuthFailure:
@@ -2628,5 +2705,4 @@ class TestBuildFloorSnapshotNormalizesObservationTime:
         parsed = datetime.fromisoformat(snap.aqi_observation_time)
         assert parsed.tzinfo is not None
         assert snap.aqi_observation_time == "2026-07-13T18:00:00-07:00"
-
 
