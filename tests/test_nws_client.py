@@ -358,6 +358,51 @@ class TestObservationStaleness:
         assert result is None
 
 
+class TestNamedStationObservation:
+    """A preferred named station is accepted only within its configured age."""
+
+    @patch.object(NWSClient, "_fetch_single_observation")
+    def test_returns_fresh_named_station(self, mock_fetch):
+        observation = {
+            "station_id": "E7138",
+            "temperature_f": 67.0,
+            "humidity": 91.0,
+            "wind_speed_mph": 1.0,
+            "timestamp": datetime.now(timezone.utc) - timedelta(minutes=4),
+        }
+        mock_fetch.return_value = observation
+
+        result = NWSClient(37.4, -122.1).get_station_observation(
+            "E7138", max_age_minutes=15
+        )
+
+        assert result is observation
+        assert mock_fetch.call_args.args[0] == "E7138"
+
+    @patch.object(NWSClient, "_fetch_single_observation")
+    def test_rejects_station_older_than_configured_limit(self, mock_fetch):
+        mock_fetch.return_value = {
+            "station_id": "E7138",
+            "temperature_f": 67.0,
+            "humidity": 91.0,
+            "wind_speed_mph": 1.0,
+            "timestamp": datetime.now(timezone.utc) - timedelta(minutes=16),
+        }
+
+        with pytest.raises(NWSError, match="stale"):
+            NWSClient(37.4, -122.1).get_station_observation(
+                "E7138", max_age_minutes=15
+            )
+
+    @patch.object(NWSClient, "_fetch_single_observation", return_value=None)
+    def test_rejects_missing_named_station(self, mock_fetch):
+        client = NWSClient(37.4, -122.1)
+        client._last_skip_reason = "no observations returned"
+
+        with pytest.raises(NWSError, match="No valid observation"):
+            client.get_station_observation("E7138")
+
+
 # ------------------------------------------------------------------
 # Station Discovery
 # ------------------------------------------------------------------

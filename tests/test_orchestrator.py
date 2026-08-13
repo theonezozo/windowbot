@@ -70,12 +70,11 @@ def _base_config(**overrides):
 
 
 class TestPreferredWeatherStation:
-    @patch("src.orchestrator.SynopticClient")
-    def test_fetches_configured_station_with_freshness_limit(self, mock_client_cls):
+    @patch("src.orchestrator._get_nws_client")
+    def test_fetches_configured_station_with_freshness_limit(self, mock_get_client):
         expected = {"station_id": "E7138", "temperature_f": 64.0}
-        mock_client_cls.return_value.get_station_observation.return_value = expected
+        mock_get_client.return_value.get_station_observation.return_value = expected
         config = _base_config(
-            synoptic_api_key="key",
             preferred_weather_station_id="E7138",
             preferred_weather_station_max_age_minutes=15,
         )
@@ -83,19 +82,16 @@ class TestPreferredWeatherStation:
         result = _fetch_preferred_weather_station(config)
 
         assert result is expected
-        mock_client_cls.return_value.get_station_observation.assert_called_once_with(
+        mock_get_client.return_value.get_station_observation.assert_called_once_with(
             "E7138", 15
         )
 
-    @patch("src.orchestrator.SynopticClient")
-    def test_missing_api_key_preserves_existing_sources(self, mock_client_cls):
-        config = _base_config(
-            synoptic_api_key="",
-            preferred_weather_station_id="E7138",
-        )
+    @patch("src.orchestrator._get_nws_client")
+    def test_empty_station_id_preserves_existing_sources(self, mock_get_client):
+        config = _base_config(preferred_weather_station_id="")
 
         assert _fetch_preferred_weather_station(config) is None
-        mock_client_cls.assert_not_called()
+        mock_get_client.assert_not_called()
 
     def test_fresh_station_supersedes_temperature_and_humidity(self):
         timestamp = datetime.now(timezone.utc) - timedelta(minutes=3)
@@ -119,7 +115,7 @@ class TestPreferredWeatherStation:
         assert result["temperature_f"] == 64.0
         assert result["humidity"] == 93.0
         assert result["wind_speed_mph"] == 8.0
-        assert result["source"] == "synoptic:E7138"
+        assert result["source"] == "nws:E7138"
         assert result["superseded_source"] == "nws"
         assert result["contributors"] == []
 
@@ -2705,4 +2701,3 @@ class TestBuildFloorSnapshotNormalizesObservationTime:
         parsed = datetime.fromisoformat(snap.aqi_observation_time)
         assert parsed.tzinfo is not None
         assert snap.aqi_observation_time == "2026-07-13T18:00:00-07:00"
-

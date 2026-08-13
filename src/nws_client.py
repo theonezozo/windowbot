@@ -353,6 +353,39 @@ class NWSClient:
             "timestamp": ts,
         }
 
+    def get_station_observation(
+        self, station_id: str, max_age_minutes: int = 15
+    ) -> dict:
+        """Fetch a named NWS station and require a recent temperature reading."""
+        if not station_id:
+            raise ValueError("station_id must not be empty")
+        if max_age_minutes <= 0:
+            raise ValueError("max_age_minutes must be positive")
+
+        now = datetime.now(timezone.utc)
+        observation = self._fetch_single_observation(station_id, now)
+        if observation is None:
+            reason = self._last_skip_reason or "no valid observation"
+            raise NWSError(
+                f"No valid observation available for NWS station {station_id}: {reason}."
+            )
+
+        age = now - observation["timestamp"]
+        if age > timedelta(minutes=max_age_minutes):
+            raise NWSError(
+                f"NWS station {station_id} observation is stale "
+                f"({self._format_age(age)}; maximum {max_age_minutes}m)."
+            )
+
+        logger.info(
+            "Preferred NWS station %s: %.1f°F, %s%% RH (%s)",
+            station_id,
+            observation["temperature_f"],
+            observation["humidity"] if observation["humidity"] is not None else "unknown",
+            self._format_age(age),
+        )
+        return observation
+
     # ------------------------------------------------------------------
     # Aggregated outdoor conditions
     # ------------------------------------------------------------------

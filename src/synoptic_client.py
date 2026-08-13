@@ -250,38 +250,6 @@ class SynopticClient:
 
         return results
 
-    def get_station_observation(
-        self, station_id: str, max_age_minutes: int = 15
-    ) -> dict:
-        """Fetch one station and require a recent temperature observation."""
-        if not station_id:
-            raise ValueError("station_id must not be empty")
-        if max_age_minutes <= 0:
-            raise ValueError("max_age_minutes must be positive")
-
-        now = datetime.now(timezone.utc)
-        observation = self._fetch_batch_observations([station_id], now).get(station_id)
-        if observation is None:
-            raise SynopticError(
-                f"No valid observation available for Synoptic station {station_id}."
-            )
-
-        age = now - observation["timestamp"]
-        if age > timedelta(minutes=max_age_minutes):
-            raise SynopticError(
-                f"Synoptic station {station_id} observation is stale "
-                f"({self._format_age(age)}; maximum {max_age_minutes}m)."
-            )
-
-        logger.info(
-            "Preferred Synoptic station %s: %.1f°F, %s%% RH (%s)",
-            station_id,
-            observation["temperature_f"],
-            observation["humidity"] if observation["humidity"] is not None else "unknown",
-            self._format_age(age),
-        )
-        return observation
-
     # ------------------------------------------------------------------
     # Aggregated outdoor conditions
     # ------------------------------------------------------------------
