@@ -16,6 +16,7 @@ from src.ecobee_client import EcobeeClient, EcobeeAuthError, EcobeeApiError
 from src.beestat_client import BeestatClient, BeestatAuthError, BeestatApiError
 from src.nws_client import NWSClient, NWSError
 from src.openmeteo_client import OpenMeteoClient, OpenMeteoError
+from src.wrh_station_client import WRHStationClient, WRHStationError
 from src.outdoor_validator import validate_outdoor_temperature, OutdoorValidationResult
 from src.purpleair_client import PurpleAirClient
 from src.airnow_client import AirNowClient
@@ -56,17 +57,17 @@ def _get_nws_client(config: dict) -> NWSClient:
 
 
 def _fetch_preferred_weather_station(config: dict) -> dict | None:
-    """Fetch the configured authoritative station through the NWS API."""
+    """Fetch the authoritative station from weather.gov's time-series feed."""
     station_id = config.get("preferred_weather_station_id")
     if not station_id:
         return None
 
     try:
-        return _get_nws_client(config).get_station_observation(
+        return WRHStationClient().get_station_observation(
             station_id,
             config.get("preferred_weather_station_max_age_minutes", 15),
         )
-    except NWSError as exc:
+    except WRHStationError as exc:
         logger.warning(
             "Preferred weather station %s unavailable: %s. "
             "Using the normal outdoor source blend.",
@@ -90,7 +91,7 @@ def _apply_preferred_weather_station(
         "station_count": 1,
         "is_fallback": False,
         "used_cache": False,
-        "source": f"nws:{station_id}",
+        "source": f"synoptic:{station_id}",
         "observation_time": timestamp.isoformat(),
         "newest_observation_time": timestamp.isoformat(),
         "preferred_station_id": station_id,
@@ -106,7 +107,7 @@ def _apply_preferred_weather_station(
 
     contributor = {
         "station_id": station_id,
-        "source_type": "nws_preferred",
+        "source_type": "synoptic_preferred",
         "station_class": "preferred",
         "temp_f": observation["temperature_f"],
         "obs_time": timestamp.isoformat(),

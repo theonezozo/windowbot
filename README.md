@@ -231,7 +231,7 @@ This runs the full Azure Functions runtime with the 10-minute timer trigger.
 | `ECOBEE_REFRESH_TOKEN` | — | Ecobee OAuth refresh token (used when `INDOOR_PROVIDER=ecobee`) |
 | `OUTDOOR_PROVIDER` | `synoptic` | Present in config but **not currently consumed** — the normal source blend uses NWS stations + Open-Meteo, with the preferred station overriding it when fresh |
 | `SYNOPTIC_API_KEY` | — | Synoptic/MesoWest API key — client exists but is not wired into the current orchestrator |
-| `PREFERRED_WEATHER_STATION_ID` | `E7138` | NWS API station whose fresh temperature/humidity supersedes the blended outdoor sources; set empty to disable |
+| `PREFERRED_WEATHER_STATION_ID` | `E7138` | Weather.gov time-series station whose fresh temperature/humidity supersedes the blended outdoor sources; set empty to disable |
 | `PREFERRED_WEATHER_STATION_MAX_AGE_MINUTES` | `15` | Maximum age for the preferred station override (three expected 5-minute updates) |
 | `WU_API_KEY` | — | Weather Underground API key — client exists but is not wired into the current orchestrator |
 | `PURPLEAIR_API_KEY` | — | PurpleAir read API key |
