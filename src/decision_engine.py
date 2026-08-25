@@ -12,7 +12,7 @@ spec (Section 4) with all user-specified refinements:
     • AQI ≥ 100 → CLOSE immediately (urgent, bypasses cooldown)
     • AQI 50–99 → neutral (no AQI-driven state change)
     • AQI < 50 → allow opening (if temperature conditions favour it)
-- Humidity gate: block opening if outdoor humidity > 80 %
+- Humidity gate: block opening until outdoor humidity clears the reopen threshold
 - Comfort gate: skip opening when indoor temps are already comfortable
 - HVAC mode gate: only act when in cooling/auto modes
 """
@@ -67,8 +67,8 @@ class DecisionEngine:
     def __init__(self, config: dict) -> None:
         self.hysteresis_open: float = float(config.get("hysteresis_open_diff", 1.0))
         self.hysteresis_close: float = float(config.get("hysteresis_close_diff", 1.0))
-        self.max_humidity: int = int(config.get("max_outdoor_humidity", 80))
-        self.humidity_deadband: float = float(config.get("humidity_deadband", 5))
+        self.max_humidity: int = int(config.get("max_outdoor_humidity", 85))
+        self.humidity_deadband: float = float(config.get("humidity_deadband", 3))
         # Re-open/clear threshold: a CLOSED window won't re-open until humidity
         # drops meaningfully below max (anti-flap deadband), and an OPEN window
         # holds through the in-between band instead of flapping closed.

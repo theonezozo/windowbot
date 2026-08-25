@@ -1209,11 +1209,16 @@ def _evaluate_gates(
     # Humidity gate
     if engine.enable_humidity_gate and outdoor.get("humidity") is not None:
         humidity = outdoor["humidity"]
-        passed = humidity <= engine.max_humidity
+        if decision.new_state == "OPEN":
+            passed = humidity <= engine.max_humidity
+            threshold = f"≤ {engine.max_humidity}%"
+        else:
+            passed = humidity <= engine.humidity_reopen
+            threshold = f"≤ {engine.humidity_reopen:.0f}% to reopen, > {engine.max_humidity}% to close"
         gates.append(GateEvaluation(
             name="Humidity",
             passed=passed,
-            threshold=f"≤ {engine.max_humidity}%",
+            threshold=threshold,
             actual=f"{humidity:.0f}%",
         ))
     
