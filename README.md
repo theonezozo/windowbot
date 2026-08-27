@@ -23,7 +23,7 @@ Every 10 minutes, WindowBot:
 | Outdoor temp > coolest indoor | **Close** | Temperature-based close (strict `>`, no close-side hysteresis) |
 | AQI ≥ 100 | **Urgent close** | Bypasses notification cooldown |
 | AQI < 50 | Allow opening | AQI 50–99 is neutral (no change) |
-| Outdoor humidity > 80% | Block opening | Prevents letting in humid air |
+| Outdoor humidity > 85% | Block opening | Prevents letting in humid air; closed windows reopen once humidity falls to ≤82% |
 | Indoor temp ≤ 72°F | Block opening | Already comfortable — no need |
 | HVAC not in cool/auto | Block all | Only active when cooling is relevant |
 | Quiet hours active | Suppress notifications | Configurable sleep window (e.g. 23:00–07:00) |
@@ -156,7 +156,8 @@ The template mirrors the shape below:
 
     "HYSTERESIS_OPEN_DIFF": "1.0",
     "HYSTERESIS_CLOSE_DIFF": "1.0",
-    "MAX_OUTDOOR_HUMIDITY": "80",
+    "MAX_OUTDOOR_HUMIDITY": "85",
+    "MAX_OUTDOOR_HUMIDITY_DEADBAND": "3",
     "MAX_AQI_THRESHOLD": "100",
     "MIN_AQI_FOR_OPENING": "50",
     "POLLING_INTERVAL_MINUTES": "10",
@@ -240,7 +241,8 @@ This runs the full Azure Functions runtime with the 10-minute timer trigger.
 | `HYSTERESIS_OPEN_DIFF` | `1.0` | °F below warmest indoor temp to trigger open |
 | `HYSTERESIS_CLOSE_DIFF` | `1.0` | **No-op** — close side no longer uses hysteresis (close fires as soon as outdoor > coolest indoor). Key retained for backward compatibility |
 | `COMFORT_TEMP_MAX` | `72.0` | Don't suggest opening below this indoor temp |
-| `MAX_OUTDOOR_HUMIDITY` | `80` | Block opening above this humidity % |
+| `MAX_OUTDOOR_HUMIDITY` | `85` | Close open windows above this humidity % |
+| `MAX_OUTDOOR_HUMIDITY_DEADBAND` | `3` | Reopen closed windows only after humidity falls this many points below `MAX_OUTDOOR_HUMIDITY` |
 | `MAX_AQI_THRESHOLD` | `100` | AQI ≥ this triggers urgent close |
 | `MIN_AQI_FOR_OPENING` | `50` | AQI must be below this to allow opening |
 | `MAX_OBSERVATION_AGE_MINUTES` | `30` | Config default; note the NWS/Open-Meteo freshness cutoff in code is 20 min |

@@ -311,7 +311,8 @@ class TestConfigLive:
 
         assert config["hysteresis_open_diff"] == 1.0
         assert config["hysteresis_close_diff"] == 1.0
-        assert config["max_outdoor_humidity"] == 80
+        assert config["max_outdoor_humidity"] == 85
+        assert config["humidity_deadband"] == 3
         assert config["max_aqi_threshold"] == 100
         assert config["min_aqi_for_opening"] == 50
         assert set(config["allowed_hvac_modes"]) == {"cool", "heatCool", "auto"}

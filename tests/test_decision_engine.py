@@ -429,25 +429,25 @@ class TestAQILogic:
 class TestHumidityGate:
     """State-aware humidity gate with anti-flap deadband.
 
-    Defaults: max_humidity=80, humidity_deadband=5 → humidity_reopen=75.
+    Defaults: max_humidity=85, humidity_deadband=3 → humidity_reopen=82.
 
-    - OPEN:  >80 → CLOSE; 75–80 → HOLD OPEN (deadband); <75 → gate clears.
-    - CLOSED: >75 (> reopen) → stay CLOSED; ≤75 → gate clears.
-    Boundary intent: at exactly 75%, OPEN holds / CLOSED clears; at exactly
-    80%, both hold (no close, no open). The KEY anti-flap change is that a
-    CLOSED window will NOT re-open at 79%.
+    - OPEN:  >85 → CLOSE; 82–85 → HOLD OPEN (deadband); <82 → gate clears.
+    - CLOSED: >82 (> reopen) → stay CLOSED; ≤82 → gate clears.
+    Boundary intent: at exactly 82%, OPEN holds / CLOSED clears; at exactly
+    85%, both hold (no close, no open). The KEY anti-flap change is that a
+    CLOSED window will NOT re-open at 84%.
     """
 
     # -- OPEN branch ------------------------------------------------
 
     def test_open_high_humidity_closes_open_windows(self, engine):
-        """OPEN + humidity 85% (>80) → CLOSE (changed)."""
+        """OPEN + humidity 90% (>85) → CLOSE (changed)."""
         result = _decide(
             engine,
             indoor_temps=[74.0],
             outdoor_temp=68.0,
             aqi=30,
-            humidity=85.0,
+            humidity=90.0,
             last_state="OPEN",
         )
         assert result.new_state == "CLOSED"
@@ -455,13 +455,13 @@ class TestHumidityGate:
         assert "too high" in result.reason.lower()
 
     def test_open_in_band_holds_open(self, engine):
-        """OPEN + humidity 78% (75–80 deadband) → HOLD OPEN (changed=False)."""
+        """OPEN + humidity 84% (82–85 deadband) → HOLD OPEN (changed=False)."""
         result = _decide(
             engine,
             indoor_temps=[74.0],
             outdoor_temp=68.0,
             aqi=30,
-            humidity=78.0,
+            humidity=84.0,
             last_state="OPEN",
         )
         assert result.new_state == "OPEN"
@@ -469,19 +469,19 @@ class TestHumidityGate:
         assert "deadband" in result.reason.lower()
 
     def test_open_below_reopen_clears_gate(self, engine):
-        """OPEN + humidity 74% (<75 reopen) → gate returns None (falls through)."""
-        assert engine._check_humidity(DEFAULT_FLOOR, 74.0, "OPEN") is None
+        """OPEN + humidity 81% (<82 reopen) → gate returns None (falls through)."""
+        assert engine._check_humidity(DEFAULT_FLOOR, 81.0, "OPEN") is None
 
-    def test_open_at_80_holds_open(self, engine):
-        """OPEN + humidity exactly 80% → hold OPEN (80 > 80 is False)."""
-        decision = engine._check_humidity(DEFAULT_FLOOR, 80.0, "OPEN")
+    def test_open_at_85_holds_open(self, engine):
+        """OPEN + humidity exactly 85% → hold OPEN (85 > 85 is False)."""
+        decision = engine._check_humidity(DEFAULT_FLOOR, 85.0, "OPEN")
         assert decision is not None
         assert decision.new_state == "OPEN"
         assert decision.changed is False
 
-    def test_open_at_75_holds_open(self, engine):
-        """OPEN + humidity exactly 75% → hold OPEN (75 ≥ 75 reopen)."""
-        decision = engine._check_humidity(DEFAULT_FLOOR, 75.0, "OPEN")
+    def test_open_at_82_holds_open(self, engine):
+        """OPEN + humidity exactly 82% → hold OPEN (82 ≥ 82 reopen)."""
+        decision = engine._check_humidity(DEFAULT_FLOOR, 82.0, "OPEN")
         assert decision is not None
         assert decision.new_state == "OPEN"
         assert decision.changed is False
@@ -500,10 +500,10 @@ class TestHumidityGate:
 
     # -- CLOSED branch ----------------------------------------------
 
-    def test_closed_anti_flap_stays_closed_at_79(self, engine):
-        """CLOSED + humidity 79% (>75 reopen) → stay CLOSED (changed=False).
+    def test_closed_anti_flap_stays_closed_at_84(self, engine):
+        """CLOSED + humidity 84% (>82 reopen) → stay CLOSED (changed=False).
 
-        Anti-flap regression: previously 79 < 80 max cleared the gate and the
+        Anti-flap regression: previously being below max cleared the gate and the
         window could re-open; now it holds closed until humidity drops to the
         re-open threshold.
         """
@@ -512,7 +512,7 @@ class TestHumidityGate:
             indoor_temps=[74.0],
             outdoor_temp=68.0,
             aqi=30,
-            humidity=79.0,
+            humidity=84.0,
             last_state="CLOSED",
         )
         assert result.new_state == "CLOSED"
@@ -520,7 +520,32 @@ class TestHumidityGate:
         assert "still elevated" in result.reason.lower()
 
     def test_closed_stays_closed_above_max(self, engine):
-        """CLOSED + humidity 81% → stay CLOSED (changed=False), elevated reason."""
+        """CLOSED + humidity 86% → stay CLOSED (changed=False), elevated reason."""
+        result = _decide(
+            engine,
+            indoor_temps=[74.0],
+            outdoor_temp=68.0,
+            aqi=30,
+            humidity=86.0,
+            last_state="CLOSED",
+        )
+        assert result.new_state == "CLOSED"
+        assert result.changed is False
+        assert "re-open threshold" in result.reason
+
+    def test_closed_at_85_stays_closed(self, engine):
+        """CLOSED + humidity exactly 85% → stay CLOSED (85 > 82 reopen)."""
+        decision = engine._check_humidity(DEFAULT_FLOOR, 85.0, "CLOSED")
+        assert decision is not None
+        assert decision.new_state == "CLOSED"
+        assert decision.changed is False
+
+    def test_closed_at_82_clears_gate(self, engine):
+        """CLOSED + humidity exactly 82% → gate clears (82 > 82 reopen is False)."""
+        assert engine._check_humidity(DEFAULT_FLOOR, 82.0, "CLOSED") is None
+
+    def test_closed_below_reopen_clears_and_opens(self, engine):
+        """CLOSED + humidity 81% (≤82) → gate clears; temp/AQI then open."""
         result = _decide(
             engine,
             indoor_temps=[74.0],
@@ -529,42 +554,17 @@ class TestHumidityGate:
             humidity=81.0,
             last_state="CLOSED",
         )
-        assert result.new_state == "CLOSED"
-        assert result.changed is False
-        assert "re-open threshold" in result.reason
-
-    def test_closed_at_80_stays_closed(self, engine):
-        """CLOSED + humidity exactly 80% → stay CLOSED (80 > 75 reopen)."""
-        decision = engine._check_humidity(DEFAULT_FLOOR, 80.0, "CLOSED")
-        assert decision is not None
-        assert decision.new_state == "CLOSED"
-        assert decision.changed is False
-
-    def test_closed_at_75_clears_gate(self, engine):
-        """CLOSED + humidity exactly 75% → gate clears (75 > 75 reopen is False)."""
-        assert engine._check_humidity(DEFAULT_FLOOR, 75.0, "CLOSED") is None
-
-    def test_closed_below_reopen_clears_and_opens(self, engine):
-        """CLOSED + humidity 74% (≤75) → gate clears; temp/AQI then open."""
-        result = _decide(
-            engine,
-            indoor_temps=[74.0],
-            outdoor_temp=68.0,
-            aqi=30,
-            humidity=74.0,
-            last_state="CLOSED",
-        )
         assert result.new_state == "OPEN"
         assert result.changed is True
 
     def test_closed_high_humidity_blocks_opening(self, engine):
-        """CLOSED + humidity 85% → stay CLOSED even if temp favours opening."""
+        """CLOSED + humidity 90% → stay CLOSED even if temp favours opening."""
         result = _decide(
             engine,
             indoor_temps=[74.0],
             outdoor_temp=68.0,
             aqi=30,
-            humidity=85.0,
+            humidity=90.0,
         )
         assert result.new_state == "CLOSED"
         assert result.changed is False
@@ -952,7 +952,7 @@ class TestCombinedConditions:
         assert result.urgent is True
 
     def test_good_temp_good_aqi_bad_humidity_closes(self, engine):
-        """Good temp + good AQI + humidity > 80 → CLOSED (humidity gate)."""
+        """Good temp + good AQI + humidity above reopen threshold → CLOSED."""
         result = _decide(
             engine,
             indoor_temps=[74.0],
@@ -1056,7 +1056,8 @@ class TestConfigCustomisation:
         config = {
             "hysteresis_open_diff": 3.0,
             "hysteresis_close_diff": 3.0,
-            "max_outdoor_humidity": 80,
+            "max_outdoor_humidity": 85,
+            "humidity_deadband": 3,
             "max_aqi_threshold": 100,
             "min_aqi_for_opening": 50,
             "allowed_hvac_modes": ["cool", "heatCool", "auto"],
@@ -1071,7 +1072,8 @@ class TestConfigCustomisation:
         config = {
             "hysteresis_open_diff": 1.0,
             "hysteresis_close_diff": 1.0,
-            "max_outdoor_humidity": 80,
+            "max_outdoor_humidity": 85,
+            "humidity_deadband": 3,
             "max_aqi_threshold": 100,
             "min_aqi_for_opening": 50,
             "allowed_hvac_modes": ["cool", "heatCool", "auto"],
@@ -1090,7 +1092,8 @@ class TestConfigCustomisation:
         config = {
             "hysteresis_open_diff": 1.0,
             "hysteresis_close_diff": 1.0,
-            "max_outdoor_humidity": 80,
+            "max_outdoor_humidity": 85,
+            "humidity_deadband": 3,
             "max_aqi_threshold": 100,
             "min_aqi_for_opening": 50,
             "allowed_hvac_modes": ["cool", "heatCool", "auto"],
@@ -1227,7 +1230,7 @@ class TestNeedsAqiOpenSafety:
         assert needs is True
 
     def test_open_beats_high_humidity(self, engine):
-        """OPEN + outdoor humidity 95% (> 80% max) → still fetch."""
+        """OPEN + outdoor humidity 95% (> 85% max) → still fetch."""
         needs, _ = _needs(engine, last_state="OPEN", humidity=95.0)
         assert needs is True
 
@@ -1289,19 +1292,20 @@ class TestNeedsAqiOpenSafety:
         assert needs is False
 
     def test_closed_humidity_above_reopen_skips(self, engine):
-        """CLOSED + humidity 78% (> 75 reopen) → skip even if temp favors opening.
+        """CLOSED + humidity 84% (> 82 reopen) → skip even if temp favors opening.
 
         Mirrors R1: the CLOSED humidity mirror now uses ``> humidity_reopen``
-        (75), not ``> max_humidity`` (80). Warm indoor + cool outdoor would
+        (82), not ``> max_humidity`` (85). Warm indoor + cool outdoor would
         otherwise fetch, so this proves the deadband short-circuits first.
-        Previously 78 < 80 continued and AQI would have been fetched.
+        A below-max-but-above-reopen humidity reading would have fetched before
+        the deadband was added.
         """
         needs, reason = _needs(
             engine,
             last_state="CLOSED",
             indoor_temps=[78.0],
             outdoor_temp=65.0,
-            humidity=78.0,
+            humidity=84.0,
         )
         assert needs is False
         assert "humidity too high" in reason.lower()

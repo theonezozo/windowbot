@@ -1152,7 +1152,8 @@ def _mini_engine():
         {
             "hysteresis_open_diff": 1.0,
             "hysteresis_close_diff": 1.0,  # ignored by the reverted bare close
-            "max_outdoor_humidity": 80,
+            "max_outdoor_humidity": 85,
+            "humidity_deadband": 3,
             "max_aqi_threshold": 100,
             "min_aqi_for_opening": 50,
             "allowed_hvac_modes": ["cool", "heatCool", "auto"],
